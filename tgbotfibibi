@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 
 # ID главных администраторов
-ADMIN_IDS = [@borchrus]  # Добавьте ID администраторов
+ADMIN_IDS = [8026911824]  # Добавьте ID администраторов
 
 # Конфигурация
 EXCEL_FILE = "conference_data.xlsx"
