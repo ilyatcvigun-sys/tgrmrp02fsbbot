@@ -36,8 +36,8 @@ RANKS = {
     0: {"name": "👤 Гость", "can_search": False, "can_award": False, "can_warn": False, "can_manage_ranks": False, "can_ban": False},
     1: {"name": "⭐ Старший лейтенант", "can_search": False, "can_award": False, "can_warn": False, "can_manage_ranks": False, "can_ban": False},
     2: {"name": "🎖 Капитан", "can_search": False, "can_award": False, "can_warn": False, "can_manage_ranks": False, "can_ban": False},
-    3: {"name": "🛡 Майор", "can_search": False, "can_award": True, "can_warn": True, "can_manage_ranks": False, "can_ban": False},
-    4: {"name": "👔 Подполковник", "can_search": True, "can_award": True, "can_warn": True, "can_manage_ranks": True, "can_ban": False},
+    3: {"name": "🛡 Майор", "can_search": False, "can_award": True, "can_warn": False, "can_manage_ranks": False, "can_ban": False},
+    4: {"name": "👔 Подполковник", "can_search": True, "can_award": True, "can_warn": False, "can_manage_ranks": False, "can_ban": False},
     5: {"name": "👑 Полковник", "can_search": True, "can_award": True, "can_warn": True, "can_manage_ranks": True, "can_ban": True},
     6: {"name": "🌟 Генерал", "can_search": True, "can_award": True, "can_warn": True, "can_manage_ranks": True, "can_ban": True}
 }
@@ -70,28 +70,25 @@ def is_private_chat(update: Update) -> bool:
     return update.effective_chat.type == 'private'
 
 def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Извлечение user_id из разных форматов: ID, @username, ссылка, ответ"""
+    """Извлечение user_id из разных форматов"""
     text = text.strip()
     
     # Числовой ID
     if text.isdigit():
         return int(text)
     
-    # @username
-    if text.startswith('@'):
-        username = text[1:]
+    # @username или username без @
+    username = text.replace('@', '').strip()
+    
+    # Ссылка https://t.me/username
+    if 't.me/' in username:
+        username = username.split('t.me/')[-1].split()[0].strip()
+    
+    # Ищем в базе
+    if username:
         result = find_user_by_username(username)
         if result:
             return result
-        return None
-    
-    # Ссылка https://t.me/username
-    if 't.me/' in text:
-        username = text.split('t.me/')[-1].split()[0].strip().replace('@', '')
-        if username:
-            result = find_user_by_username(username)
-            if result:
-                return result
         return None
     
     # Ответ на сообщение
@@ -101,15 +98,20 @@ def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     return None
 
 def find_user_by_username(username):
-    """Поиск одного пользователя по username/нику/позывному"""
+    """Поиск пользователя в базе по нику или позывному"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    cursor.execute('''
-        SELECT user_id FROM users 
-        WHERE game_nick LIKE ? OR callsign LIKE ?
-    ''', (f'%{username}%', f'%{username}%'))
+    # Пробуем точное совпадение
+    cursor.execute('SELECT user_id FROM users WHERE game_nick = ? OR callsign = ?', (username, username))
+    result = cursor.fetchone()
     
+    if result:
+        conn.close()
+        return result[0]
+    
+    # Пробуем частичное совпадение
+    cursor.execute('SELECT user_id FROM users WHERE game_nick LIKE ? OR callsign LIKE ?', (f'%{username}%', f'%{username}%'))
     results = cursor.fetchall()
     conn.close()
     
@@ -120,16 +122,11 @@ def find_user_by_username(username):
     return None
 
 def find_users_by_username(username):
-    """Поиск всех пользователей по username"""
+    """Поиск всех пользователей"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT user_id, game_nick, callsign, token, rank 
-        FROM users 
-        WHERE game_nick LIKE ? OR callsign LIKE ?
-    ''', (f'%{username}%', f'%{username}%'))
-    
+    cursor.execute('SELECT user_id, game_nick, callsign, token, rank FROM users WHERE game_nick LIKE ? OR callsign LIKE ?', 
+                   (f'%{username}%', f'%{username}%'))
     results = cursor.fetchall()
     conn.close()
     return results
@@ -333,7 +330,6 @@ def check_gban(user_id):
     cursor.execute('SELECT * FROM gban WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     conn.close()
-    
     if row:
         return {"is_banned": True, "nick": row[2], "reason": row[3], "date": row[4], "banned_by": row[5]}
     return {"is_banned": False}
@@ -395,14 +391,9 @@ def get_user_permissions(user_id):
     return RANKS.get(user_data['rank'], RANKS[0])
 
 def get_admins():
-    """Список администраторов (ранг 4+)"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT user_id, game_nick, callsign, token, rank, department 
-        FROM users WHERE rank >= 4
-        ORDER BY rank DESC
-    ''')
+    cursor.execute('SELECT user_id, game_nick, callsign, token, rank, department FROM users WHERE rank >= 4 ORDER BY rank DESC')
     admins = cursor.fetchall()
     conn.close()
     return admins
@@ -410,26 +401,24 @@ def get_admins():
 # ============ КОМАНДЫ ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Только в ЛС"""
+    if not is_private_chat(update):
+        return  # В конференции игнорируем
+    
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     
-    if is_private_chat(update):
-        if user_data:
-            keyboard = [
-                [KeyboardButton("👤 Информация")],
-                [KeyboardButton("🔍 Проверить ЧС"), KeyboardButton("ℹ️ Помощь")]
-            ]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            await update.message.reply_text("🤖 Бот конференции\n\nВыберите действие:", reply_markup=reply_markup)
-        else:
-            keyboard = [[KeyboardButton("📝 Регистрация")]]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            await update.message.reply_text("Добро пожаловать! Пройдите регистрацию:", reply_markup=reply_markup)
+    if user_data:
+        keyboard = [
+            [KeyboardButton("👤 Информация")],
+            [KeyboardButton("🔍 Проверить ЧС"), KeyboardButton("ℹ️ Помощь")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text("🤖 Бот конференции\n\nВыберите действие:", reply_markup=reply_markup)
     else:
-        if user_data:
-            await update.message.reply_text("🤖 Бот активен\nИспользуйте: /info /help")
-        else:
-            await update.message.reply_text("Для регистрации напишите в ЛС боту.")
+        keyboard = [[KeyboardButton("📝 Регистрация")]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text("Добро пожаловать! Пройдите регистрацию:", reply_markup=reply_markup)
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -451,33 +440,58 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     permissions = get_user_permissions(user_id)
+    rank = user_data['rank'] if user_data else 0
     
-    help_text = "📚 СПРАВКА\n\n"
-    help_text += "Основные:\n"
-    help_text += "/start /info /help /profile /stats /awards\n"
-    help_text += "/search 52**** /check_gban [ID]\n\n"
+    text = "╔══════════════════════╗\n"
+    text += "║   📚 СПРАВКА КОМАНД   ║\n"
+    text += "╚══════════════════════╝\n\n"
     
-    if permissions['can_warn']:
-        help_text += "Майор+:\n/warn ID/@user причина\n/award ID/@user\n\n"
+    text += "🔹 ОСНОВНЫЕ КОМАНДЫ:\n"
+    text += "├ /start — Главное меню\n"
+    text += "├ /info — Информация о профиле\n"
+    text += "├ /help — Эта справка\n"
+    text += "├ /profile — Подробный профиль\n"
+    text += "├ /stats — Статистика\n"
+    text += "├ /awards — Ваши награды\n"
+    text += "├ /search 52**** — Поиск по жетону\n"
+    text += "└ /check_gban [ID] — Проверка ЧС\n\n"
     
-    if permissions['can_manage_ranks']:
-        help_text += "Подполковник+:\n/setrank ID/@user 0-6\n/setdept ID/@user номер\n/admins\n\n"
+    if rank >= 3:
+        text += "🔹 МАЙОР (3 ранг):\n"
+        text += "└ /award ID/@user — Выдать награду\n\n"
     
-    if permissions['can_ban']:
-        help_text += "Полковник+:\n/ban ID/@user причина\n/unban ID/@user\n\n"
+    if rank >= 5:
+        text += "🔹 ПОЛКОВНИК (5 ранг):\n"
+        text += "├ /warn ID/@user причина — Предупреждение\n"
+        text += "├ /setrank ID/@user 0-6 — Установить ранг\n"
+        text += "├ /setdept ID/@user номер — Назначить отдел\n"
+        text += "├ /ban ID/@user причина — Бан\n"
+        text += "├ /unban ID/@user — Разбан\n"
+        text += "└ /admins — Список администраторов\n\n"
     
-    if user_data and user_data['rank'] >= 6:
-        help_text += "Генерал:\n/gban ID/@user причина\n/ungban ID/@user\n/gban_list\n/settoken ID/@user ЖЕТОН\n/add_admin ID/@user\n/remove_admin ID/@user\n\n"
+    if rank >= 6:
+        text += "🔹 ГЕНЕРАЛ (6 ранг):\n"
+        text += "├ /gban ID/@user причина — Глобальный бан\n"
+        text += "├ /ungban ID/@user — Снять глобальный бан\n"
+        text += "├ /gban_list — Список ЧС\n"
+        text += "└ /settoken ID/@user ЖЕТОН — Выдать жетон\n\n"
     
     if user_id in ADMIN_IDS:
-        help_text += "Главный админ:\n/add_admin ID/@user\n/remove_admin ID/@user\n\n"
+        text += "🔹 ГЛАВНЫЙ АДМИН:\n"
+        text += "├ /add_admin ID/@user — Добавить админа\n"
+        text += "└ /remove_admin ID/@user — Удалить админа\n\n"
     
-    help_text += "Форматы: ID, @username, ссылка, ответ на сообщение\n\n"
-    help_text += "Ранги:\n"
+    text += "╔══════════════════════╗\n"
+    text += "║  📝 ФОРМАТЫ ВВОДА:   ║\n"
+    text += "║ ID | @user | ссылка  ║\n"
+    text += "║ ответ на сообщение   ║\n"
+    text += "╚══════════════════════╝\n\n"
+    
+    text += "⭐ РАНГИ:\n"
     for r in range(7):
-        help_text += f"{r} - {RANKS[r]['name']}\n"
+        text += f"  {r} — {RANKS[r]['name']}\n"
     
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(text)
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -487,29 +501,46 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     permissions = get_user_permissions(user_id)
     await update.message.reply_text(
-        f"👤 Профиль\n\n🎮 {user_data['nick']}\n📻 {user_data['callsign']}\n"
-        f"🎫 {user_data['token']}\n⭐ {permissions['name']}\n📁 {user_data['department']}\n"
-        f"⚠️ {user_data['warns']}\n📅 {user_data['reg_date']}"
+        f"╔══════════════════════╗\n"
+        f"║     👤 ПРОФИЛЬ       ║\n"
+        f"╚══════════════════════╝\n\n"
+        f"🎮 Ник: {user_data['nick']}\n"
+        f"📻 Позывной: {user_data['callsign']}\n"
+        f"🎫 Жетон: {user_data['token']}\n"
+        f"⭐ Ранг: {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}\n"
+        f"⚠️ Предупреждения: {user_data['warns']}\n"
+        f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = get_statistics()
-    await update.message.reply_text(f"📊 Всего: {stats['total']}\n✅ Активных: {stats['active']}\n🚫 Забанено: {stats['banned']}\n🌟 Генералов: {stats['generals']}")
+    await update.message.reply_text(
+        f"╔══════════════════════╗\n"
+        f"║   📊 СТАТИСТИКА      ║\n"
+        f"╚══════════════════════╝\n\n"
+        f"👥 Всего участников: {stats['total']}\n"
+        f"✅ Активных: {stats['active']}\n"
+        f"🚫 Забанено: {stats['banned']}\n"
+        f"🌟 Генералов: {stats['generals']}"
+    )
 
 async def awards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     awards = get_user_awards(user_id)
     if awards:
-        text = "\n".join([f"🏅 {a[0]} ({a[1]}) - {a[2]}" for a in awards])
-        await update.message.reply_text(f"🏅 Награды:\n\n{text}")
+        text = "╔══════════════════════╗\n║   🏅 НАГРАДЫ         ║\n╚══════════════════════╝\n\n"
+        for a in awards:
+            text += f"🏅 {a[0]}\n   📁 {a[1]}\n   📅 {a[2]}\n\n"
+        await update.message.reply_text(text)
     else:
-        await update.message.reply_text("Нет наград.")
+        await update.message.reply_text("❌ У вас пока нет наград.")
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     permissions = get_user_permissions(user_id)
     if not permissions['can_search']:
-        await update.message.reply_text("❌ Недостаточно прав.")
+        await update.message.reply_text("❌ Недостаточно прав (с 4 ранга).")
         return
     if not context.args:
         await update.message.reply_text("❌ /search 52****")
@@ -524,7 +555,14 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if row:
         rank_name = RANKS.get(row[5], RANKS[0])['name']
-        await update.message.reply_text(f"🎫 {token}\n\n🎮 {row[2]}\n📻 {row[3]}\n⭐ {rank_name}\n📁 {row[6]}\n⚠️ {row[7]}")
+        await update.message.reply_text(
+            f"🎫 Жетон: {token}\n"
+            f"🎮 Ник: {row[2]}\n"
+            f"📻 Позывной: {row[3]}\n"
+            f"⭐ Ранг: {rank_name}\n"
+            f"📁 Отдел: {row[6]}\n"
+            f"⚠️ Предупреждения: {row[7]}"
+        )
     else:
         await update.message.reply_text("❌ Не найден.")
 
@@ -533,14 +571,17 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_id = update.effective_user.id
         result = check_gban(user_id)
         if result['is_banned']:
-            await update.message.reply_text(f"🚫 Вы в ЧС!\n📝 {result['reason']}\n📅 {result['date']}")
+            await update.message.reply_text(f"🚫 ВЫ В ЧС!\n📝 {result['reason']}\n📅 {result['date']}")
         else:
             await update.message.reply_text("✅ Вы не в ЧС.")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
-    if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Не найден.")
+    if target_id is None:
+        await update.message.reply_text("❌ Пользователь не найден. Проверьте @username или ID.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Найдено несколько. Уточните ID.")
         return
     
     result = check_gban(target_id)
@@ -556,19 +597,19 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Только генералы.")
         return
     if not context.args:
-        await update.message.reply_text("❌ /gban ID/@user причина")
+        await update.message.reply_text("❌ /gban @user причина")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
     reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
     
     if target_id is None:
-        await update.message.reply_text("❌ Не найден.")
+        await update.message.reply_text("❌ Не найден. Проверьте @username.")
         return
     if target_id == -1:
         username = context.args[0].replace('@', '').replace('https://t.me/', '')
         users = find_users_by_username(username)
-        text = "Найдено несколько:\n\n"
+        text = "🔍 Найдено несколько:\n\n"
         for u in users:
             text += f"🆔 {u[0]} | {u[1]} | {u[2]} | {RANKS.get(u[4], RANKS[0])['name']}\n"
         text += "\nУточните: /gban ID причина"
@@ -578,7 +619,7 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_gban(target_id, reason, user_id)
     target_data = get_user_data(target_id)
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
-    await update.message.reply_text(f"🚫 Глобальный бан!\n👤 {target_name}\n🆔 {target_id}\n📝 {reason}\n👮 {user_data['callsign']}")
+    await update.message.reply_text(f"🚫 БАН!\n👤 {target_name}\n📝 {reason}")
 
 async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -587,7 +628,7 @@ async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Только генералы.")
         return
     if not context.args:
-        await update.message.reply_text("❌ /ungban ID/@user")
+        await update.message.reply_text("❌ /ungban @user")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
@@ -596,9 +637,9 @@ async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if remove_gban(target_id):
-        await update.message.reply_text(f"✅ {target_id} удален из ЧС.")
+        await update.message.reply_text("✅ Снят с ЧС.")
     else:
-        await update.message.reply_text("❌ Не найден в ЧС.")
+        await update.message.reply_text("❌ Не в ЧС.")
 
 async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -609,24 +650,31 @@ async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     bans = get_gban_list()
     if bans:
-        text = "🚫 ЧС:\n\n"
+        text = "🚫 ЧЁРНЫЙ СПИСОК:\n\n"
         for b in bans[:20]:
             text += f"🆔 {b[0]} | {b[1]}\n📝 {b[2]}\n📅 {b[3]}\n\n"
         await update.message.reply_text(text)
     else:
-        await update.message.reply_text("ЧС пуст.")
+        await update.message.reply_text("✅ ЧС пуст.")
 
 async def setrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
-    if not user_data or user_data['rank'] < 4:
-        await update.message.reply_text("❌ Недостаточно прав.")
+    if not user_data or user_data['rank'] < 5:
+        await update.message.reply_text("❌ С 5 ранга (Полковник).")
         return
     if len(context.args) < 2:
-        await update.message.reply_text("❌ /setrank ID/@user 0-6")
+        await update.message.reply_text("❌ /setrank @user 0-6")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
+    if target_id is None:
+        await update.message.reply_text("❌ Не найден. Проверьте @username.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько найдено. Уточните ID.")
+        return
+    
     try:
         new_rank = int(context.args[1])
     except ValueError:
@@ -634,10 +682,7 @@ async def setrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if new_rank not in RANKS:
-        await update.message.reply_text("❌ Неверный ранг.")
-        return
-    if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Не найден.")
+        await update.message.reply_text("❌ Неверный ранг (0-6).")
         return
     
     if update_user_rank(target_id, new_rank):
@@ -649,15 +694,22 @@ async def setrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setdept_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
-    if not user_data or user_data['rank'] < 4:
-        await update.message.reply_text("❌ Недостаточно прав.")
+    if not user_data or user_data['rank'] < 5:
+        await update.message.reply_text("❌ С 5 ранга (Полковник).")
         return
     if len(context.args) < 2:
         deps = "\n".join([f"{i+1}. {d}" for i, d in enumerate(DEPARTMENTS)])
-        await update.message.reply_text(f"❌ /setdept ID/@user номер\n\n{deps}")
+        await update.message.reply_text(f"❌ /setdept @user номер\n\n{deps}")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
+    if target_id is None:
+        await update.message.reply_text("❌ Не найден. Проверьте @username.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько найдено. Уточните ID.")
+        return
+    
     try:
         dept_num = int(context.args[1]) - 1
     except ValueError:
@@ -666,9 +718,6 @@ async def setdept_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if dept_num < 0 or dept_num >= len(DEPARTMENTS):
         await update.message.reply_text("❌ Неверный отдел.")
-        return
-    if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Не найден.")
         return
     
     if update_user_department(target_id, DEPARTMENTS[dept_num]):
@@ -680,45 +729,49 @@ async def setdept_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
-    if not user_data or user_data['rank'] < 3:
-        await update.message.reply_text("❌ Недостаточно прав.")
+    if not user_data or user_data['rank'] < 5:
+        await update.message.reply_text("❌ С 5 ранга (Полковник).")
         return
     if len(context.args) < 2:
-        await update.message.reply_text("❌ /warn ID/@user причина")
+        await update.message.reply_text("❌ /warn @user причина")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
-    reason = ' '.join(context.args[1:])
-    
-    if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Не найден.")
+    if target_id is None:
+        await update.message.reply_text("❌ Не найден. Проверьте @username.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько найдено. Уточните ID.")
         return
     
+    reason = ' '.join(context.args[1:])
     success, message = add_warning(target_id, user_id, reason)
     target_data = get_user_data(target_id)
+    
     if success:
         await update.message.reply_text(f"⚠️ {message}\n👤 {target_data['callsign']}\n📝 {reason}")
     else:
         await update.message.reply_text(f"❌ {message}")
 
 async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выдача жетона (Генерал)"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     if not user_data or user_data['rank'] < 6:
         await update.message.reply_text("❌ Только генералы.")
         return
     if len(context.args) < 2:
-        await update.message.reply_text("❌ /settoken ID/@user ЖЕТОН\nПример: /settoken @user 521234")
+        await update.message.reply_text("❌ /settoken @user 52****")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
-    new_token = context.args[1]
-    
-    if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Не найден.")
+    if target_id is None:
+        await update.message.reply_text("❌ Не найден. Проверьте @username.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько найдено. Уточните ID.")
         return
     
+    new_token = context.args[1]
     success, message = set_user_token(target_id, new_token)
     if success:
         target_data = get_user_data(target_id)
@@ -727,10 +780,9 @@ async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {message}")
 
 async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список администраторов"""
     admins = get_admins()
     if admins:
-        text = "👥 Администрация:\n\n"
+        text = "╔══════════════════════╗\n║  👥 АДМИНИСТРАЦИЯ   ║\n╚══════════════════════╝\n\n"
         for a in admins:
             text += f"👤 {a[2]} | {a[1]}\n⭐ {RANKS[a[4]]['name']}\n📁 {a[5]}\n🆔 {a[0]}\n\n"
         await update.message.reply_text(text)
@@ -738,48 +790,52 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Администраторы не найдены.")
 
 async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавление администратора (Главный админ)"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("❌ Только главный администратор.")
         return
     if not context.args:
-        await update.message.reply_text("❌ /add_admin ID/@user")
+        await update.message.reply_text("❌ /add_admin @user")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
-    if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Не найден.")
+    if target_id is None:
+        await update.message.reply_text("❌ Не найден. Проверьте @username.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько найдено. Уточните ID.")
         return
     
     if target_id not in ADMIN_IDS:
         ADMIN_IDS.append(target_id)
         update_user_rank(target_id, 6)
         target_data = get_user_data(target_id)
-        await update.message.reply_text(f"✅ {target_data['callsign']} → администратор (Генерал)")
+        await update.message.reply_text(f"✅ {target_data['callsign']} → Генерал (админ)")
     else:
         await update.message.reply_text("❌ Уже администратор.")
 
 async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаление администратора (Главный админ)"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("❌ Только главный администратор.")
         return
     if not context.args:
-        await update.message.reply_text("❌ /remove_admin ID/@user")
+        await update.message.reply_text("❌ /remove_admin @user")
         return
     
     target_id = extract_user_id(update, context, context.args[0])
-    if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Не найден.")
+    if target_id is None:
+        await update.message.reply_text("❌ Не найден. Проверьте @username.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько найдено. Уточните ID.")
         return
     
     if target_id in ADMIN_IDS and target_id != user_id:
         ADMIN_IDS.remove(target_id)
         update_user_rank(target_id, 0)
         target_data = get_user_data(target_id)
-        await update.message.reply_text(f"✅ {target_data['callsign']} удален из администраторов.")
+        await update.message.reply_text(f"✅ {target_data['callsign']} удален из админов.")
     else:
         await update.message.reply_text("❌ Нельзя удалить.")
 
@@ -790,12 +846,12 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if get_user_data(user_id):
         await update.message.reply_text("❌ Уже зарегистрированы!")
         return ConversationHandler.END
-    await update.message.reply_text("📝 Шаг 1/2 - Игровой ник:")
+    await update.message.reply_text("📝 Шаг 1/2 — Игровой ник:")
     return GAME_NICK
 
 async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['game_nick'] = update.message.text
-    await update.message.reply_text("Шаг 2/2 - Позывной:")
+    await update.message.reply_text("Шаг 2/2 — Позывной:")
     return CALLSIGN
 
 async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -812,10 +868,9 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено.")
-    await start(update, context)
     return ConversationHandler.END
 
-# ============ ОБРАБОТЧИК СООБЩЕНИЙ ============
+# ============ ОБРАБОТЧИК КНОПОК В ЛС ============
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -834,8 +889,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check_gban_command(update, context)
     elif text == "ℹ️ Помощь":
         await help_command(update, context)
-    else:
-        await start(update, context)
 
 # ============ ЗАПУСК ============
 
@@ -854,7 +907,7 @@ def main():
     
     application.add_handler(reg_handler)
     
-    # Все команды
+    # Команды
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('info', info_command))
     application.add_handler(CommandHandler('help', help_command))
@@ -874,7 +927,8 @@ def main():
     application.add_handler(CommandHandler('add_admin', add_admin_command))
     application.add_handler(CommandHandler('remove_admin', remove_admin_command))
     
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Только кнопки в ЛС
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     
     print("🤖 Бот запущен!")
     application.run_polling()
