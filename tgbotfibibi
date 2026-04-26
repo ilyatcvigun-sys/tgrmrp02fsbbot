@@ -1,10 +1,9 @@
 import random
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import sqlite3
-from openpyxl.styles import Font, PatternFill, Alignment
 import os
 
 # Настройка логирования
@@ -14,23 +13,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Состояния для ConversationHandler
+# Состояния
 GAME_NICK, CALLSIGN = range(2)
-SEARCH_TOKEN = range(2, 3)
+SEARCH_TOKEN = 2
 RANK_ASSIGN_USER, RANK_ASSIGN_RANK = range(3, 5)
 AWARD_USER, AWARD_TYPE, AWARD_SPECIFIC = range(5, 8)
-DEPARTMENT_ASSIGN = range(8, 9)
+DEPARTMENT_ASSIGN = 8
 WARN_USER, WARN_REASON = range(9, 11)
 BAN_USER, BAN_DURATION = range(11, 13)
 
 # Токен бота
-BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
+BOT_TOKEN = "ВАШ_ТОКЕН_СЮДА"
 
-# ID главных администраторов
-ADMIN_IDS = [8026911824]  # Добавьте ID администраторов
+# ID администраторов
+ADMIN_IDS = [123456789]  # Замените на свой ID
 
-# Конфигурация
-EXCEL_FILE = "conference_data.xlsx"
+# Файл базы данных
+DB_FILE = "conference.db"
 
 # Ранги
 RANKS = {
@@ -59,295 +58,297 @@ DEPARTMENTS = [
 
 # Награды
 AWARDS = {
-    "🏅 Боевые награды": [
-        "Орден Мужества",
-        "Медаль за Отвагу",
-        "Крест Доблести",
-        "Звезда Героя"
-    ],
-    "📜 Заслуги": [
-        "За выслугу лет (I)",
-        "За выслугу лет (II)",
-        "За выслугу лет (III)",
-        "Ветеран"
-    ],
-    "🎖 Особые награды": [
-        "Знак Почета",
-        "Благодарность командования",
-        "Почетная грамота",
-        "Нагрудный знак"
-    ],
-    "⚡ Специальные": [
-        "За оперативность",
-        "Мастер тактики",
-        "Стратег года",
-        "Наставник"
-    ]
+    "🏅 Боевые награды": ["Орден Мужества", "Медаль за Отвагу", "Крест Доблести", "Звезда Героя"],
+    "📜 Заслуги": ["За выслугу лет (1)", "За выслугу лет (2)", "За выслугу лет (3)", "Ветеран"],
+    "🎖 Особые награды": ["Знак Почета", "Благодарность командования", "Почетная грамота", "Нагрудный знак"],
+    "⚡ Специальные": ["За оперативность", "Мастер тактики", "Стратег года", "Наставник"]
 }
 
-# Инициализация Excel файла
-def init_db():
-    conn = sqlite3.connect('conference_data.db')
+# ============ РАБОТА С БАЗОЙ ДАННЫХ ============
+
+def init_database():
+    """Инициализация базы данных"""
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    # Таблица пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE,
-            game_nick TEXT,
-            callsign TEXT,
-            token TEXT UNIQUE,
+            user_id INTEGER UNIQUE NOT NULL,
+            game_nick TEXT NOT NULL,
+            callsign TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
             rank INTEGER DEFAULT 0,
             department TEXT DEFAULT 'Не назначен',
             warns TEXT DEFAULT '0/0',
             ban_status TEXT DEFAULT 'Нет',
-            ban_reason TEXT,
-            ban_date TEXT,
-            created_at TEXT
+            ban_reason TEXT DEFAULT '',
+            ban_date TEXT DEFAULT '',
+            created_at TEXT DEFAULT ''
+        )
+    ''')
+    
+    # Таблица глобального бана
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS gban (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nick TEXT,
+            reason TEXT,
+            date TEXT,
+            banned_by INTEGER
+        )
+    ''')
+    
+    # Таблица наград
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS awards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nick TEXT,
+            award_name TEXT,
+            award_type TEXT,
+            date TEXT,
+            issued_by INTEGER
+        )
+    ''')
+    
+    # Таблица предупреждений
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            nick TEXT,
+            warn_type TEXT,
+            counter TEXT,
+            reason TEXT,
+            date TEXT,
+            issued_by INTEGER
         )
     ''')
     
     conn.commit()
     conn.close()
 
-# Генерация уникального жетона
 def generate_unique_token():
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb["Пользователи"]
+    """Генерация уникального жетона"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
     
     while True:
         random_digits = ''.join([str(random.randint(0, 9)) for _ in range(4)])
         token = f"52{random_digits}"
         
-        # Проверка уникальности
-        token_exists = False
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[4] == token:
-                token_exists = True
-                break
-        
-        if not token_exists:
-            wb.close()
+        cursor.execute('SELECT token FROM users WHERE token = ?', (token,))
+        if not cursor.fetchone():
+            conn.close()
             return token
 
-# Добавление пользователя
-def add_user_excel(user_id, game_nick, callsign):
+def add_user(user_id, game_nick, callsign):
+    """Добавление пользователя"""
     token = generate_unique_token()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
     
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb["Пользователи"]
+    cursor.execute('''
+        INSERT INTO users (user_id, game_nick, callsign, token, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, game_nick, callsign, token, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     
-    new_row = [ws.max_row, user_id, game_nick, callsign, token, 0, "Не назначен",
-               "0/0", "Нет", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
-    ws.append(new_row)
-    
-    wb.save(EXCEL_FILE)
-    wb.close()
-    
+    conn.commit()
+    conn.close()
     return token
 
-# Получение данных пользователя
 def get_user_data(user_id):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb["Пользователи"]
-        
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[1] == user_id:
-                data = {
-                    "id": row[0],
-                    "user_id": row[1],
-                    "nick": row[2],
-                    "callsign": row[3],
-                    "token": row[4],
-                    "rank": row[5],
-                    "department": row[6],
-                    "warns": row[7],
-                    "ban_status": row[8],
-                    "ban_reason": row[9],
-                    "ban_date": row[10],
-                    "reg_date": row[11]
-                }
-                wb.close()
-                return data
-        
-        wb.close()
-        return None
-    except Exception as e:
-        logger.error(f"Ошибка получения данных пользователя: {e}")
-        return None
+    """Получение данных пользователя"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return {
+            "user_id": row[1],
+            "nick": row[2],
+            "callsign": row[3],
+            "token": row[4],
+            "rank": row[5],
+            "department": row[6],
+            "warns": row[7],
+            "ban_status": row[8],
+            "ban_reason": row[9],
+            "ban_date": row[10],
+            "reg_date": row[11]
+        }
+    return None
 
-# Обновление ранга
 def update_user_rank(user_id, new_rank):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb["Пользователи"]
-        
-        for row in ws.iter_rows(min_row=2):
-            if row[1].value == user_id:
-                row[5].value = new_rank
-                wb.save(EXCEL_FILE)
-                wb.close()
-                return True
-        
-        wb.close()
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка обновления ранга: {e}")
-        return False
+    """Обновление ранга"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET rank = ? WHERE user_id = ?', (new_rank, user_id))
+    conn.commit()
+    success = cursor.rowcount > 0
+    conn.close()
+    return success
 
-# Обновление отдела
 def update_user_department(user_id, department):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb["Пользователи"]
-        
-        for row in ws.iter_rows(min_row=2):
-            if row[1].value == user_id:
-                row[6].value = department
-                wb.save(EXCEL_FILE)
-                wb.close()
-                return True
-        
-        wb.close()
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка обновления отдела: {e}")
-        return False
+    """Обновление отдела"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET department = ? WHERE user_id = ?', (department, user_id))
+    conn.commit()
+    success = cursor.rowcount > 0
+    conn.close()
+    return success
 
-# Добавление предупреждения
-def add_warning_excel(user_id, issuer_id, reason):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb["Пользователи"]
-        ws_warns = wb["Предупреждения"]
-        
-        for row in ws.iter_rows(min_row=2):
-            if row[1].value == user_id:
-                current_warns = str(row[7].value)
-                warn_parts = current_warns.split('/')
-                
-                if len(warn_parts) != 2:
-                    current_verbal = 0
-                    current_written = 0
-                else:
-                    try:
-                        current_verbal = int(warn_parts[0])
-                        current_written = int(warn_parts[1])
-                    except ValueError:
-                        current_verbal = 0
-                        current_written = 0
-                
-                # Проверка лимитов
-                if current_verbal < 2:
-                    current_verbal += 1
-                    warn_type = "Устное"
-                elif current_written < 3:
-                    current_written += 1
-                    warn_type = "Письменное"
-                else:
-                    wb.close()
-                    return False, "Достигнут лимит предупреждений"
-                
-                new_warns = f"{current_verbal}/{current_written}"
-                row[7].value = new_warns
-                
-                # Запись в лист предупреждений
-                user_nick = row[2].value
-                ws_warns.append([ws_warns.max_row, user_id, user_nick, warn_type,
-                               new_warns, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issuer_id])
-                
-                wb.save(EXCEL_FILE)
-                wb.close()
-                return True, f"Выдано {warn_type.lower()} предупреждение ({new_warns})"
-        
-        wb.close()
+def add_warning(user_id, issuer_id, reason):
+    """Добавление предупреждения"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT warns, game_nick FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    
+    if not row:
+        conn.close()
         return False, "Пользователь не найден"
-    except Exception as e:
-        logger.error(f"Ошибка добавления предупреждения: {e}")
-        return False, f"Ошибка: {str(e)}"
+    
+    current_warns = row[0]
+    user_nick = row[1]
+    parts = current_warns.split('/')
+    
+    if len(parts) == 2:
+        verbal = int(parts[0])
+        written = int(parts[1])
+    else:
+        verbal = 0
+        written = 0
+    
+    if verbal < 2:
+        verbal += 1
+        warn_type = "Устное"
+    elif written < 3:
+        written += 1
+        warn_type = "Письменное"
+    else:
+        conn.close()
+        return False, "Достигнут лимит предупреждений"
+    
+    new_warns = f"{verbal}/{written}"
+    
+    cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, user_id))
+    
+    cursor.execute('''
+        INSERT INTO warnings (user_id, nick, warn_type, counter, reason, date, issued_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, user_nick, warn_type, new_warns, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issuer_id))
+    
+    conn.commit()
+    conn.close()
+    return True, f"Выдано {warn_type.lower()} предупреждение ({new_warns})"
 
-# Добавление в глобальный бан
 def add_gban(user_id, reason, banned_by):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        
-        # Получаем ник пользователя
-        ws_users = wb["Пользователи"]
-        user_nick = f"User {user_id}"
-        for row in ws_users.iter_rows(min_row=2, values_only=True):
-            if row[1] == user_id:
-                user_nick = row[2]
-                break
-        
-        ws_gban = wb["Глобальный бан"]
-        ws_gban.append([ws_gban.max_row, user_id, user_nick, reason,
-                       datetime.now().strftime("%Y-%m-%d %H:%M:%S"), banned_by])
-        
-        wb.save(EXCEL_FILE)
-        wb.close()
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка добавления в глобальный бан: {e}")
-        return False
+    """Добавление в глобальный бан"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    user_data = get_user_data(user_id)
+    user_nick = user_data['nick'] if user_data else f"User {user_id}"
+    
+    cursor.execute('''
+        INSERT INTO gban (user_id, nick, reason, date, banned_by)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, user_nick, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), banned_by))
+    
+    conn.commit()
+    conn.close()
+    return True
 
-# Проверка глобального бана
 def check_gban(user_id):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws_gban = wb["Глобальный бан"]
-        
-        for row in ws_gban.iter_rows(min_row=2, values_only=True):
-            if row[1] == user_id:
-                result = {
-                    "is_banned": True,
-                    "nick": row[2],
-                    "reason": row[3],
-                    "date": row[4],
-                    "banned_by": row[5]
-                }
-                wb.close()
-                return result
-        
-        wb.close()
-        return {"is_banned": False}
-    except Exception as e:
-        logger.error(f"Ошибка проверки глобального бана: {e}")
-        return {"is_banned": False}
+    """Проверка глобального бана"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM gban WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return {
+            "is_banned": True,
+            "nick": row[2],
+            "reason": row[3],
+            "date": row[4],
+            "banned_by": row[5]
+        }
+    return {"is_banned": False}
 
-# Добавление награды
-def add_award_excel(user_id, award_name, award_type, issued_by):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws_awards = wb["Награды"]
-        
-        # Получаем ник пользователя
-        ws_users = wb["Пользователи"]
-        user_nick = f"User {user_id}"
-        for row in ws_users.iter_rows(min_row=2, values_only=True):
-            if row[1] == user_id:
-                user_nick = row[2]
-                break
-        
-        ws_awards.append([ws_awards.max_row, user_id, user_nick, award_name, award_type,
-                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issued_by])
-        
-        wb.save(EXCEL_FILE)
-        wb.close()
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка добавления награды: {e}")
-        return False
+def add_award(user_id, award_name, award_type, issued_by):
+    """Добавление награды"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    user_data = get_user_data(user_id)
+    user_nick = user_data['nick'] if user_data else f"User {user_id}"
+    
+    cursor.execute('''
+        INSERT INTO awards (user_id, nick, award_name, award_type, date, issued_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (user_id, user_nick, award_name, award_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issued_by))
+    
+    conn.commit()
+    conn.close()
+    return True
 
-# Получение прав пользователя
+def get_statistics():
+    """Получение статистики"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM users')
+    total = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM users WHERE ban_status = "Нет"')
+    active = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM users WHERE rank = 6')
+    generals = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        "total": total,
+        "active": active,
+        "banned": total - active,
+        "generals": generals
+    }
+
+def get_user_awards(user_id):
+    """Получение наград пользователя"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT award_name, award_type, date FROM awards WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,))
+    awards = cursor.fetchall()
+    conn.close()
+    
+    return awards
+
 def get_user_permissions(user_id):
+    """Получение прав пользователя"""
     user_data = get_user_data(user_id)
     if not user_data:
         return RANKS[0]
     return RANKS.get(user_data['rank'], RANKS[0])
 
-# Главное меню
+# ============ ОБРАБОТЧИКИ КОМАНД ============
+
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     permissions = get_user_permissions(user_id)
@@ -380,13 +381,12 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(
-            "🎮 Добро пожаловать в конференцию!\n\n"
-            "Для начала работы пройдите регистрацию:",
+            "🎮 Добро пожаловать в конференцию!\n\nДля начала работы пройдите регистрацию:",
             reply_markup=reply_markup
         )
 
-# Регистрация
 async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало регистрации"""
     user_id = update.effective_user.id
     
     if get_user_data(user_id):
@@ -394,23 +394,22 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await main_menu(update, context)
         return ConversationHandler.END
     
-    await update.message.reply_text(
-        "📝 Регистрация в конференции\n\n"
-        "Шаг 1/2 - Введите ваш игровой ник:"
-    )
+    await update.message.reply_text("📝 Регистрация в конференции\n\nШаг 1/2 - Введите ваш игровой ник:")
     return GAME_NICK
 
 async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение ника"""
     context.user_data['game_nick'] = update.message.text
     await update.message.reply_text("Шаг 2/2 - Введите ваш позывной:")
     return CALLSIGN
 
 async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершение регистрации"""
     callsign = update.message.text
     user_id = update.effective_user.id
     game_nick = context.user_data['game_nick']
     
-    token = add_user_excel(user_id, game_nick, callsign)
+    token = add_user(user_id, game_nick, callsign)
     
     await update.message.reply_text(
         f"✅ Регистрация успешно завершена!\n\n"
@@ -424,8 +423,8 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     await main_menu(update, context)
     return ConversationHandler.END
 
-# Профиль
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ профиля"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     
@@ -447,8 +446,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
 
-# Поиск по жетону
 async def search_by_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Поиск по жетону"""
     user_id = update.effective_user.id
     permissions = get_user_permissions(user_id)
     
@@ -460,450 +459,90 @@ async def search_by_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SEARCH_TOKEN
 
 async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполнение поиска"""
     token = update.message.text.strip()
     
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb["Пользователи"]
-        
-        found = False
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[4] == token:
-                rank_name = RANKS.get(row[5], RANKS[0])['name']
-                await update.message.reply_text(
-                    f"🎫 Информация по жетону {token}:\n\n"
-                    f"🎮 Ник: {row[2]}\n"
-                    f"📻 Позывной: {row[3]}\n"
-                    f"⭐ Ранг: {rank_name}\n"
-                    f"📁 Отдел: {row[6]}\n"
-                    f"⚠️ Предупреждения: {row[7]}"
-                )
-                found = True
-                break
-        
-        if not found:
-            await update.message.reply_text("❌ Участник с таким жетоном не найден.")
-        
-        wb.close()
-    except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
-        await update.message.reply_text("❌ Ошибка при поиске.")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
     
-    return ConversationHandler.END
-
-# Управление рангами
-async def manage_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    permissions = get_user_permissions(user_id)
+    cursor.execute('SELECT * FROM users WHERE token = ?', (token,))
+    row = cursor.fetchone()
+    conn.close()
     
-    if not permissions['can_manage_ranks']:
-        await update.message.reply_text("❌ Недостаточно прав.")
-        return ConversationHandler.END
-    
-    await update.message.reply_text("Введите ID пользователя для изменения ранга:")
-    return RANK_ASSIGN_USER
-
-async def assign_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['target_id'] = update.message.text
-    
-    ranks_list = "\n".join([f"{k}: {v['name']}" for k, v in RANKS.items()])
-    
-    await update.message.reply_text(
-        f"Выберите новый ранг (введите номер):\n\n{ranks_list}"
-    )
-    return RANK_ASSIGN_RANK
-
-async def complete_rank_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        new_rank = int(update.message.text)
-        target_id = int(context.user_data['target_id'])
-        
-        if new_rank not in RANKS:
-            await update.message.reply_text("❌ Неверный ранг.")
-            return ConversationHandler.END
-        
-        if update_user_rank(target_id, new_rank):
-            await update.message.reply_text(
-                f"✅ Ранг пользователя {target_id} изменен на {RANKS[new_rank]['name']}"
-            )
-        else:
-            await update.message.reply_text("❌ Пользователь не найден.")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат ID или ранга.")
-    except Exception as e:
-        logger.error(f"Ошибка изменения ранга: {e}")
-        await update.message.reply_text("❌ Ошибка при изменении ранга.")
-    
-    return ConversationHandler.END
-
-# Назначение отдела
-async def assign_department(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    permissions = get_user_permissions(user_id)
-    
-    if not permissions['can_manage_ranks']:
-        await update.message.reply_text("❌ Недостаточно прав.")
-        return ConversationHandler.END
-    
-    deps_list = "\n".join([f"{i+1}. {dep}" for i, dep in enumerate(DEPARTMENTS)])
-    
-    await update.message.reply_text(
-        f"Введите ID пользователя и номер отдела через пробел:\n\n{deps_list}"
-    )
-    return DEPARTMENT_ASSIGN
-
-async def complete_department_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        parts = update.message.text.split()
-        if len(parts) != 2:
-            await update.message.reply_text("❌ Неверный формат. Используйте: ID номер_отдела")
-            return ConversationHandler.END
-        
-        target_id = int(parts[0])
-        dept_num = int(parts[1]) - 1
-        
-        if dept_num < 0 or dept_num >= len(DEPARTMENTS):
-            await update.message.reply_text("❌ Неверный номер отдела.")
-            return ConversationHandler.END
-        
-        if update_user_department(target_id, DEPARTMENTS[dept_num]):
-            await update.message.reply_text(
-                f"✅ Пользователь {target_id} назначен в отдел: {DEPARTMENTS[dept_num]}"
-            )
-        else:
-            await update.message.reply_text("❌ Пользователь не найден.")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат. Используйте: ID номер_отдела")
-    except Exception as e:
-        logger.error(f"Ошибка назначения отдела: {e}")
-        await update.message.reply_text("❌ Ошибка при назначении отдела.")
-    
-    return ConversationHandler.END
-
-# Выдача наград
-async def award_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    permissions = get_user_permissions(user_id)
-    
-    if not permissions['can_award']:
-        await update.message.reply_text("❌ Недостаточно прав.")
-        return ConversationHandler.END
-    
-    await update.message.reply_text("🎖 Введите ID получателя награды:")
-    return AWARD_USER
-
-async def select_award_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['award_target'] = update.message.text
-    
-    types_list = "\n".join([f"{i+1}. {t}" for i, t in enumerate(AWARDS.keys())])
-    
-    await update.message.reply_text(
-        f"Выберите тип награды:\n\n{types_list}"
-    )
-    return AWARD_TYPE
-
-async def select_specific_award(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        type_num = int(update.message.text) - 1
-        award_types = list(AWARDS.keys())
-        
-        if type_num < 0 or type_num >= len(award_types):
-            await update.message.reply_text("❌ Неверный тип награды.")
-            return ConversationHandler.END
-        
-        context.user_data['award_type'] = award_types[type_num]
-        awards_list = "\n".join([f"{i+1}. {a}" for i, a in enumerate(AWARDS[award_types[type_num]])])
-        
+    if row:
+        rank_name = RANKS.get(row[5], RANKS[0])['name']
         await update.message.reply_text(
-            f"Выберите награду:\n\n{awards_list}"
+            f"🎫 Информация по жетону {token}:\n\n"
+            f"🎮 Ник: {row[2]}\n"
+            f"📻 Позывной: {row[3]}\n"
+            f"⭐ Ранг: {rank_name}\n"
+            f"📁 Отдел: {row[6]}\n"
+            f"⚠️ Предупреждения: {row[7]}"
         )
-        return AWARD_SPECIFIC
-    except ValueError:
-        await update.message.reply_text("❌ Введите номер типа награды.")
-        return ConversationHandler.END
-
-async def complete_award(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        award_num = int(update.message.text) - 1
-        award_type = context.user_data['award_type']
-        
-        if award_num < 0 or award_num >= len(AWARDS[award_type]):
-            await update.message.reply_text("❌ Неверный номер награды.")
-            return ConversationHandler.END
-        
-        award_name = AWARDS[award_type][award_num]
-        target_id = int(context.user_data['award_target'])
-        issuer_id = update.effective_user.id
-        
-        if add_award_excel(target_id, award_name, award_type, issuer_id):
-            await update.message.reply_text(
-                f"✅ Награда '{award_name}' выдана пользователю {target_id}!"
-            )
-        else:
-            await update.message.reply_text("❌ Ошибка при выдаче награды.")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат.")
-    except Exception as e:
-        logger.error(f"Ошибка выдачи награды: {e}")
-        await update.message.reply_text("❌ Ошибка при выдаче награды.")
-    
-    return ConversationHandler.END
-
-# Предупреждения
-async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    permissions = get_user_permissions(user_id)
-    
-    if not permissions['can_warn']:
-        await update.message.reply_text("❌ Недостаточно прав.")
-        return ConversationHandler.END
-    
-    await update.message.reply_text("⚠️ Введите ID пользователя для предупреждения:")
-    return WARN_USER
-
-async def warn_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['warn_target'] = update.message.text
-    await update.message.reply_text("Введите причину предупреждения:")
-    return WARN_REASON
-
-async def complete_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reason = update.message.text
-    try:
-        target_id = int(context.user_data['warn_target'])
-        issuer_id = update.effective_user.id
-        
-        success, message = add_warning_excel(target_id, issuer_id, reason)
-        
-        if success:
-            await update.message.reply_text(f"✅ {message}")
-        else:
-            await update.message.reply_text(f"❌ {message}")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный ID пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка выдачи предупреждения: {e}")
-        await update.message.reply_text("❌ Ошибка при выдаче предупреждения.")
-    
-    return ConversationHandler.END
-
-# Бан пользователя
-async def ban_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    permissions = get_user_permissions(user_id)
-    
-    if not permissions['can_ban']:
-        await update.message.reply_text("❌ Недостаточно прав.")
-        return ConversationHandler.END
-    
-    await update.message.reply_text("🚫 Введите ID пользователя для бана:")
-    return BAN_USER
-
-async def ban_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['ban_target'] = update.message.text
-    
-    durations = ["1 час", "6 часов", "12 часов", "1 день", "3 дня", "7 дней", "30 дней", "Навсегда"]
-    dur_list = "\n".join([f"{i+1}. {d}" for i, d in enumerate(durations)])
-    
-    await update.message.reply_text(
-        f"Выберите длительность бана:\n\n{dur_list}\n\n"
-        f"Или введите причину и номер длительности через пробел\n"
-        f"Пример: Нарушение правил 3"
-    )
-    return BAN_DURATION
-
-async def complete_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        parts = update.message.text.rsplit(' ', 1)
-        
-        if len(parts) == 2:
-            reason = parts[0]
-            duration_num = int(parts[1]) - 1
-        else:
-            reason = update.message.text
-            duration_num = 7  # По умолчанию навсегда
-        
-        durations = ["1 час", "6 часов", "12 часов", "1 день", "3 дня", "7 дней", "30 дней", "Навсегда"]
-        
-        if duration_num < 0 or duration_num >= len(durations):
-            await update.message.reply_text("❌ Неверная длительность.")
-            return ConversationHandler.END
-        
-        duration = durations[duration_num]
-        target_id = int(context.user_data['ban_target'])
-        issuer_id = update.effective_user.id
-        
-        # Здесь должна быть логика бана
-        # Временно просто выводим сообщение
-        await update.message.reply_text(
-            f"✅ Пользователь {target_id} забанен!\n"
-            f"Причина: {reason}\n"
-            f"Длительность: {duration}"
-        )
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат.")
-    except Exception as e:
-        logger.error(f"Ошибка бана: {e}")
-        await update.message.reply_text("❌ Ошибка при бане.")
-    
-    return ConversationHandler.END
-
-# Глобальный бан
-async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data = get_user_data(user_id)
-    
-    if not user_data or user_data['rank'] < 6:
-        await update.message.reply_text("❌ Только генералы могут использовать глобальный бан.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /gban ID причина")
-        return
-    
-    try:
-        target_id = int(context.args[0])
-        reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
-        
-        if add_gban(target_id, reason, user_id):
-            await update.message.reply_text(
-                f"🚫 Пользователь {target_id} добавлен в глобальный черный список.\n"
-                f"Причина: {reason}"
-            )
-        else:
-            await update.message.reply_text("❌ Ошибка при добавлении в ЧС.")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный ID пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка глобального бана: {e}")
-        await update.message.reply_text("❌ Ошибка при выполнении команды.")
-
-# Проверка глобального бана
-async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /check_gban ID")
-        return
-    
-    try:
-        target_id = int(context.args[0])
-        result = check_gban(target_id)
-        
-        if result['is_banned']:
-            await update.message.reply_text(
-                f"🚫 Пользователь в глобальном ЧС!\n\n"
-                f"👤 Ник: {result['nick']}\n"
-                f"📝 Причина: {result['reason']}\n"
-                f"📅 Дата: {result['date']}\n"
-                f"👮 Кто забанил: {result['banned_by']}"
-            )
-        else:
-            await update.message.reply_text("✅ Пользователь не в глобальном ЧС.")
-    except ValueError:
-        await update.message.reply_text("❌ Неверный ID пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка проверки глобального бана: {e}")
-        await update.message.reply_text("❌ Ошибка при проверке.")
-
-# Статистика
-async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb["Пользователи"]
-        
-        total = ws.max_row - 1
-        active = 0
-        banned = 0
-        generals = 0
-        
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if row[8] == "Нет":
-                active += 1
-            else:
-                banned += 1
-            if row[5] == 6:
-                generals += 1
-        
-        wb.close()
-        
-        await update.message.reply_text(
-            f"📊 Статистика конференции\n\n"
-            f"👥 Всего участников: {total}\n"
-            f"✅ Активных: {active}\n"
-            f"🚫 Забанено: {banned}\n"
-            f"🌟 Генералов: {generals}"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка получения статистики: {e}")
-        await update.message.reply_text("❌ Ошибка при получении статистики.")
-
-# Награды пользователя
-async def show_my_awards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws_awards = wb["Награды"]
-        
-        awards_list = []
-        for row in ws_awards.iter_rows(min_row=2, values_only=True):
-            if row[1] == user_id:
-                awards_list.append(f"🏅 {row[3]} ({row[4]}) - {row[5]}")
-        
-        wb.close()
-        
-        if awards_list:
-            awards_text = "\n".join(awards_list[-10:])  # Последние 10 наград
-            await update.message.reply_text(
-                f"🏅 Ваши награды (последние 10):\n\n{awards_text}"
-            )
-        else:
-            await update.message.reply_text("У вас пока нет наград.")
-    except Exception as e:
-        logger.error(f"Ошибка получения наград: {e}")
-        await update.message.reply_text("❌ Ошибка при получении наград.")
-
-# Обработка сообщений
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    user_id = update.effective_user.id
-    
-    # Проверка глобального бана
-    gban_status = check_gban(user_id)
-    if gban_status['is_banned']:
-        await update.message.reply_text("🚫 Вы в глобальном черном списке!")
-        return
-    
-    if text == "📝 Регистрация":
-        return await start_registration(update, context)
-    elif text == "👤 Профиль":
-        await show_profile(update, context)
-    elif text == "🔍 Поиск":
-        return await search_by_token(update, context)
-    elif text == "📊 Статистика":
-        await show_statistics(update, context)
-    elif text == "🏅 Мои награды":
-        await show_my_awards(update, context)
-    elif text == "🎖 Выдать награду":
-        return await award_user(update, context)
-    elif text == "⚠️ Предупредить":
-        return await warn_user(update, context)
-    elif text == "📋 Управление рангами":
-        return await manage_rank(update, context)
-    elif text == "👥 Назначить отдел":
-        return await assign_department(update, context)
-    elif text == "🚫 Бан":
-        return await ban_user_menu(update, context)
     else:
-        await main_menu(update, context)
+        await update.message.reply_text("❌ Участник с таким жетоном не найден.")
+    
+    return ConversationHandler.END
 
-# Отмена операции
+async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ статистики"""
+    stats = get_statistics()
+    
+    await update.message.reply_text(
+        f"📊 Статистика конференции\n\n"
+        f"👥 Всего участников: {stats['total']}\n"
+        f"✅ Активных: {stats['active']}\n"
+        f"🚫 Забанено: {stats['banned']}\n"
+        f"🌟 Генералов: {stats['generals']}"
+    )
+
+async def show_my_awards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ наград"""
+    user_id = update.effective_user.id
+    awards = get_user_awards(user_id)
+    
+    if awards:
+        awards_text = "\n".join([f"🏅 {a[0]} ({a[1]}) - {a[2]}" for a in awards])
+        await update.message.reply_text(f"🏅 Ваши награды:\n\n{awards_text}")
+    else:
+        await update.message.reply_text("У вас пока нет наград.")
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена операции"""
     await update.message.reply_text("❌ Операция отменена.")
     await main_menu(update, context)
     return ConversationHandler.END
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка сообщений"""
+    text = update.message.text
+    user_id = update.effective_user.id
+    
+    # Проверка глобального бана
+    gban = check_gban(user_id)
+    if gban['is_banned']:
+        await update.message.reply_text("🚫 Вы в глобальном черном списке!")
+        return
+    
+    handlers = {
+        "📝 Регистрация": start_registration,
+        "👤 Профиль": show_profile,
+        "🔍 Поиск": search_by_token,
+        "📊 Статистика": show_statistics,
+        "🏅 Мои награды": show_my_awards,
+    }
+    
+    if text in handlers:
+        return await handlers[text](update, context)
+    else:
+        await main_menu(update, context)
+
+# ============ ЗАПУСК ============
+
 def main():
-    # Инициализация Excel
-    init_excel()
+    """Главная функция"""
+    # Инициализация базы данных
+    init_database()
     
     # Создание приложения
     application = Application.builder().token(BOT_TOKEN).build()
@@ -927,77 +566,12 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Обработчик рангов
-    rank_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^📋 Управление рангами$'), manage_rank)],
-        states={
-            RANK_ASSIGN_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, assign_rank)],
-            RANK_ASSIGN_RANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_rank_assign)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    
-    # Обработчик отделов
-    dept_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^👥 Назначить отдел$'), assign_department)],
-        states={
-            DEPARTMENT_ASSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_department_assign)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    
-    # Обработчик наград
-    award_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^🎖 Выдать награду$'), award_user)],
-        states={
-            AWARD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_award_type)],
-            AWARD_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_specific_award)],
-            AWARD_SPECIFIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_award)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    
-    # Обработчик предупреждений
-    warn_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^⚠️ Предупредить$'), warn_user)],
-        states={
-            WARN_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, warn_reason)],
-            WARN_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_warn)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    
-    # Обработчик бана
-    ban_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^🚫 Бан$'), ban_user_menu)],
-        states={
-            BAN_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ban_duration)],
-            BAN_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_ban)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    
-    # Добавление обработчиков
     application.add_handler(reg_handler)
     application.add_handler(search_handler)
-    application.add_handler(rank_handler)
-    application.add_handler(dept_handler)
-    application.add_handler(award_handler)
-    application.add_handler(warn_handler)
-    application.add_handler(ban_handler)
-    
-    # Команды
     application.add_handler(CommandHandler('start', main_menu))
-    application.add_handler(CommandHandler('gban', gban_command))
-    application.add_handler(CommandHandler('check_gban', check_gban_command))
-    
-    # Обработчик сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Обработка ошибок
-    application.add_error_handler(lambda update, context: logger.error(f"Ошибка: {context.error}"))
-    
-    print("🤖 Бот конференции с Excel-базой запущен!")
+    print("🤖 Бот запущен!")
     application.run_polling()
 
 if __name__ == '__main__':
