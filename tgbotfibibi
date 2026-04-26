@@ -902,7 +902,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text)
 
-======== ПРОФИЛЬ ДРУГОГО ПОЛЬЗОВАТЕЛЯ===========
+# ============ ПРОФИЛЬ ДРУГОГО ПОЛЬЗОВАТЕЛЯ ============
 
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Просмотр профиля другого пользователя"""
