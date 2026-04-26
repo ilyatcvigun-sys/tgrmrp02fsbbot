@@ -26,7 +26,7 @@ BAN_USER, BAN_DURATION = range(11, 13)
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 
 # ID администраторов
-ADMIN_IDS = [8026911824]  # Замените на свой ID
+ADMIN_IDS = [8026911824]
 
 # Файл базы данных
 DB_FILE = "conference.db"
@@ -64,14 +64,85 @@ AWARDS = {
     "⚡ Специальные": ["За оперативность", "Мастер тактики", "Стратег года", "Наставник"]
 }
 
-# ============ РАБОТА С БАЗОЙ ДАННЫХ ============
+# ============ ПОИСК ПОЛЬЗОВАТЕЛЯ ============
 
-def init_database():
-    """Инициализация базы данных"""
+def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    Извлекает user_id из разных форматов:
+    - Числовой ID: 123456789
+    - @username: @username
+    - Ссылка: https://t.me/username
+    - Ответ на сообщение
+    """
+    text = text.strip()
+    
+    # Числовой ID
+    if text.isdigit():
+        return int(text)
+    
+    # @username
+    if text.startswith('@'):
+        username = text[1:]
+        user_id = find_user_by_username(username)
+        if user_id:
+            return user_id
+        return None
+    
+    # Ссылка https://t.me/username
+    if 't.me/' in text:
+        username = text.split('t.me/')[-1].split()[0].strip()
+        if username:
+            user_id = find_user_by_username(username)
+            if user_id:
+                return user_id
+        return None
+    
+    # Ответ на сообщение
+    if update.message and update.message.reply_to_message:
+        return update.message.reply_to_message.from_user.id
+    
+    return None
+
+def find_user_by_username(username):
+    """Поиск пользователя по username"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Таблица пользователей
+    cursor.execute('''
+        SELECT user_id FROM users 
+        WHERE game_nick LIKE ? OR callsign LIKE ?
+    ''', (f'%{username}%', f'%{username}%'))
+    
+    results = cursor.fetchall()
+    conn.close()
+    
+    if len(results) == 1:
+        return results[0][0]
+    elif len(results) > 1:
+        return -1
+    return None
+
+def find_users_by_username(username):
+    """Поиск всех пользователей по username"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT user_id, game_nick, callsign, token, rank 
+        FROM users 
+        WHERE game_nick LIKE ? OR callsign LIKE ?
+    ''', (f'%{username}%', f'%{username}%'))
+    
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+# ============ РАБОТА С БАЗОЙ ДАННЫХ ============
+
+def init_database():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +160,6 @@ def init_database():
         )
     ''')
     
-    # Таблица глобального бана
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS gban (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,7 +171,6 @@ def init_database():
         )
     ''')
     
-    # Таблица наград
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS awards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +183,6 @@ def init_database():
         )
     ''')
     
-    # Таблица предупреждений
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS warnings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,7 +200,6 @@ def init_database():
     conn.close()
 
 def generate_unique_token():
-    """Генерация уникального жетона"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -146,7 +213,6 @@ def generate_unique_token():
             return token
 
 def add_user(user_id, game_nick, callsign):
-    """Добавление пользователя"""
     token = generate_unique_token()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -161,7 +227,6 @@ def add_user(user_id, game_nick, callsign):
     return token
 
 def get_user_data(user_id):
-    """Получение данных пользователя"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -186,7 +251,6 @@ def get_user_data(user_id):
     return None
 
 def update_user_rank(user_id, new_rank):
-    """Обновление ранга"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('UPDATE users SET rank = ? WHERE user_id = ?', (new_rank, user_id))
@@ -196,7 +260,6 @@ def update_user_rank(user_id, new_rank):
     return success
 
 def update_user_department(user_id, department):
-    """Обновление отдела"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('UPDATE users SET department = ? WHERE user_id = ?', (department, user_id))
@@ -206,7 +269,6 @@ def update_user_department(user_id, department):
     return success
 
 def add_warning(user_id, issuer_id, reason):
-    """Добавление предупреждения"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -221,12 +283,8 @@ def add_warning(user_id, issuer_id, reason):
     user_nick = row[1]
     parts = current_warns.split('/')
     
-    if len(parts) == 2:
-        verbal = int(parts[0])
-        written = int(parts[1])
-    else:
-        verbal = 0
-        written = 0
+    verbal = int(parts[0]) if len(parts) == 2 else 0
+    written = int(parts[1]) if len(parts) == 2 else 0
     
     if verbal < 2:
         verbal += 1
@@ -239,7 +297,6 @@ def add_warning(user_id, issuer_id, reason):
         return False, "Достигнут лимит предупреждений"
     
     new_warns = f"{verbal}/{written}"
-    
     cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, user_id))
     
     cursor.execute('''
@@ -252,10 +309,8 @@ def add_warning(user_id, issuer_id, reason):
     return True, f"Выдано {warn_type.lower()} предупреждение ({new_warns})"
 
 def add_gban(user_id, reason, banned_by):
-    """Добавление в глобальный бан"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     user_data = get_user_data(user_id)
     user_nick = user_data['nick'] if user_data else f"User {user_id}"
     
@@ -269,29 +324,19 @@ def add_gban(user_id, reason, banned_by):
     return True
 
 def check_gban(user_id):
-    """Проверка глобального бана"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     cursor.execute('SELECT * FROM gban WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     conn.close()
     
     if row:
-        return {
-            "is_banned": True,
-            "nick": row[2],
-            "reason": row[3],
-            "date": row[4],
-            "banned_by": row[5]
-        }
+        return {"is_banned": True, "nick": row[2], "reason": row[3], "date": row[4], "banned_by": row[5]}
     return {"is_banned": False}
 
 def add_award(user_id, award_name, award_type, issued_by):
-    """Добавление награды"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     user_data = get_user_data(user_id)
     user_nick = user_data['nick'] if user_data else f"User {user_id}"
     
@@ -305,75 +350,51 @@ def add_award(user_id, award_name, award_type, issued_by):
     return True
 
 def get_statistics():
-    """Получение статистики"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
     cursor.execute('SELECT COUNT(*) FROM users')
     total = cursor.fetchone()[0]
-    
     cursor.execute('SELECT COUNT(*) FROM users WHERE ban_status = "Нет"')
     active = cursor.fetchone()[0]
-    
     cursor.execute('SELECT COUNT(*) FROM users WHERE rank = 6')
     generals = cursor.fetchone()[0]
-    
     conn.close()
     
-    return {
-        "total": total,
-        "active": active,
-        "banned": total - active,
-        "generals": generals
-    }
+    return {"total": total, "active": active, "banned": total - active, "generals": generals}
 
 def get_user_awards(user_id):
-    """Получение наград пользователя"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     cursor.execute('SELECT award_name, award_type, date FROM awards WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,))
     awards = cursor.fetchall()
     conn.close()
-    
     return awards
 
 def get_user_permissions(user_id):
-    """Получение прав пользователя"""
     user_data = get_user_data(user_id)
     if not user_data:
         return RANKS[0]
     return RANKS.get(user_data['rank'], RANKS[0])
 
-# ============ ОБРАБОТЧИКИ КОМАНД ============
+# ============ КОМАНДА /start ============
 
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню"""
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start - показывает меню"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
-    permissions = get_user_permissions(user_id)
     
     if user_data:
         keyboard = [
             [KeyboardButton("👤 Профиль"), KeyboardButton("🔍 Поиск")],
             [KeyboardButton("📊 Статистика"), KeyboardButton("🏅 Мои награды")]
         ]
-        
-        if permissions['can_award']:
-            keyboard.append([KeyboardButton("🎖 Выдать награду"), KeyboardButton("⚠️ Предупредить")])
-        if permissions['can_manage_ranks']:
-            keyboard.append([KeyboardButton("📋 Управление рангами"), KeyboardButton("👥 Назначить отдел")])
-        if permissions['can_ban']:
-            keyboard.append([KeyboardButton("🚫 Бан")])
-        
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(
-            f"🎮 Бот конференции\n\n"
-            f"👤 {user_data['callsign']}\n"
-            f"🎫 Жетон: {user_data['token']}\n"
-            f"⭐ {permissions['name']}\n"
-            f"📁 Отдел: {user_data['department']}",
+            "🎮 Главное меню\n\nИспользуйте кнопки ниже или команды:\n"
+            "/info - информация о профиле\n"
+            "/help - список команд",
             reply_markup=reply_markup
         )
     else:
@@ -381,90 +402,291 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(
-            "🎮 Добро пожаловать в конференцию!\n\nДля начала работы пройдите регистрацию:",
+            "Добро пожаловать!\nДля начала работы пройдите регистрацию:",
             reply_markup=reply_markup
         )
 
-async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало регистрации"""
-    user_id = update.effective_user.id
-    
-    if get_user_data(user_id):
-        await update.message.reply_text("❌ Вы уже зарегистрированы!")
-        await main_menu(update, context)
-        return ConversationHandler.END
-    
-    await update.message.reply_text("📝 Регистрация в конференции\n\nШаг 1/2 - Введите ваш игровой ник:")
-    return GAME_NICK
+# ============ КОМАНДА /info ============
 
-async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение ника"""
-    context.user_data['game_nick'] = update.message.text
-    await update.message.reply_text("Шаг 2/2 - Введите ваш позывной:")
-    return CALLSIGN
-
-async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершение регистрации"""
-    callsign = update.message.text
-    user_id = update.effective_user.id
-    game_nick = context.user_data['game_nick']
-    
-    token = add_user(user_id, game_nick, callsign)
-    
-    await update.message.reply_text(
-        f"✅ Регистрация успешно завершена!\n\n"
-        f"🎮 Игровой ник: {game_nick}\n"
-        f"📻 Позывной: {callsign}\n"
-        f"🎫 Ваш жетон: {token}\n"
-        f"⭐ Ранг: {RANKS[0]['name']}\n\n"
-        f"Сохраните жетон! Для повышения обратитесь к командованию."
-    )
-    
-    await main_menu(update, context)
-    return ConversationHandler.END
-
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ профиля"""
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает информацию о профиле как на скриншоте"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     
     if not user_data:
-        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start")
+        return
+    
+    permissions = get_user_permissions(user_id)
+    
+    info_text = (
+        f"🎮 Бот конференции\n\n"
+        f"👤 {user_data['callsign']}\n"
+        f"🎫 Жетон: {user_data['token']}\n"
+        f"⭐️ {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}"
+    )
+    
+    await update.message.reply_text(info_text)
+
+# ============ КОМАНДА /help ============
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Справка по командам"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    permissions = get_user_permissions(user_id)
+    
+    help_text = "📚 **СПРАВКА ПО КОМАНДАМ**\n\n"
+    
+    help_text += "**Основные:**\n"
+    help_text += "/start - Главное меню\n"
+    help_text += "/info - Информация о профиле\n"
+    help_text += "/help - Эта справка\n"
+    help_text += "/profile - Ваш профиль\n"
+    help_text += "/stats - Статистика\n"
+    help_text += "/awards - Ваши награды\n\n"
+    
+    if permissions['can_search']:
+        help_text += "**Поиск:**\n"
+        help_text += "/search 52**** - Поиск по жетону\n\n"
+    
+    if permissions['can_warn']:
+        help_text += "**Предупреждения:**\n"
+        help_text += "/warn ID/@user причина\n"
+        help_text += "Пример: /warn 123456789 Нарушение\n"
+        help_text += "Пример: /warn @username Нарушение\n\n"
+    
+    if permissions['can_award']:
+        help_text += "**Награды:**\n"
+        help_text += "/award ID/@user - Выдать награду\n\n"
+    
+    if permissions['can_manage_ranks']:
+        help_text += "**Управление:**\n"
+        help_text += "/setrank ID/@user ранг (0-6)\n"
+        help_text += "/setdept ID/@user номер_отдела\n\n"
+    
+    if permissions['can_ban']:
+        help_text += "**Бан:**\n"
+        help_text += "/ban ID/@user причина\n"
+        help_text += "/unban ID/@user\n"
+        help_text += "/gban ID/@user причина - Глобальный бан\n"
+        help_text += "/ungban ID/@user - Снять глобальный бан\n"
+        help_text += "/check_gban ID/@user - Проверка бана\n\n"
+    
+    if user_id in ADMIN_IDS:
+        help_text += "**Админ:**\n"
+        help_text += "/add_admin ID\n"
+        help_text += "/remove_admin ID\n"
+        help_text += "/gban_list - Список ЧС\n\n"
+    
+    help_text += "**Форматы:** ID, @username, ссылка t.me, ответ на сообщение"
+    
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+# ============ КОМАНДЫ С ПОДДЕРЖКОЙ @username ============
+
+async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный бан"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    if not user_data or user_data['rank'] < 6:
+        await update.message.reply_text("❌ Только генералы могут использовать глобальный бан.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Использование: /gban ID/@user/ссылка причина\n"
+            "Или ответьте на сообщение: /gban причина"
+        )
+        return
+    
+    target_text = context.args[0]
+    reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
+    
+    target_id = extract_user_id(update, context, target_text)
+    
+    if target_id is None:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    if target_id == -1:
+        username = target_text.replace('@', '').replace('https://t.me/', '')
+        users = find_users_by_username(username)
+        text = "Найдено несколько:\n\n"
+        for u in users:
+            rank_name = RANKS.get(u[4], RANKS[0])['name']
+            text += f"🆔 {u[0]} | {u[1]} | {u[2]} | {rank_name}\n"
+        text += "\nУточните: /gban ID причина"
+        await update.message.reply_text(text)
+        return
+    
+    add_gban(target_id, reason, user_id)
+    target_data = get_user_data(target_id)
+    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    
+    await update.message.reply_text(
+        f"🚫 Глобальный бан!\n\n"
+        f"👤 {target_name}\n"
+        f"🆔 {target_id}\n"
+        f"📝 {reason}\n"
+        f"👮 Забанил: {user_data['callsign']}"
+    )
+
+async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка глобального бана"""
+    if not context.args:
+        await update.message.reply_text("❌ /check_gban ID/@user")
+        return
+    
+    target_text = context.args[0]
+    target_id = extract_user_id(update, context, target_text)
+    
+    if target_id is None or target_id == -1:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    result = check_gban(target_id)
+    
+    if result['is_banned']:
+        await update.message.reply_text(
+            f"🚫 В глобальном ЧС!\n\n"
+            f"👤 {result['nick']}\n"
+            f"📝 {result['reason']}\n"
+            f"📅 {result['date']}\n"
+            f"👮 Забанил: {result['banned_by']}"
+        )
+    else:
+        await update.message.reply_text("✅ Не в глобальном ЧС.")
+
+async def setrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установка ранга"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    if not user_data or user_data['rank'] < 4:
+        await update.message.reply_text("❌ Недостаточно прав.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /setrank ID/@user ранг (0-6)")
+        return
+    
+    target_text = context.args[0]
+    try:
+        new_rank = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Ранг: 0-6")
+        return
+    
+    if new_rank not in RANKS:
+        await update.message.reply_text("❌ Неверный ранг.")
+        return
+    
+    target_id = extract_user_id(update, context, target_text)
+    
+    if target_id is None or target_id == -1:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    if update_user_rank(target_id, new_rank):
+        target_data = get_user_data(target_id)
+        await update.message.reply_text(f"✅ {target_data['callsign']} → {RANKS[new_rank]['name']}")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
+
+async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Предупреждение"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    if not user_data or user_data['rank'] < 3:
+        await update.message.reply_text("❌ Недостаточно прав.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /warn ID/@user причина")
+        return
+    
+    target_text = context.args[0]
+    reason = ' '.join(context.args[1:])
+    
+    target_id = extract_user_id(update, context, target_text)
+    
+    if target_id is None or target_id == -1:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    success, message = add_warning(target_id, user_id, reason)
+    target_data = get_user_data(target_id)
+    
+    if success:
+        await update.message.reply_text(f"⚠️ {message}\n👤 {target_data['callsign']}\n📝 {reason}")
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Профиль"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    if not user_data:
+        await update.message.reply_text("❌ Не зарегистрированы.")
         return
     
     permissions = get_user_permissions(user_id)
     
     await update.message.reply_text(
-        f"👤 Профиль участника\n\n"
+        f"👤 Профиль\n\n"
         f"🎮 Ник: {user_data['nick']}\n"
         f"📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n"
-        f"⭐ Ранг: {permissions['name']}\n"
-        f"📁 Отдел: {user_data['department']}\n"
+        f"⭐ {permissions['name']}\n"
+        f"📁 {user_data['department']}\n"
         f"⚠️ Предупреждения: {user_data['warns']}\n"
-        f"🚫 Статус бана: {user_data['ban_status']}\n"
-        f"📅 Зарегистрирован: {user_data['reg_date']}"
+        f"📅 {user_data['reg_date']}"
     )
 
-async def search_by_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика"""
+    stats = get_statistics()
+    await update.message.reply_text(
+        f"📊 Статистика\n\n"
+        f"👥 Всего: {stats['total']}\n"
+        f"✅ Активных: {stats['active']}\n"
+        f"🚫 Забанено: {stats['banned']}\n"
+        f"🌟 Генералов: {stats['generals']}"
+    )
+
+async def awards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Награды"""
+    user_id = update.effective_user.id
+    awards = get_user_awards(user_id)
+    
+    if awards:
+        text = "\n".join([f"🏅 {a[0]} ({a[1]}) - {a[2]}" for a in awards])
+        await update.message.reply_text(f"🏅 Награды:\n\n{text}")
+    else:
+        await update.message.reply_text("У вас пока нет наград.")
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по жетону"""
     user_id = update.effective_user.id
     permissions = get_user_permissions(user_id)
     
     if not permissions['can_search']:
-        await update.message.reply_text("❌ Недостаточно прав для поиска.")
-        return ConversationHandler.END
+        await update.message.reply_text("❌ Недостаточно прав.")
+        return
     
-    await update.message.reply_text("🔍 Введите жетон для поиска (формат: 52****):")
-    return SEARCH_TOKEN
-
-async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выполнение поиска"""
-    token = update.message.text.strip()
+    if not context.args:
+        await update.message.reply_text("❌ /search 52****")
+        return
+    
+    token = context.args[0]
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     cursor.execute('SELECT * FROM users WHERE token = ?', (token,))
     row = cursor.fetchone()
     conn.close()
@@ -472,82 +694,90 @@ async def execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         rank_name = RANKS.get(row[5], RANKS[0])['name']
         await update.message.reply_text(
-            f"🎫 Информация по жетону {token}:\n\n"
-            f"🎮 Ник: {row[2]}\n"
-            f"📻 Позывной: {row[3]}\n"
-            f"⭐ Ранг: {rank_name}\n"
-            f"📁 Отдел: {row[6]}\n"
-            f"⚠️ Предупреждения: {row[7]}"
+            f"🎫 Жетон {token}\n\n"
+            f"🎮 {row[2]}\n"
+            f"📻 {row[3]}\n"
+            f"⭐ {rank_name}\n"
+            f"📁 {row[6]}\n"
+            f"⚠️ {row[7]}"
         )
     else:
-        await update.message.reply_text("❌ Участник с таким жетоном не найден.")
-    
-    return ConversationHandler.END
+        await update.message.reply_text("❌ Не найден.")
 
-async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ статистики"""
-    stats = get_statistics()
-    
-    await update.message.reply_text(
-        f"📊 Статистика конференции\n\n"
-        f"👥 Всего участников: {stats['total']}\n"
-        f"✅ Активных: {stats['active']}\n"
-        f"🚫 Забанено: {stats['banned']}\n"
-        f"🌟 Генералов: {stats['generals']}"
-    )
-
-async def show_my_awards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ наград"""
-    user_id = update.effective_user.id
-    awards = get_user_awards(user_id)
-    
-    if awards:
-        awards_text = "\n".join([f"🏅 {a[0]} ({a[1]}) - {a[2]}" for a in awards])
-        await update.message.reply_text(f"🏅 Ваши награды:\n\n{awards_text}")
-    else:
-        await update.message.reply_text("У вас пока нет наград.")
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена операции"""
-    await update.message.reply_text("❌ Операция отменена.")
-    await main_menu(update, context)
-    return ConversationHandler.END
+# ============ ОБРАБОТЧИК СООБЩЕНИЙ ============
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка сообщений"""
+    """Обработка кнопок"""
     text = update.message.text
     user_id = update.effective_user.id
     
-    # Проверка глобального бана
     gban = check_gban(user_id)
     if gban['is_banned']:
-        await update.message.reply_text("🚫 Вы в глобальном черном списке!")
+        await update.message.reply_text("🚫 Вы в глобальном ЧС!")
         return
     
-    handlers = {
-        "📝 Регистрация": start_registration,
-        "👤 Профиль": show_profile,
-        "🔍 Поиск": search_by_token,
-        "📊 Статистика": show_statistics,
-        "🏅 Мои награды": show_my_awards,
-    }
-    
-    if text in handlers:
-        return await handlers[text](update, context)
+    if text == "📝 Регистрация":
+        return await start_registration(update, context)
+    elif text == "👤 Профиль":
+        await profile_command(update, context)
+    elif text == "🔍 Поиск":
+        await update.message.reply_text("Используйте команду /search 52****")
+    elif text == "📊 Статистика":
+        await stats_command(update, context)
+    elif text == "🏅 Мои награды":
+        await awards_command(update, context)
     else:
-        await main_menu(update, context)
+        await start(update, context)
+
+# ============ РЕГИСТРАЦИЯ ============
+
+async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if get_user_data(user_id):
+        await update.message.reply_text("❌ Уже зарегистрированы!")
+        await start(update, context)
+        return ConversationHandler.END
+    
+    await update.message.reply_text("📝 Шаг 1/2 - Игровой ник:")
+    return GAME_NICK
+
+async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['game_nick'] = update.message.text
+    await update.message.reply_text("Шаг 2/2 - Позывной:")
+    return CALLSIGN
+
+async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    callsign = update.message.text
+    user_id = update.effective_user.id
+    game_nick = context.user_data['game_nick']
+    
+    token = add_user(user_id, game_nick, callsign)
+    
+    await update.message.reply_text(
+        f"✅ Регистрация завершена!\n\n"
+        f"🎮 Ник: {game_nick}\n"
+        f"📻 Позывной: {callsign}\n"
+        f"🎫 Жетон: {token}\n"
+        f"⭐ {RANKS[0]['name']}"
+    )
+    
+    await start(update, context)
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено.")
+    await start(update, context)
+    return ConversationHandler.END
 
 # ============ ЗАПУСК ============
 
 def main():
-    """Главная функция"""
-    # Инициализация базы данных
     init_database()
     
-    # Создание приложения
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Обработчик регистрации
+    # ConversationHandler для регистрации
     reg_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration)],
         states={
@@ -557,18 +787,22 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     
-    # Обработчик поиска
-    search_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^🔍 Поиск$'), search_by_token)],
-        states={
-            SEARCH_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, execute_search)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-    
     application.add_handler(reg_handler)
-    application.add_handler(search_handler)
-    application.add_handler(CommandHandler('start', main_menu))
+    
+    # Команды
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('info', info_command))
+    application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('profile', profile_command))
+    application.add_handler(CommandHandler('stats', stats_command))
+    application.add_handler(CommandHandler('awards', awards_command))
+    application.add_handler(CommandHandler('search', search_command))
+    application.add_handler(CommandHandler('gban', gban_command))
+    application.add_handler(CommandHandler('check_gban', check_gban_command))
+    application.add_handler(CommandHandler('setrank', setrank_command))
+    application.add_handler(CommandHandler('warn', warn_command))
+    
+    # Обработчик сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("🤖 Бот запущен!")
