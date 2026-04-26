@@ -20,7 +20,7 @@ GAME_NICK, CALLSIGN = range(2)
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 
 # ID администраторов
-ADMIN_IDS = [8026911824]
+ADMIN_IDS = [992403438]
 
 # Файл базы данных
 DB_FILE = "conference.db"
