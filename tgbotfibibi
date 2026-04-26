@@ -715,6 +715,155 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("✅ Не в ЧС.")
 
+async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Регистрация пользователя (6+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
+    # Проверяем ответ на сообщение
+    target_id = extract_user_id(update, context)
+    
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    
+    if not target_id:
+        await update.message.reply_text(
+            "❌ /aregister @user Ник Позывной\n"
+            "Или ответьте на сообщение: /aregister Ник Позывной"
+        )
+        return
+    
+    if isinstance(target_id, str):
+        resolved = await resolve_user_id(update, context, target_id)
+        if resolved:
+            target_id = resolved
+        else:
+            await update.message.reply_text("❌ Не удалось найти пользователя.")
+            return
+    
+    if target_id == -1:
+        await update.message.reply_text("❌ Уточните ID.")
+        return
+    
+    # Проверка на существующую регистрацию
+    if get_user_data(target_id):
+        await update.message.reply_text("❌ Пользователь уже зарегистрирован.")
+        return
+    
+    # Получаем ник и позывной
+    if target_id and context.args:
+        # Формат: /aregister Nick Callsign
+        if len(context.args) >= 2:
+            game_nick = context.args[0]
+            callsign = context.args[1]
+        else:
+            await update.message.reply_text("❌ /aregister Nick Позывной")
+            return
+    else:
+        # Формат: /aregister @user Nick Callsign
+        if len(context.args) >= 3:
+            game_nick = context.args[1]
+            callsign = context.args[2]
+        else:
+            await update.message.reply_text("❌ /aregister @user Ник Позывной")
+            return
+    
+    # Регистрируем
+    token = add_user(target_id, game_nick, callsign)
+    
+    if token:
+        await update.message.reply_text(
+            f"✅ Пользователь зарегистрирован!\n\n"
+            f"👤 {callsign}\n"
+            f"🎮 Ник: {game_nick}\n"
+            f"🎫 Жетон: {token}\n"
+            f"⭐ {RANKS[0]['name']}\n"
+            f"🆔 {target_id}"
+        )
+        
+        # Уведомляем пользователя
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"✅ Вас зарегистрировали!\n\n"
+                     f"🎮 Ник: {game_nick}\n"
+                     f"📻 Позывной: {callsign}\n"
+                     f"🎫 Жетон: {token}\n"
+                     f"⭐ {RANKS[0]['name']}"
+            )
+        except:
+            pass
+    else:
+        await update.message.reply_text("❌ Ошибка регистрации.")
+
+async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительная регистрация с жетоном (6+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    
+    if not target_id:
+        await update.message.reply_text("❌ /aforcereg @user Ник Позывной Жетон")
+        return
+    
+    if isinstance(target_id, str):
+        resolved = await resolve_user_id(update, context, target_id)
+        if resolved:
+            target_id = resolved
+        else:
+            await update.message.reply_text("❌ Не найден.")
+            return
+    
+    if target_id == -1:
+        await update.message.reply_text("❌ Уточните ID.")
+        return
+    
+    # Удаляем старую регистрацию если есть
+    existing = get_user_data(target_id)
+    
+    # Получаем параметры
+    if target_id and len(context.args) >= 3:
+        game_nick = context.args[0]
+        callsign = context.args[1]
+        token = context.args[2]
+    elif len(context.args) >= 4:
+        game_nick = context.args[1]
+        callsign = context.args[2]
+        token = context.args[3]
+    else:
+        await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+        return
+    
+    # Удаляем старую запись если есть
+    if existing:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM users WHERE user_id = ?', (target_id,))
+        conn.commit()
+        conn.close()
+    
+    # Регистрируем с указанным жетоном
+    new_token = add_user(target_id, game_nick, callsign, token)
+    
+    if new_token:
+        await update.message.reply_text(
+            f"✅ Перерегистрирован!\n\n"
+            f"👤 {callsign}\n"
+            f"🎮 {game_nick}\n"
+            f"🎫 {new_token}\n"
+            f"🆔 {target_id}"
+        )
+    else:
+        await update.message.reply_text("❌ Ошибка. Возможно жетон занят.")
+
 # ============ AKICK ============
 
 async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1578,6 +1727,8 @@ def main():
     application.add_handler(CommandHandler('aglobal_unban', aglobal_unban))
     application.add_handler(CommandHandler('asetallrank', asetallrank))
     application.add_handler(CommandHandler('awho', awhoprofile))
+    application.add_handler(CommandHandler('aregister', aregister))
+    application.add_handler(CommandHandler('aforcereg', aforcereg))
     # Команды БЕЗ префикса (только gban, ungban, check_gban, gban_list)
     application.add_handler(CommandHandler('gban', gban_command))
     application.add_handler(CommandHandler('ungban', ungban_command))
