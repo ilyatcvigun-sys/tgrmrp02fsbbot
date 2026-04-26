@@ -88,44 +88,37 @@ def has_permission(user_id, action):
 
 def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
     """
-    Извлечение user_id по Telegram @username или ID
+    Извлечение user_id по приоритету:
     1. Ответ на сообщение (reply)
-    2. @username через Telegram API (get_chat)
+    2. @username (Telegram username)
     3. Числовой ID
     4. Поиск в базе по нику/позывному
     """
-    # 1. Ответ на сообщение
     if update.message and update.message.reply_to_message:
         return update.message.reply_to_message.from_user.id
     
-    # 2. Текст
     if text:
         text = text.strip()
         
-        # Числовой ID
         if text.isdigit():
             return int(text)
         
-        # @username или ссылка
         username = text.replace('@', '').strip()
+        
         if 't.me/' in username:
             username = username.split('t.me/')[-1].split()[0].strip()
         
         if username:
-            # Сначала ищем в базе
             user_id = find_user_in_db(username)
             if user_id and user_id != -1:
                 return user_id
             
-            # Если не нашли в базе - возвращаем username для поиска через API
             return f"@{username}"
     
     return None
 
 async def resolve_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, target) -> int:
-    """
-    Разрешает user_id: если передан @username - получает ID через Telegram API
-    """
+    """Разрешает user_id: если передан @username - получает ID через Telegram API"""
     if isinstance(target, int):
         return target
     
@@ -135,6 +128,7 @@ async def resolve_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
             chat = await context.bot.get_chat(f"@{username}")
             return chat.id
         except Exception as e:
+            logger.error(f"Resolve error: {e}")
             return None
     
     return None
@@ -144,14 +138,12 @@ def find_user_in_db(username):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Точное совпадение
     cursor.execute('SELECT user_id FROM users WHERE game_nick = ? OR callsign = ?', (username, username))
     result = cursor.fetchone()
     if result:
         conn.close()
         return result[0]
     
-    # Начинается с
     cursor.execute('SELECT user_id FROM users WHERE game_nick LIKE ? OR callsign LIKE ?', 
                  (f'{username}%', f'{username}%'))
     results = cursor.fetchall()
@@ -209,15 +201,6 @@ async def unban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception as e:
         logger.error(f"Unban error: {e}")
         return False
-
-def check_warn_limit_and_kick(user_id):
-    """Проверка лимита предупреждений (3/3)"""
-    user_data = get_user_data(user_id)
-    if not user_data:
-        return False
-    
-    warns = user_data['warns']
-    return warns == "2/3" or warns == "3/3"
 
 # ============ БАЗА ДАННЫХ ============
 
@@ -387,7 +370,7 @@ def add_warning(user_id, issuer_id, reason):
         written += 1
         warn_type = "Письменное"
         if written == 3:
-            kicked = True  # Достигнут лимит письменных
+            kicked = True
     else:
         conn.close()
         return False, "Достигнут лимит предупреждений", None
@@ -446,7 +429,6 @@ def get_gban_list():
     return bans
 
 def get_warn_list(user_id=None):
-    """Получение списка предупреждений"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -563,54 +545,49 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "╔══════════════════════╗\n"
     text += "║   📚 СПРАВКА КОМАНД   ║\n"
     text += "╚══════════════════════╝\n\n"
+    text += "Все команды с 'a': /ahelp\n\n"
     
     text += "🔹 ДЛЯ ВСЕХ:\n"
-    text += "├ /start — Главное меню (ЛС)\n"
-    text += "├ /info — Информация о профиле\n"
-    text += "├ /help — Эта справка\n"
-    text += "├ /profile — Подробный профиль\n"
-    text += "├ /stats — Статистика\n"
-    text += "├ /awards — Ваши награды\n"
-    text += "├ /nick [имя] — Поиск по нику\n"
-    text += "├ /search 52**** — Поиск по жетону\n"
-    text += "└ /check_gban [ID] — Проверка ЧС\n\n"
+    text += "├ /start | /astart\n"
+    text += "├ /info | /ainfo\n"
+    text += "├ /help | /ahelp\n"
+    text += "├ /profile | /aprofile\n"
+    text += "├ /stats | /astats\n"
+    text += "├ /awards | /aawards\n"
+    text += "├ /nick | /anick\n"
+    text += "├ /search | /asearch\n"
+    text += "└ /check_gban — Проверка ЧС\n\n"
     
     if rank >= 5:
         text += "🔹 ПОЛКОВНИК (5+):\n"
-        text += "├ /warn @user причина — Предупреждение\n"
-        text += "├ /warnlist [@user] — Список предупреждений\n"
-        text += "├ /kick @user — Кик\n"
-        text += "├ /ban @user причина — Бан (+автокик)\n"
-        text += "├ /unban @user — Разбан\n"
-        text += "├ /setrank @user 0-6 — Установить ранг\n"
-        text += "├ /setdept @user номер — Назначить отдел\n"
-        text += "├ /admins — Список администраторов\n"
-        text += "└ /userlist — Полный список (ЛС)\n\n"
+        text += "├ /kick | /akick\n"
+        text += "├ /ban | /aban\n"
+        text += "├ /unban | /aunban\n"
+        text += "├ /warn | /awarn\n"
+        text += "├ /warnlist | /awarnlist\n"
+        text += "├ /setrank | /asetrank\n"
+        text += "├ /setdept | /asetdept\n"
+        text += "├ /admins | /aadmins\n"
+        text += "└ /userlist | /auserlist\n\n"
     
     if rank >= 6:
         text += "🔹 ГЕНЕРАЛ (6):\n"
-        text += "├ /gban @user причина — Глобальный бан (+кик)\n"
-        text += "├ /ungban @user — Снять глобальный бан\n"
-        text += "├ /gban_list — Список ЧС\n"
-        text += "└ /settoken @user 52**** — Выдать жетон\n\n"
+        text += "├ /gban — Глобальный бан (без алиаса)\n"
+        text += "├ /ungban — Снять гбан (без алиаса)\n"
+        text += "├ /gban_list — Список ЧС (без алиаса)\n"
+        text += "└ /settoken | /asettoken\n\n"
     
     if is_main_admin(user_id):
         text += "🔹 ГЛАВНЫЙ АДМИН:\n"
-        text += "├ /setadmin @user — Назначить админа\n"
-        text += "├ /unsetadmin @user — Снять админа\n"
-        text += "├ /adminlist — Список админов\n"
-        text += "├ /reset_user @user — Сброс пользователя\n"
-        text += "├ /delete_user @user — Удалить пользователя\n"
-        text += "├ /backup — Экспорт базы\n"
-        text += "├ /broadcast — Рассылка\n"
-        text += "├ /global_unban — Массовый разбан\n"
-        text += "└ /setallrank 0-6 — Ранг всем\n\n"
-    
-    text += "📝 ФОРМАТЫ: @username, ID, ответ на сообщение\n\n"
-    
-    text += "⭐ РАНГИ:\n"
-    for r in range(7):
-        text += f"  {r} — {RANKS[r]['name']}\n"
+        text += "├ /setadmin | /asetadmin\n"
+        text += "├ /unsetadmin | /aunsetadmin\n"
+        text += "├ /adminlist | /aadminlist\n"
+        text += "├ /reset_user | /areset_user\n"
+        text += "├ /delete_user | /adelete_user\n"
+        text += "├ /backup | /abackup\n"
+        text += "├ /broadcast | /abroadcast\n"
+        text += "├ /global_unban | /aglobal_unban\n"
+        text += "└ /setallrank | /asetallrank\n"
     
     await update.message.reply_text(text)
 
@@ -729,7 +706,6 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not target_id:
         target_id = update.effective_user.id
     
-    # Разрешаем @username через API
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
         if resolved:
@@ -751,7 +727,6 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============ KICK ============
 
 async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кик пользователя"""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'kick'):
         await update.message.reply_text("❌ С 5 ранга.")
@@ -765,7 +740,6 @@ async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Укажите @username или ответьте на сообщение.")
         return
     
-    # Разрешаем @username
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
         if resolved:
@@ -783,14 +757,13 @@ async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     success = await kick_user_from_chat(update, context, target_id)
     if success:
-        await update.message.reply_text(f"👢 {target_name} кикнут из чата.")
+        await update.message.reply_text(f"👢 {target_name} кикнут.")
     else:
-        await update.message.reply_text("❌ Не удалось кикнуть. Проверьте права бота.")
+        await update.message.reply_text("❌ Не удалось кикнуть.")
 
-# ============ BAN (с киком) ============
+# ============ BAN ============
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Бан пользователя с киком"""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'ban'):
         await update.message.reply_text("❌ С 5 ранга.")
@@ -811,7 +784,6 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не найден.")
         return
     
-    # Разрешаем @username
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
         if resolved:
@@ -827,18 +799,16 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_data = get_user_data(target_id)
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
     
-    # Бан в чате
     ban_success = await ban_user_in_chat(update, context, target_id)
     
     if ban_success:
         await update.message.reply_text(f"🚫 БАН!\n👤 {target_name}\n📝 {reason}")
     else:
-        await update.message.reply_text("❌ Не удалось забанить. Проверьте права бота.")
+        await update.message.reply_text("❌ Не удалось забанить.")
 
-# ============ GBAN (с киком) ============
+# ============ GBAN ============
 
 async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный бан с киком"""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'gban'):
         await update.message.reply_text("❌ Только генералы.")
@@ -859,7 +829,6 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не найден.")
         return
     
-    # Разрешаем @username
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
         if resolved:
@@ -878,20 +847,16 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
         return
     
-    # Добавление в глобальный бан
     add_gban(target_id, reason, user_id)
-    
-    # Кик из чата
     await kick_user_from_chat(update, context, target_id)
     
     target_data = get_user_data(target_id)
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
     await update.message.reply_text(f"🚫 ГЛОБАЛЬНЫЙ БАН!\n👤 {target_name}\n📝 {reason}")
 
-# ============ WARN (с автокиком) ============
+# ============ WARN ============
 
 async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Предупреждение с автокиком при лимите"""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'warn'):
         await update.message.reply_text("❌ С 5 ранга.")
@@ -912,7 +877,6 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не найден.")
         return
     
-    # Разрешаем @username
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
         if resolved:
@@ -932,23 +896,20 @@ async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         await update.message.reply_text(f"⚠️ {message}\n👤 {target_name}\n📝 {reason}")
         
-        # Автокик при достижении лимита
         if kicked:
             await update.message.reply_text(f"🚨 Лимит предупреждений!\n👢 {target_name} кикнут.")
             await kick_user_from_chat(update, context, target_id)
     else:
         await update.message.reply_text(f"❌ {message}")
 
-# ============ WARNLIST ============
+# ============ WARMLIST ============
 
 async def warnlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список предупреждений"""
     user_id = update.effective_user.id
     
-    # Если есть аргумент - показываем предупреждения конкретного пользователя
     if context.args:
         if not has_permission(user_id, 'warn'):
-            await update.message.reply_text("❌ С 5 ранга для просмотра чужих предупреждений.")
+            await update.message.reply_text("❌ С 5 ранга.")
             return
         
         target_id = extract_user_id(update, context, context.args[0])
@@ -964,19 +925,16 @@ async def warnlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_name = target_data['callsign'] if target_data else f"User {target_id}"
         title = f"⚠️ Предупреждения: {target_name}"
     else:
-        # Показываем свои предупреждения
         warns = get_warn_list(user_id)
         title = "⚠️ Ваши предупреждения"
     
     if warns:
         text = f"{title}\n\n"
         for w in warns[:20]:
-            text += f"📅 {w[6]} | {w[3]}\n"
-            text += f"📝 {w[5]}\n"
-            text += f"📊 {w[4]}\n\n"
+            text += f"📅 {w[6]} | {w[3]}\n📝 {w[5]}\n📊 {w[4]}\n\n"
         await update.message.reply_text(text)
     else:
-        await update.message.reply_text(f"{title}\n✅ Предупреждений нет.")
+        await update.message.reply_text(f"{title}\n✅ Нет.")
 
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
 
@@ -1128,7 +1086,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         await update.message.reply_text("✅ Разбанен.")
     else:
-        await update.message.reply_text("❌ Ошибка разбана.")
+        await update.message.reply_text("❌ Ошибка.")
 
 async def settoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1315,7 +1273,7 @@ async def delete_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     conn.commit()
     conn.close()
     
-    await update.message.reply_text(f"✅ {target_data['callsign']} полностью удален.")
+    await update.message.reply_text(f"✅ {target_data['callsign']} удален.")
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1329,7 +1287,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = cursor.fetchall()
     conn.close()
     
-    text = f"📋 ЭКСПОРТ БАЗЫ ({len(users)} пользователей):\n\n"
+    text = f"📋 ЭКСПОРТ ({len(users)} пользователей):\n\n"
     for u in users:
         text += f"🆔 {u[1]} | {u[2]} | {u[3]}\n"
         text += f"🎫 {u[4]} | ⭐ {u[5]} | 📁 {u[6]}\n\n"
@@ -1340,7 +1298,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=open('/tmp/backup.txt', 'rb'),
         filename='backup.txt',
-        caption="📋 Экспорт базы данных"
+        caption="📋 Экспорт"
     )
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1490,44 +1448,45 @@ def main():
     
     application.add_handler(reg_handler)
     
-    # Основные команды
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('info', info_command))
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('profile', profile_command))
-    application.add_handler(CommandHandler('stats', stats_command))
-    application.add_handler(CommandHandler('awards', awards_command))
-    application.add_handler(CommandHandler('nick', nick_command))
-    application.add_handler(CommandHandler('search', search_command))
-    application.add_handler(CommandHandler('check_gban', check_gban_command))
+    # Основные команды + алиасы
+    cmds = {
+        'start': start, 'info': info_command, 'help': help_command,
+        'profile': profile_command, 'stats': stats_command, 'awards': awards_command,
+        'nick': nick_command, 'search': search_command, 'check_gban': check_gban_command,
+        'gban': gban_command, 'ungban': ungban_command, 'gban_list': gban_list_command,
+        'kick': kick_command, 'ban': ban_command, 'unban': unban_command,
+        'warn': warn_command, 'warnlist': warnlist_command,
+        'setrank': setrank_command, 'setdept': setdept_command,
+        'settoken': settoken_command, 'admins': admins_command, 'userlist': userlist_command,
+        'setadmin': setadmin_command, 'unsetadmin': unsetadmin_command,
+        'adminlist': adminlist_command, 'reset_user': reset_user_command,
+        'delete_user': delete_user_command, 'backup': backup_command,
+        'broadcast': broadcast_command, 'global_unban': global_unban_command,
+        'setallrank': setallrank_command
+    }
     
-    # Команды 5+ ранга
-    application.add_handler(CommandHandler('kick', kick_command))
-    application.add_handler(CommandHandler('ban', ban_command))
-    application.add_handler(CommandHandler('unban', unban_command))
-    application.add_handler(CommandHandler('warn', warn_command))
-    application.add_handler(CommandHandler('warnlist', warnlist_command))
-    application.add_handler(CommandHandler('setrank', setrank_command))
-    application.add_handler(CommandHandler('setdept', setdept_command))
-    application.add_handler(CommandHandler('admins', admins_command))
-    application.add_handler(CommandHandler('userlist', userlist_command))
+    # Регистрируем основные команды
+    for cmd, handler in cmds.items():
+        application.add_handler(CommandHandler(cmd, handler))
     
-    # Команды 6 ранга
-    application.add_handler(CommandHandler('gban', gban_command))
-    application.add_handler(CommandHandler('ungban', ungban_command))
-    application.add_handler(CommandHandler('gban_list', gban_list_command))
-    application.add_handler(CommandHandler('settoken', settoken_command))
+    # Регистрируем алиасы (кроме gban, ungban, check_gban)
+    aliases = {
+        'astart': start, 'ainfo': info_command, 'ahelp': help_command,
+        'aprofile': profile_command, 'astats': stats_command, 'aawards': awards_command,
+        'anick': nick_command, 'asearch': search_command,
+        'akick': kick_command, 'aban': ban_command, 'aunban': unban_command,
+        'awarn': warn_command, 'awarnlist': warnlist_command,
+        'asetrank': setrank_command, 'asetdept': setdept_command,
+        'asettoken': settoken_command, 'aadmins': admins_command, 'auserlist': userlist_command,
+        'asetadmin': setadmin_command, 'aunsetadmin': unsetadmin_command,
+        'aadminlist': adminlist_command, 'areset_user': reset_user_command,
+        'adelete_user': delete_user_command, 'abackup': backup_command,
+        'abroadcast': broadcast_command, 'aglobal_unban': global_unban_command,
+        'asetallrank': setallrank_command
+    }
     
-    # Команды главного админа
-    application.add_handler(CommandHandler('setadmin', setadmin_command))
-    application.add_handler(CommandHandler('unsetadmin', unsetadmin_command))
-    application.add_handler(CommandHandler('adminlist', adminlist_command))
-    application.add_handler(CommandHandler('reset_user', reset_user_command))
-    application.add_handler(CommandHandler('delete_user', delete_user_command))
-    application.add_handler(CommandHandler('backup', backup_command))
-    application.add_handler(CommandHandler('broadcast', broadcast_command))
-    application.add_handler(CommandHandler('global_unban', global_unban_command))
-    application.add_handler(CommandHandler('setallrank', setallrank_command))
+    for cmd, handler in aliases.items():
+        application.add_handler(CommandHandler(cmd, handler))
     
     # Кнопки в ЛС
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
