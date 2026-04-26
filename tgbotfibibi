@@ -3,17 +3,9 @@ import logging
 from datetime import datetime, timedelta
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-import openpyxl
+import sqlite3
 from openpyxl.styles import Font, PatternFill, Alignment
 import os
-# Перейти в папку с ботом
-cd /app/tgbotfibibi
-
-# Установить библиотеки
-pip install openpyxl python-telegram-bot
-
-# Проверить установку
-pip list | grep openpyxl
 
 # Настройка логирования
 logging.basicConfig(
@@ -94,68 +86,29 @@ AWARDS = {
 }
 
 # Инициализация Excel файла
-def init_excel():
-    if not os.path.exists(EXCEL_FILE):
-        wb = openpyxl.Workbook()
-        
-        # Лист пользователей
-        ws_users = wb.active
-        ws_users.title = "Пользователи"
-        headers_users = ["ID", "User ID", "Ник", "Позывной", "Жетон", "Ранг", "Отдел",
-                        "Предупреждения", "Бан", "Причина бана", "Дата бана", "Дата регистрации"]
-        ws_users.append(headers_users)
-        
-        # Стилизация заголовков
-        for cell in ws_users[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
-            cell.alignment = Alignment(horizontal="center")
-        
-        # Лист глобального бана
-        ws_gban = wb.create_sheet("Глобальный бан")
-        headers_gban = ["ID", "User ID", "Ник", "Причина", "Дата бана", "Кто забанил"]
-        ws_gban.append(headers_gban)
-        
-        for cell in ws_gban[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-            cell.alignment = Alignment(horizontal="center")
-        
-        # Лист наград
-        ws_awards = wb.create_sheet("Награды")
-        headers_awards = ["ID", "User ID", "Ник", "Награда", "Тип награды", "Дата выдачи", "Кто выдал"]
-        ws_awards.append(headers_awards)
-        
-        for cell in ws_awards[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
-            cell.alignment = Alignment(horizontal="center")
-        
-        # Лист предупреждений
-        ws_warns = wb.create_sheet("Предупреждения")
-        headers_warns = ["ID", "User ID", "Ник", "Тип", "Счетчик", "Причина", "Дата", "Кто выдал"]
-        ws_warns.append(headers_warns)
-        
-        for cell in ws_warns[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
-            cell.alignment = Alignment(horizontal="center")
-        
-        # Устанавливаем ширину столбцов
-        for ws in [ws_users, ws_gban, ws_awards, ws_warns]:
-            for column in ws.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)
-                ws.column_dimensions[column_letter].width = adjusted_width
-        
-        wb.save(EXCEL_FILE)
+def init_db():
+    conn = sqlite3.connect('conference_data.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,
+            game_nick TEXT,
+            callsign TEXT,
+            token TEXT UNIQUE,
+            rank INTEGER DEFAULT 0,
+            department TEXT DEFAULT 'Не назначен',
+            warns TEXT DEFAULT '0/0',
+            ban_status TEXT DEFAULT 'Нет',
+            ban_reason TEXT,
+            ban_date TEXT,
+            created_at TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
 # Генерация уникального жетона
 def generate_unique_token():
