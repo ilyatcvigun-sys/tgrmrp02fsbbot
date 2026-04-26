@@ -23,10 +23,10 @@ WARN_USER, WARN_REASON = range(9, 11)
 BAN_USER, BAN_DURATION = range(11, 13)
 
 # Токен бота
-BOT_TOKEN = "ВАШ_ТОКЕН_СЮДА"
+BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 
 # ID администраторов
-ADMIN_IDS = [123456789]  # Замените на свой ID
+ADMIN_IDS = [8026911824]  # Замените на свой ID
 
 # Файл базы данных
 DB_FILE = "conference.db"
