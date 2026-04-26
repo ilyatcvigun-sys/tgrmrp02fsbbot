@@ -6,6 +6,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 import os
+# Перейти в папку с ботом
+cd /app/tgbotfibibi
+
+# Установить библиотеки
+pip install openpyxl python-telegram-bot
+
+# Проверить установку
+pip list | grep openpyxl
 
 # Настройка логирования
 logging.basicConfig(
