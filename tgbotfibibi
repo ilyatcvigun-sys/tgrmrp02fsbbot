@@ -618,8 +618,14 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "├ /aawards\n"
     text += "├ /anick\n"
     text += "├ /asearch\n"
+    text += "├ NEW /areports подать на выдачу наказания NEW\n"
     text += "└ /check_gban — Проверка ЧС\n\n"
+
+    if rank >= 4:
+        text += "🔹 ПОДПОЛКОВНИК (4+):\n"
+        text += "├ /areports_info посмотреть инфу по выдаче\n"
     
+
     if rank >= 5:
         text += "🔹 ПОЛКОВНИК (5+):\n"
         text += "├ /akick @user\n"
@@ -1220,6 +1226,151 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
     # Очищаем временные данные
     del context.user_data['pending_report']
     del context.user_data['pending_action']
+
+
+async def areports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список всех жалоб (доступно всем)"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, reporter_nick, violator_nick, violation, status, verdict, moderator_comment, created_at, resolved_at
+        FROM reports 
+        ORDER BY id DESC 
+        LIMIT 20
+    ''')
+    reports = cursor.fetchall()
+    conn.close()
+    
+    if not reports:
+        await update.message.reply_text("📋 Жалоб пока нет.")
+        return
+    
+    text = "📋 ПОСЛЕДНИЕ ЖАЛОБЫ:\n\n"
+    
+    for r in reports:
+        report_id = r[0]
+        reporter = r[1]
+        violator = r[2]
+        violation = r[3]
+        status = r[4]
+        verdict = r[5] or "—"
+        comment = r[6] or "—"
+        created = r[7]
+        resolved = r[8] or "—"
+        
+        # Эмодзи статуса
+        if status == 'pending':
+            status_emoji = "⏳"
+            status_text = "На рассмотрении"
+        elif status == 'approve':
+            status_emoji = "✅"
+            status_text = "Одобрено"
+        elif status == 'reject':
+            status_emoji = "❌"
+            status_text = "Отказано"
+        else:
+            status_emoji = "❓"
+            status_text = status
+        
+        text += f"{status_emoji} #{report_id} | {status_text}\n"
+        text += f"👤 Подал: {reporter}\n"
+        text += f"🎮 Нарушитель: {violator}\n"
+        text += f"⚠️ {violation[:50]}...\n" if len(violation) > 50 else f"⚠️ {violation}\n"
+        text += f"📅 Создана: {created}\n"
+        
+        if status != 'pending':
+            text += f"📊 Вердикт: {verdict}\n"
+            text += f"💬 Комментарий: {comment}\n"
+            text += f"📅 Рассмотрена: {resolved}\n"
+        
+        text += "\n"
+    
+    # Добавляем статистику
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM reports')
+    total = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
+    pending = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM reports WHERE status = "approve"')
+    approved = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM reports WHERE status = "reject"')
+    rejected = cursor.fetchone()[0]
+    conn.close()
+    
+    text += "━━━━━━━━━━━━━━━\n"
+    text += f"📊 Статистика:\n"
+    text += f"Всего: {total} | ⏳ {pending} | ✅ {approved} | ❌ {rejected}"
+    
+    await update.message.reply_text(text)
+
+
+async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подробная информация о жалобе по ID"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'search'):
+        await update.message.reply_text("❌ Только с 4 ранга.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /areport_info номер\nПример: /areport_info 5")
+        return
+    
+    try:
+        report_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Укажите номер жалобы.")
+        return
+    
+    report = get_report(report_id)
+    if not report:
+        await update.message.reply_text("❌ Жалоба не найдена.")
+        return
+    
+    # Эмодзи статуса
+    if report['status'] == 'pending':
+        status_text = "⏳ На рассмотрении"
+    elif report['status'] == 'approve':
+        status_text = "✅ Одобрено"
+    elif report['status'] == 'reject':
+        status_text = "❌ Отказано"
+    else:
+        status_text = report['status']
+    
+    # Данные модератора
+    if report['moderator_id']:
+        mod_data = get_user_data(report['moderator_id'])
+        mod_name = mod_data['callsign'] if mod_data else f"ID {report['moderator_id']}"
+    else:
+        mod_name = "—"
+    
+    text = (
+        f"📋 ЖАЛОБА #{report['id']}\n\n"
+        f"📊 Статус: {status_text}\n"
+        f"👤 Подал: {report['reporter_nick']} (ID: {report['reporter_id']})\n"
+        f"🎮 Нарушитель: {report['violator_nick']}\n"
+        f"🏛 Фракция: {report['faction']}\n"
+        f"⚠️ Нарушение: {report['violation']}\n"
+        f"📎 Доказательства: {report['evidence']}\n"
+        f"💻 Команда: {report['command']}\n"
+        f"📅 Создана: {report['created_at']}\n"
+    )
+    
+    if report['status'] != 'pending':
+        text += (
+            f"\n📊 Вердикт: {report['verdict']}\n"
+            f"👮 Модератор: {mod_name}\n"
+            f"💬 Комментарий: {report['moderator_comment']}\n"
+            f"📅 Рассмотрена: {report['resolved_at']}\n"
+        )
+    
+    await update.message.reply_text(text)
 
 # ============ AKICK ============
 
@@ -2088,6 +2239,8 @@ def main():
     application.add_handler(CommandHandler('awho', awhoprofile))
     application.add_handler(CommandHandler('aregister', aregister))
     application.add_handler(CommandHandler('aforcereg', aforcereg))
+    application.add_handler(CommandHandler('areports', areports))
+    application.add_handler(CommandHandler('areport_info', areport_info))
     # Приветствие новых участников
     application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
     # Команды БЕЗ префикса (только gban, ungban, check_gban, gban_list)
