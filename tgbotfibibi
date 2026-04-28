@@ -1197,19 +1197,23 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
             f"💬 Комментарий: {comment}"
         )
         
-        # Отправка в топик (если указан VERDICT_TOPIC_ID)
-        chat_id = update.effective_chat.id
+        # ID чата конференции (замените на ваш)
+        CONFERENCE_CHAT_ID = 3389197905 # ← ЗАМЕНИТЕ НА ID ВАШЕЙ КОНФЕРЕНЦИИ
+        
         if VERDICT_TOPIC_ID:
             await context.bot.send_message(
-                chat_id=chat_id,
+                chat_id=CONFERENCE_CHAT_ID,
                 text=topic_text,
                 message_thread_id=VERDICT_TOPIC_ID
             )
         else:
-            await context.bot.send_message(chat_id=chat_id, text=topic_text)
+            await context.bot.send_message(
+                chat_id=CONFERENCE_CHAT_ID,
+                text=topic_text
+            )
     except Exception as e:
         logger.error(f"Topic error: {e}")
-    
+
     # Уведомление модератору
     await update.message.reply_text(f"✅ Вердикт по жалобе #{report_id} отправлен!")
     
