@@ -618,11 +618,12 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "├ /aawards\n"
     text += "├ /anick\n"
     text += "├ /asearch\n"
-    text += "├ NEW /areports подать на выдачу наказания NEW\n"
+    text += "├ NEW /areport подать на выдачу наказания NEW\n"
     text += "└ /check_gban — Проверка ЧС\n\n"
 
     if rank >= 4:
         text += "🔹 ПОДПОЛКОВНИК (4+):\n"
+        text += "├ /areports посмотреть все жалобы\n"
         text += "├ /areports_info посмотреть инфу по выдаче\n"
     
 
