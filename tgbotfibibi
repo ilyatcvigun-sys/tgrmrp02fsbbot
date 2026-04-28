@@ -864,6 +864,57 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Ошибка. Возможно жетон занят.")
 
+from telegram.ext import ChatMemberHandler
+
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие нового участника"""
+    chat_member = update.chat_member
+    
+    # Проверяем, что пользователь добавлен (а не вышел)
+    if chat_member.new_chat_member.status in ['member', 'administrator']:
+        user = chat_member.new_chat_member.user
+        user_id = user.id
+        user_name = user.first_name or "Гость"
+        
+        # Проверяем, зарегистрирован ли в базе
+        user_data = get_user_data(user_id)
+        
+        if user_data:
+            permissions = get_user_permissions(user_id)
+            welcome_text = (
+                f"👋 Приветствуем, {user_data['callsign']}!\n\n"
+                f"🎮 Ник: {user_data['nick']}\n"
+                f"🎫 Жетон: {user_data['token']}\n"
+                f"⭐ Ранг: {permissions['name']}\n"
+                f"📁 Отдел: {user_data['department']}\n\n"
+                f"Добро пожаловать в фибиби R-RP 02!"
+            )
+        else:
+            welcome_text = (
+                f"👋 Приветствуем, {user_name}!\n\n"
+                f"Вы не зарегистрированы в системе.\n"
+                f"Напишите боту в ЛС для регистрации.\n\n"
+                f"Добро пожаловать в фибиби R-RP 02! Следящий за ФСБ - Klim_Andreev"
+            )
+        
+        await update.effective_chat.send_message(welcome_text)
+
+
+async def goodbye_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Прощание с участником"""
+    chat_member = update.chat_member
+    
+    if chat_member.new_chat_member.status == 'left':
+        user = chat_member.new_chat_member.user
+        user_id = user.id
+        
+        user_data = get_user_data(user_id)
+        
+        if user_data:
+            await update.effective_chat.send_message(
+                f"👋 {user_data['callsign']} покинул конференцию."
+            )
+
 # ============ AKICK ============
 
 async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1729,6 +1780,8 @@ def main():
     application.add_handler(CommandHandler('awho', awhoprofile))
     application.add_handler(CommandHandler('aregister', aregister))
     application.add_handler(CommandHandler('aforcereg', aforcereg))
+    # Приветствие новых участников
+    application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
     # Команды БЕЗ префикса (только gban, ungban, check_gban, gban_list)
     application.add_handler(CommandHandler('gban', gban_command))
     application.add_handler(CommandHandler('ungban', ungban_command))
