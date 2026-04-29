@@ -656,6 +656,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "├ /ungban @user\n"
         text += "├ /gban_list\n"
         text += "└ /asettoken @user 52****\n\n"
+        text += "├ 🔹🔹/achangelog Уведомление о изменениях в боте🔹🔹\n"
+        
     
     if is_main_admin(user_id):
         text += "🔹 Кто-то важный:\n"
@@ -1516,6 +1518,44 @@ async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 {target_data['callsign']}\n"
         f"⚠️ Было: {old_warns} → Стало: 0/0"
     )
+# =========== achangelog ==========
+
+async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправка списка изменений в конференцию (6+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ /achangelog Текст изменений\n\n"
+            "Пример: /achangelog Добавлена команда /awho"
+        )
+        return
+    
+    changes = ' '.join(context.args)
+    issuer_data = get_user_data(user_id)
+    issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+    
+    changelog_text = (
+        f"🔄 ОБНОВЛЕНИЕ БОТА\n\n"
+        f"📝 {changes}\n\n"
+        f"👮 Добавил: {issuer_name}\n"
+        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    
+    # Отправка в конференцию
+    CONFERENCE_CHAT_ID = -1001234567890  # ← ЗАМЕНИТЕ НА ID ВАШЕЙ КОНФЕРЕНЦИИ
+    
+    try:
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text=changelog_text
+        )
+        await update.message.reply_text("✅ Изменения отправлены в конференцию!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 # ============ AKICK ============
 
@@ -2451,6 +2491,7 @@ def main():
     application.add_handler(CommandHandler('areport_info', areport_info))
     application.add_handler(CommandHandler('aunwarn', aunwarn))
     application.add_handler(CommandHandler('aunwarnall', aunwarnall))
+    application.add_handler(CommandHandler('achangelog', achangelog))
     # Приветствие новых участников
     application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
     # Команды БЕЗ префикса (только gban, ungban, check_gban, gban_list)
