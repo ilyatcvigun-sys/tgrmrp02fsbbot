@@ -40,7 +40,8 @@ RANKS = {
     3: {"name": "🛡 Майор"},
     4: {"name": "👔 Подполковник"},
     5: {"name": "👑 Полковник"},
-    6: {"name": "🌟 Генерал"}
+    6: {"name": "🌟 Генерал"},
+    7: {"name": "⚜️ Следящий за ФСБ"} 
 }
 
 # Отделы
@@ -82,6 +83,9 @@ def has_permission(user_id, action):
     if not user_data:
         return False
     rank = user_data['rank']
+    
+    if rank >= 7:
+        return True
     
     permissions = {
         "search": rank >= 4,
@@ -481,8 +485,13 @@ def get_statistics():
     active = cursor.fetchone()[0]
     cursor.execute('SELECT COUNT(*) FROM users WHERE rank = 6')
     generals = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM users WHERE rank = 7')  
+    marshals = cursor.fetchone()[0]  
     conn.close()
-    return {"total": total, "active": active, "banned": total - active, "generals": generals}
+    return {
+        "total": total, "active": active, "banned": total - active,
+        "generals": generals, "marshals": marshals  
+    }
 
 def get_user_awards(user_id):
     conn = sqlite3.connect(DB_FILE)
@@ -633,6 +642,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "├ /aban @user причина\n"
         text += "├ /aunban @user\n"
         text += "├ /awarn @user причина\n"
+        text += "├ /aunwarn снять варн\n"
+        text += "├ /aunwarnall снять все варны\n"
         text += "├ /awarnlist [@user]\n"
         text += "├ /asetrank @user 0-6\n"
         text += "├ /asetdept @user номер\n"
@@ -647,7 +658,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "└ /asettoken @user 52****\n\n"
     
     if is_main_admin(user_id):
-        text += "🔹 ГЛАВНЫЙ АДМИН:\n"
+        text += "🔹 Кто-то важный:\n"
         text += "├ /asetadmin @user\n"
         text += "├ /aunsetadmin @user\n"
         text += "├ /aadminlist\n"
@@ -657,7 +668,10 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "├ /abroadcast текст\n"
         text += "├ /aglobal_unban\n"
         text += "└ /asetallrank 0-6\n"
-    
+
+    if rank >= 7:
+        text += "🔹 Следящий за ФСБ (7):\n"
+        text += "└ Все права\n\n"
     await update.message.reply_text(text)
 
 async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -863,9 +877,11 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Уведомляем пользователя
         try:
+            issuer_data = get_user_data(user_id)
+            issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
             await context.bot.send_message(
                 chat_id=target_id,
-                text=f"✅ Вас зарегистрировали!\n\n"
+                text=f"✅ Вас зарегистрировал {issuer_name}!\n\n"
                      f"🎮 Ник: {game_nick}\n"
                      f"📻 Позывной: {callsign}\n"
                      f"🎫 Жетон: {token}\n"
@@ -958,14 +974,13 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_data = get_user_data(user_id)
         
         if user_data:
-            permissions = get_user_permissions(user_id)
-            welcome_text = (
-                f"👋 Приветствуем, {user_data['callsign']}!\n\n"
-                f"🎮 Ник: {user_data['nick']}\n"
+            await update.effective_chat.send_message(
+                f"👋 Приветствуем, {user_data['nick']}!\n\n"
+                f"📻 Позывной: {user_data['callsign']}\n"
                 f"🎫 Жетон: {user_data['token']}\n"
                 f"⭐ Ранг: {permissions['name']}\n"
                 f"📁 Отдел: {user_data['department']}\n\n"
-                f"Добро пожаловать в фибиби R-RP 02!"
+                f"Добро пожаловать в конференцию!"
             )
         else:
             welcome_text = (
@@ -1372,6 +1387,135 @@ async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     await update.message.reply_text(text)
+# ======================AUNWARN========================
+async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Снятие предупреждений (5+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    
+    if not target_id:
+        await update.message.reply_text("❌ /aunwarn @user или ответьте на сообщение.")
+        return
+    
+    if isinstance(target_id, str):
+        resolved = await resolve_user_id(update, context, target_id)
+        if resolved:
+            target_id = resolved
+        else:
+            await update.message.reply_text("❌ Не удалось найти.")
+            return
+    
+    if target_id == -1:
+        await update.message.reply_text("❌ Уточните ID.")
+        return
+    
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    current_warns = target_data['warns']
+    
+    if current_warns == "0/0":
+        await update.message.reply_text(f"❌ У {target_data['callsign']} нет предупреждений.")
+        return
+    
+    # Снимаем одно предупреждение
+    parts = current_warns.split('/')
+    verbal = int(parts[0]) if len(parts) == 2 else 0
+    written = int(parts[1]) if len(parts) == 2 else 0
+    
+    if written > 0:
+        written -= 1
+        removed_type = "письменное"
+    elif verbal > 0:
+        verbal -= 1
+        removed_type = "устное"
+    else:
+        await update.message.reply_text("❌ Ошибка.")
+        return
+    
+    new_warns = f"{verbal}/{written}"
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, target_id))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"✅ Снято {removed_type} предупреждение\n"
+        f"👤 {target_data['callsign']}\n"
+        f"⚠️ Было: {current_warns} → Стало: {new_warns}"
+    )
+    
+    try:
+        issuer_data = get_user_data(user_id)
+        issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"✅ С вас снято предупреждение!\n\n"
+                 f"⚠️ Было: {current_warns} → Стало: {new_warns}\n"
+                 f"👮 Снял: {issuer_name}"
+        )
+    except:
+        pass
+
+async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Снятие ВСЕХ предупреждений (5+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    
+    if not target_id:
+        await update.message.reply_text("❌ /aunwarnall @user или ответьте на сообщение.")
+        return
+    
+    if isinstance(target_id, str):
+        resolved = await resolve_user_id(update, context, target_id)
+        if resolved:
+            target_id = resolved
+        else:
+            await update.message.reply_text("❌ Не удалось найти.")
+            return
+    
+    if target_id == -1:
+        await update.message.reply_text("❌ Уточните ID.")
+        return
+    
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    old_warns = target_data['warns']
+    
+    if old_warns == "0/0":
+        await update.message.reply_text(f"❌ У {target_data['callsign']} нет предупреждений.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', ("0/0", target_id))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"✅ Все предупреждения сняты\n"
+        f"👤 {target_data['callsign']}\n"
+        f"⚠️ Было: {old_warns} → Стало: 0/0"
+    )
 
 # ============ AKICK ============
 
@@ -1406,9 +1550,18 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     success = await kick_user_from_chat(update, context, target_id)
     if success:
-        await update.message.reply_text(f"👢 {target_name} кикнут.")
-    else:
-        await update.message.reply_text("❌ Не удалось кикнуть.")
+        try:
+            issuer_data = get_user_data(user_id)
+            issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"👢 Вас кикнули из конференции!\n"
+                     f"👮 Кикнул: {issuer_name}"
+            )
+        except:
+            pass
+        
+        await update.message.reply_text(f"👢 {target_name} кикнут.")")
 
 # ============ ABAN ============
 
@@ -1451,9 +1604,20 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ban_success = await ban_user_in_chat(update, context, target_id)
     
     if ban_success:
+        # Уведомление пользователю
+        try:
+            issuer_data = get_user_data(user_id)
+            issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"🚫 Вы забанены!\n\n"
+                     f"📝 Причина: {reason}\n"
+                     f"👮 Забанил: {issuer_name}"
+            )
+        except:
+            pass
+        
         await update.message.reply_text(f"🚫 БАН!\n👤 {target_name}\n📝 {reason}")
-    else:
-        await update.message.reply_text("❌ Не удалось забанить.")
 
 # ============ GBAN ============
 
@@ -1664,11 +1828,22 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         await update.message.reply_text(f"⚠️ {message}\n👤 {target_name}\n📝 {reason}")
         
+        try:
+            issuer_data = get_user_data(user_id)
+            issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"⚠️ Вам выдано предупреждение!\n\n"
+                     f"📊 {message}\n"
+                     f"📝 Причина: {reason}\n"
+                     f"👮 Выдал: {issuer_name}"
+            )
+        except:
+            pass
+        
         if kicked:
             await update.message.reply_text(f"🚨 Лимит предупреждений!\n👢 {target_name} кикнут.")
             await kick_user_from_chat(update, context, target_id)
-    else:
-        await update.message.reply_text(f"❌ {message}")
 
 # ============ AWARNLIST ============
 
@@ -1757,22 +1932,22 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if target_id:
         if not context.args:
-            await update.message.reply_text("❌ /asetrank 0-6")
+            await update.message.reply_text("❌ /asetrank 0-7")
             return
         try:
             new_rank = int(context.args[0])
         except ValueError:
-            await update.message.reply_text("❌ Ранг: 0-6")
+            await update.message.reply_text("❌ Ранг: 0-7")
             return
     else:
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /asetrank @user 0-6")
+            await update.message.reply_text("❌ /asetrank @user 0-7")
             return
         target_id = extract_user_id(update, context, context.args[0])
         try:
             new_rank = int(context.args[1])
         except (ValueError, IndexError):
-            await update.message.reply_text("❌ Ранг: 0-6")
+            await update.message.reply_text("❌ Ранг: 0-7")
             return
     
     if isinstance(target_id, str):
@@ -1781,15 +1956,27 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_id is None:
         await update.message.reply_text("❌ Не найден.")
         return
-    if new_rank not in RANKS:
-        await update.message.reply_text("❌ Неверный ранг.")
+    if new_rank not in RANKS: 
+        await update.message.reply_text("❌ Неверный ранг (0-7).")
         return
     
-    if update_user_rank(target_id, new_rank):
+       if update_user_rank(target_id, new_rank):
         target_data = get_user_data(target_id)
+        issuer_data = get_user_data(user_id)
+        issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+        
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"📢 Ваш ранг изменён!\n\n"
+                     f"⭐ Новый ранг: {RANKS[new_rank]['name']}\n"
+                     f"👮 Изменил: {issuer_name}"
+            )
+        except:
+            pass
+        
         await update.message.reply_text(f"✅ {target_data['callsign']} → {RANKS[new_rank]['name']}")
-    else:
-        await update.message.reply_text("❌ Ошибка.")
+
 
 # ============ ASETDEPT ============
 
@@ -1833,12 +2020,22 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Неверный отдел.")
         return
     
-    if update_user_department(target_id, DEPARTMENTS[dept_num]):
+     if update_user_department(target_id, DEPARTMENTS[dept_num]):
         target_data = get_user_data(target_id)
+        issuer_data = get_user_data(user_id)
+        issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+        
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"📢 Ваш отдел изменён!\n\n"
+                     f"📁 Новый отдел: {DEPARTMENTS[dept_num]}\n"
+                     f"👮 Изменил: {issuer_name}"
+            )
+        except:
+            pass
+        
         await update.message.reply_text(f"✅ {target_data['callsign']} → {DEPARTMENTS[dept_num]}")
-    else:
-        await update.message.reply_text("❌ Ошибка.")
-
 # ============ AUNBAN ============
 
 async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1894,12 +2091,22 @@ async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     success, message = set_user_token(target_id, new_token)
-    if success:
+      if success:
         target_data = get_user_data(target_id)
+        
+        try:
+            issuer_data = get_user_data(user_id)
+            issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"🎫 Вам выдан новый жетон!\n\n"
+                     f"🎫 Жетон: {new_token}\n"
+                     f"👮 Выдал: {issuer_name}"
+            )
+        except:
+            pass
+        
         await update.message.reply_text(f"✅ {target_data['callsign']}\n🎫 {new_token}")
-    else:
-        await update.message.reply_text(f"❌ {message}")
-
 # ============ AADMINS ============
 
 async def aadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2242,6 +2449,8 @@ def main():
     application.add_handler(CommandHandler('aforcereg', aforcereg))
     application.add_handler(CommandHandler('areports', areports))
     application.add_handler(CommandHandler('areport_info', areport_info))
+    application.add_handler(CommandHandler('aunwarn', aunwarn))
+    application.add_handler(CommandHandler('aunwarnall', aunwarnall))
     # Приветствие новых участников
     application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
     # Команды БЕЗ префикса (только gban, ungban, check_gban, gban_list)
