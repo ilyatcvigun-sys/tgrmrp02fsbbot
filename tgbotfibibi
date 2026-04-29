@@ -2139,7 +2139,7 @@ async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     success, message = set_user_token(target_id, new_token)
-      if success:
+    if success:
         target_data = get_user_data(target_id)
         
         try:
