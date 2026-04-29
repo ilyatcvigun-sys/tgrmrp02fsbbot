@@ -1601,7 +1601,7 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
         
-        await update.message.reply_text(f"👢 {target_name} кикнут.")")
+        await update.message.reply_text(f"👢 {target_name} кикнут.")
 
 # ============ ABAN ============
 
