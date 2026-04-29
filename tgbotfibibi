@@ -2062,7 +2062,11 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Неверный отдел.")
         return
     
-     if update_user_department(target_id, DEPARTMENTS[dept_num]):
+    if dept_num < 0 or dept_num >= len(DEPARTMENTS):
+        await update.message.reply_text("❌ Неверный отдел.")
+        return
+    
+    if update_user_department(target_id, DEPARTMENTS[dept_num]):
         target_data = get_user_data(target_id)
         issuer_data = get_user_data(user_id)
         issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
@@ -2078,6 +2082,8 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         
         await update.message.reply_text(f"✅ {target_data['callsign']} → {DEPARTMENTS[dept_num]}")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
 # ============ AUNBAN ============
 
 async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
