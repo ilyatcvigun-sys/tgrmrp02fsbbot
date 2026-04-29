@@ -1996,11 +1996,12 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_id is None:
         await update.message.reply_text("❌ Не найден.")
         return
+
     if new_rank not in RANKS: 
         await update.message.reply_text("❌ Неверный ранг (0-7).")
         return
     
-       if update_user_rank(target_id, new_rank):
+    if update_user_rank(target_id, new_rank):
         target_data = get_user_data(target_id)
         issuer_data = get_user_data(user_id)
         issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
@@ -2016,7 +2017,8 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         
         await update.message.reply_text(f"✅ {target_data['callsign']} → {RANKS[new_rank]['name']}")
-
+    else:
+        await update.message.reply_text("❌ Ошибка.")
 
 # ============ ASETDEPT ============
 
