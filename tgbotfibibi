@@ -1340,7 +1340,7 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
         )
         
         # ID чата конференции (замените на ваш)
-        CONFERENCE_CHAT_ID = -3389197905 # ← ЗАМЕНИТЕ НА ID ВАШЕЙ КОНФЕРЕНЦИИ
+        CONFERENCE_CHAT_ID = -1003389197905 # ← ЗАМЕНИТЕ НА ID ВАШЕЙ КОНФЕРЕНЦИИ
         
         if VERDICT_TOPIC_ID:
             await context.bot.send_message(
@@ -1664,7 +1664,7 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # Отправка в конференцию
-    CONFERENCE_CHAT_ID = -3389197905  # ← ЗАМЕНИТЕ НА ID ВАШЕЙ КОНФЕРЕНЦИИ
+    CONFERENCE_CHAT_ID = -1003389197905  # ← ЗАМЕНИТЕ НА ID ВАШЕЙ КОНФЕРЕНЦИИ
     
     try:
         await context.bot.send_message(
