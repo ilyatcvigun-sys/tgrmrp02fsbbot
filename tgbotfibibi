@@ -1019,6 +1019,58 @@ async def goodbye_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👋 {user_data['callsign']} покинул конференцию."
             )
 
+
+
+# ================ сообщения перед кикиом и тд 
+
+async def send_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int, action: str, reason: str = ""):
+    """Отправка сообщения с аудио перед действием"""
+    try:
+        target_data = get_user_data(target_id)
+        target_name = target_data['callsign'] if target_data else f"User {target_id}"
+        target_nick = target_data['nick'] if target_data else "Unknown"
+        
+        mention = f'<a href="tg://user?id={target_id}">{target_nick}</a>'
+        
+        if action == "kick":
+            text = f"👢 {mention} что-то натворил..."
+            audio_file = "audio/kick_audio.mp3"
+        elif action == "ban":
+            text = f"🚫 {mention} будет забанен..."
+            audio_file = "audio/ban_audio.mp3"
+        elif action == "warn_kick":
+            text = f"🚨 {mention} лимит предупреждений, пока..."
+            audio_file = "audio/warn_kick_audio.mp3"
+        elif action == "gban":
+            text = f"🌍 {mention} залутал чс..."
+            audio_file = "audio/gban_audio.mp3"
+        else:
+            text = f"⚠️ {mention} {action}..."
+            audio_file = None
+        
+        if reason:
+            text += f"\n📝 Причина: {reason}"
+        
+        # Отправка с аудио или без
+        if audio_file and os.path.exists(audio_file):
+            with open(audio_file, 'rb') as audio:
+                await update.effective_chat.send_audio(
+                    audio=audio,
+                    caption=text,
+                    parse_mode='HTML'
+                )
+        else:
+            await update.effective_chat.send_message(text, parse_mode='HTML')
+            
+    except Exception as e:
+        logger.error(f"Action error: {e}")
+        # Fallback
+        try:
+            await update.effective_chat.send_message(f"👢 {target_name} получает по заслугам...")
+        except:
+            pass
+
+
 # ============ смена позывного =====
 async def acallsign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Смена позывного (4+ ранг или свой)"""
