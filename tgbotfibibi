@@ -1730,14 +1730,23 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ AKICK ============
 
 async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кик пользователя"""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'kick'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
     target_id = extract_user_id(update, context)
-    if not target_id and context.args:
+    reason = ""
+    
+    if target_id:
+        reason = ' '.join(context.args) if context.args else ""
+    else:
+        if not context.args:
+            await update.message.reply_text("❌ /akick @user причина\nИли ответьте на сообщение: /akick причина")
+            return
         target_id = extract_user_id(update, context, context.args[0])
+        reason = ' '.join(context.args[1:]) if len(context.args) > 1 else ""
     
     if not target_id:
         await update.message.reply_text("❌ Укажите @username или ответьте на сообщение.")
@@ -1751,27 +1760,17 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось найти.")
             return
     
-    if target_id == -1:
-        await update.message.reply_text("❌ Уточните ID.")
-        return
-    
     target_data = get_user_data(target_id)
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
     
+    # Сообщение с музыкой и причиной
+    await send_action_message(update, context, target_id, "kick", reason)
+    
     success = await kick_user_from_chat(update, context, target_id)
     if success:
-        try:
-            issuer_data = get_user_data(user_id)
-            issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
-            await context.bot.send_message(
-                chat_id=target_id,
-                text=f"👢 Вас кикнули из конференции!\n"
-                     f"👮 Кикнул: {issuer_name}"
-            )
-        except:
-            pass
-        
         await update.message.reply_text(f"👢 {target_name} кикнут.")
+    else:
+        await update.message.reply_text("❌ Не удалось кикнуть.")
 
 # ============ ABAN ============
 
@@ -1827,7 +1826,8 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
         
-        await update.message.reply_text(f"🚫 БАН!\n👤 {target_name}\n📝 {reason}")
+    await send_action_message(update, context, target_id, "ban", reason)
+    ban_success = await ban_user_in_chat(update, context, target_id)
 
 # ============ GBAN ============
 
@@ -2051,9 +2051,9 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
         
-        if kicked:
-            await update.message.reply_text(f"🚨 Лимит предупреждений!\n👢 {target_name} кикнут.")
-            await kick_user_from_chat(update, context, target_id)
+    if kicked:
+        await send_action_message(update, context, target_id, "warn_kick", "Лимит предупреждений (3/3)")
+        await kick_user_from_chat(update, context, target_id)
 
 # ============ AWARNLIST ============
 
