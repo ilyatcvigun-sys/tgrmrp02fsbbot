@@ -785,12 +785,13 @@ async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_id = extract_user_id(update, context)
+    checker_id = update.effective_user.id
     
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
     
     if not target_id:
-        target_id = update.effective_user.id
+        target_id = checker_id
     
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
@@ -805,10 +806,23 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     result = check_gban(target_id)
+    
     if result['is_banned']:
-        await update.message.reply_text(f"🚫 В ЧС!\n👤 {result['nick']}\n📝 {result['reason']}\n📅 {result['date']}")
+        # Проверяем права смотрящего
+        if has_permission(checker_id, 'warn'):  # 5+ ранг
+            # Полная информация
+            await update.message.reply_text(
+                f"🚫 В ЧС\n"
+                f"👤 {result['nick']}\n"
+                f"📝 {result['reason']}\n"
+                f"📅 {result['date']}\n"
+                f"👮 Выдал: {result['banned_by']}"
+            )
+        else:
+            # Только факт бана
+            await update.message.reply_text(f"🚫 Пользователь в ЧС\n👤 {result['nick']}")
     else:
-        await update.message.reply_text("✅ Не в ЧС.")
+        await update.message.reply_text("✅ Не в ЧС")
 
 async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Регистрация пользователя (6+ ранг)"""
