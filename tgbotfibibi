@@ -1711,7 +1711,6 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     changelog_text = (
         f"🔄 ОБНОВЛЕНИЕ БОТА\n\n"
         f"📝 {changes}\n\n"
-        f"👮 Добавил: {issuer_name}\n"
         f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
     
