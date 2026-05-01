@@ -205,6 +205,13 @@ async def unban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE,
         logger.error(f"Unban error: {e}")
         return False
 
+def get_admin_nick(user_id):
+    """Получение ника по user_id"""
+    user_data = get_user_data(user_id)
+    if user_data:
+        return user_data['nick']
+    return str(user_id)
+
 # ============ БАЗА ДАННЫХ ============
 
 def init_database():
@@ -808,21 +815,19 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     result = check_gban(target_id)
     
     if result['is_banned']:
-        # Проверяем права смотрящего
-        if has_permission(checker_id, 'warn'):  # 5+ ранг
-            # Полная информация
+        if has_permission(checker_id, 'warn'):
+            admin_nick = get_admin_nick(result['banned_by'])
             await update.message.reply_text(
-                f"🚫 В ЧС\n"
+                f"🚫 В ЧС!\n"
                 f"👤 {result['nick']}\n"
                 f"📝 {result['reason']}\n"
                 f"📅 {result['date']}\n"
-                f"👮 Выдал: {result['banned_by']}"
+                f"👮 Выдал: {admin_nick}"
             )
         else:
-            # Только факт бана
-            await update.message.reply_text(f"🚫 Пользователь в ЧС\n👤 {result['nick']}")
+            await update.message.reply_text(f"🚫 Пользователь в ЧС!\n👤 {result['nick']}")
     else:
-        await update.message.reply_text("✅ Не в ЧС")
+        await update.message.reply_text("✅ Не в ЧС.")
 
 async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Регистрация пользователя (6+ ранг)"""
