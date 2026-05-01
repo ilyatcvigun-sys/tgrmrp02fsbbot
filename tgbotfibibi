@@ -619,7 +619,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "Все команды с префиксом 'a'\n\n"
     
     text += "🔹 ДЛЯ ВСЕХ:\n"
-    text += "├ /astart\n"
+    text += "├ /start\n"
     text += "├ /ainfo\n"
     text += "├ /ahelp\n"
     text += "├ /aprofile\n"
@@ -2655,7 +2655,7 @@ def main():
     application.add_handler(reg_handler)
     
     # Команды с префиксом "a"
-    application.add_handler(CommandHandler('astart', start))
+    application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('ainfo', ainfo))
     application.add_handler(CommandHandler('ahelp', ahelp))
     application.add_handler(CommandHandler('aprofile', aprofile))
