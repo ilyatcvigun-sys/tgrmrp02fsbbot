@@ -31,6 +31,8 @@ ADMIN_IDS = [8026911824]
 from pathlib import Path
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_DIR = DATA_DIR / "audio"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE = str(DATA_DIR / "conference.db")
 
 # ID темы для вердиктов
@@ -1896,62 +1898,6 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
     await update.message.reply_text(f"🚫 ГЛОБАЛЬНЫЙ БАН!\n👤 {target_name}\n📝 {reason}")
 
-async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просмотр профиля другого пользователя"""
-    user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks'):
-        await update.message.reply_text("❌ С 5 ранга.")
-        return
-    
-    target_id = extract_user_id(update, context)
-    if not target_id and context.args:
-        target_id = extract_user_id(update, context, context.args[0])
-    
-    if not target_id:
-        await update.message.reply_text("❌ /awho @user или ответьте на сообщение.")
-        return
-    
-    if isinstance(target_id, str):
-        resolved = await resolve_user_id(update, context, target_id)
-        if resolved:
-            target_id = resolved
-        else:
-            await update.message.reply_text("❌ Не удалось найти.")
-            return
-    
-    if target_id == -1:
-        await update.message.reply_text("❌ Уточните ID.")
-        return
-    
-    user_data = get_user_data(target_id)
-    if not user_data:
-        await update.message.reply_text("❌ Пользователь не зарегистрирован.")
-        return
-    
-    permissions = get_user_permissions(target_id)
-    
-    # Получаем предупреждения
-    warns = get_warn_list(target_id)
-    warn_count = len(warns) if warns else 0
-    
-    # Получаем награды
-    awards = get_user_awards(target_id)
-    award_count = len(awards) if awards else 0
-    
-    text = (
-        f"👤 ПРОФИЛЬ\n\n"
-        f"🎮 Ник: {user_data['nick']}\n"
-        f"📻 Позывной: {user_data['callsign']}\n"
-        f"🎫 Жетон: {user_data['token']}\n"
-        f"⭐ Ранг: {permissions['name']}\n"
-        f"📁 Отдел: {user_data['department']}\n"
-        f"⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
-        f"🏅 Наград: {award_count}\n"
-        f"🆔 ID: {user_data['user_id']}\n"
-        f"📅 Зарегистрирован: {user_data['reg_date']}"
-    )
-    
-    await update.message.reply_text(text)
 
 # ============ ПРОФИЛЬ ДРУГОГО ПОЛЬЗОВАТЕЛЯ ============
 
