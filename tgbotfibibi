@@ -27,10 +27,14 @@ BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 ADMIN_IDS = [8026911824]
 
 # Файл базы данных
-DB_FILE = "conference.db"
 
-# ID темы (топика) для вердиктов
-VERDICT_TOPIC_ID = 40224  # Замените на ID вашего топика
+from pathlib import Path
+DATA_DIR = Path("/app/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE = str(DATA_DIR / "conference.db")
+
+# ID темы для вердиктов
+VERDICT_TOPIC_ID = 40224  
 
 # Ранги
 RANKS = {
@@ -1050,22 +1054,19 @@ async def send_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         target_nick = target_data['nick'] if target_data else "Unknown"
         
         mention = f'<a href="tg://user?id={target_id}">{target_nick}</a>'
-        
+        audio_file = f"/app/data/audio/{action}_audio.mp3"
         if action == "kick":
             text = f"👢 {mention} что-то натворил..."
-            audio_file = "audio/kick_audio.mp3"
+            audio_file = str(AUDIO_DIR / "kick_audio.mp3")
         elif action == "ban":
             text = f"🚫 {mention} будет забанен..."
-            audio_file = "audio/ban_audio.mp3"
+            audio_file = str(AUDIO_DIR / "ban_audio.mp3")
         elif action == "warn_kick":
-            text = f"🚨 {mention} лимит предупреждений, пока..."
-            audio_file = "audio/warn_kick_audio.mp3"
+            text = f"🚨 {mention} лимит предупреждений..."
+            audio_file = str(AUDIO_DIR / "warn_kick_audio.mp3")
         elif action == "gban":
             text = f"🌍 {mention} залутал чс..."
-            audio_file = "audio/gban_audio.mp3"
-        else:
-            text = f"⚠️ {mention} {action}..."
-            audio_file = None
+            audio_file = str(AUDIO_DIR / "gban_audio.mp3")
         
         if reason:
             text += f"\n📝 Причина: {reason}"
