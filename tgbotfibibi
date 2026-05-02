@@ -689,13 +689,6 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "🔹 Следящий за ФСБ (7):\n"
         text += "└ 😎😎Климу все доступно, почти😎😎\n\n"
 
-    if has_special_access(user_id):
-        text += "🔐 СПЕЦДОПУСК:\n"
-        text += "├ /awhois ID — Полная информация\n"
-        text += "├ /asetnick @user Ник — Смена ника\n"
-        text += "├ /aspecial выдать спец допуск\n"
-        text += "├ /aspeciallist и так понятно\n"
-        text += "└ /acheckall — Все в ЧС\n\n"
 
     
     await update.message.reply_text(text)
