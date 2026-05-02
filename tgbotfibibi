@@ -687,7 +687,17 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if rank >= 7:
         text += "🔹 Следящий за ФСБ (7):\n"
-        text += "└ 😎😎Климу все доступно😎😎\n\n"
+        text += "└ 😎😎Климу все доступно, почти😎😎\n\n"
+
+    if has_special_access(user_id):
+        text += "🔐 СПЕЦДОПУСК:\n"
+        text += "├ /awhois ID — Полная информация\n"
+        text += "├ /asetnick @user Ник — Смена ника\n"
+        text += "├ /aspecial выдать спец допуск\n"
+        text += "├ /aspeciallist и так понятно\n"
+        text += "└ /acheckall — Все в ЧС\n\n"
+
+    
     await update.message.reply_text(text)
 
 async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -821,7 +831,7 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     result = check_gban(target_id)
     
     if result['is_banned']:
-        if has_permission(checker_id, 'warn'):
+        if has_permission(checker_id, 'warn') or has_special_access(checker_id):
             admin_nick = get_admin_nick(result['banned_by'])
             await update.message.reply_text(
                 f"🚫 В ЧС!\n"
@@ -1092,6 +1102,154 @@ async def send_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         except:
             pass
 
+# =========== спец допуск ===========
+def has_permission(user_id, action):
+    if is_main_admin(user_id):
+        return True
+    
+ 
+    if has_special_access(user_id):
+        return True
+    
+    user_data = get_user_data(user_id)
+    if not user_data:
+        return False
+    rank = user_data['rank']
+    
+    if rank >= 7:
+        return True
+    
+    permissions = {
+        "search": rank >= 4,
+        "award": rank >= 3,
+        "warn": rank >= 5,
+        "manage_ranks": rank >= 5,
+        "ban": rank >= 5,
+        "kick": rank >= 5,
+        "gban": rank >= 6
+    }
+    return permissions.get(action, False)
+
+
+async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Поиск пользователя по ID (спецдопуск)"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id) and not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только со спецдопуском.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /awhois ID\nПример: /awhois 123456789")
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Укажите ID.")
+        return
+    
+    user_data = get_user_data(target_id)
+    if not user_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    permissions = get_user_permissions(target_id)
+    warns = get_warn_list(target_id)
+    warn_count = len(warns) if warns else 0
+    awards = get_user_awards(target_id)
+    award_count = len(awards) if awards else 0
+    gban = check_gban(target_id)
+    
+    text = (
+        f"🔍 ПОЛНАЯ ИНФОРМАЦИЯ\n\n"
+        f"🎮 Ник: {user_data['nick']}\n"
+        f"📻 Позывной: {user_data['callsign']}\n"
+        f"🎫 Жетон: {user_data['token']}\n"
+        f"⭐ Ранг: {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}\n"
+        f"⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
+        f"🏅 Наград: {award_count}\n"
+        f"🔐 Спецдопуск: {'Да' if has_special_access(target_id) else 'Нет'}\n"
+        f"🚫 ЧС: {'Да' if gban['is_banned'] else 'Нет'}\n"
+        f"🆔 ID: {user_data['user_id']}\n"
+        f"📅 Зарегистрирован: {user_data['reg_date']}"
+    )
+    
+    await update.message.reply_text(text)
+
+
+async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Смена ника (спецдопуск)"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id) and not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только со спецдопуском.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    
+    if target_id:
+        if not context.args:
+            await update.message.reply_text("❌ /asetnick НовыйНик")
+            return
+        new_nick = ' '.join(context.args)
+    else:
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /asetnick @user НовыйНик")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        new_nick = ' '.join(context.args[1:])
+    
+    if isinstance(target_id, str):
+        target_id = await resolve_user_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    target_data = get_user_data(target_id)
+    old_nick = target_data['nick']
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET game_nick = ? WHERE user_id = ?', (new_nick, target_id))
+    conn.commit()
+    conn.close()
+    
+    issuer_data = get_user_data(user_id)
+    issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+    
+    # Уведомление
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"📢 Ваш ник изменён!\n🎮 Было: {old_nick}\n🎮 Стало: {new_nick}\n👮 Изменил: {issuer_name}"
+        )
+    except:
+        pass
+    
+    await update.message.reply_text(f"✅ Ник изменён!\n🎮 {old_nick} → {new_nick}")
+
+
+async def acheckall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Массовая проверка ЧС (спецдопуск)"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id) and not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только со спецдопуском.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, nick FROM gban ORDER BY id DESC')
+    bans = cursor.fetchall()
+    conn.close()
+    
+    if bans:
+        text = f"🚫 ВСЕ В ЧС ({len(bans)}):\n\n"
+        for b in bans:
+            text += f"🆔 {b[0]} | 👤 {b[1]}\n"
+        await update.message.reply_text(text)
+    else:
+        await update.message.reply_text("✅ ЧС пуст.")
 
 # ============ смена позывного =====
 async def acallsign(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1952,6 +2110,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📁 Отдел: {user_data['department']}\n"
         f"⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
         f"🏅 Наград: {award_count}\n"
+        f"{'🔐 Спецдопуск: Да\n' if has_special_access(target_id) else ''}"
         f"🆔 ID: {user_data['user_id']}\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
@@ -2657,6 +2816,11 @@ def main():
     application.add_handler(CommandHandler('achangelog', achangelog))
     application.add_handler(CommandHandler('acallsign', acallsign))
     application.add_handler(CommandHandler('atest', atest))
+    application.add_handler(CommandHandler('awhois', awhois))
+    application.add_handler(CommandHandler('asetnick', asetnick))
+    application.add_handler(CommandHandler('acheckall', acheckall))
+    application.add_handler(CommandHandler('aspecial', aspecial))
+    application.add_handler(CommandHandler('aspeciallist', aspeciallist))
     # Приветствие новых участников
     application.add_handler(ChatMemberHandler(welcome_new_member))
     # Команды БЕЗ префикса (только gban, ungban, check_gban, gban_list)
