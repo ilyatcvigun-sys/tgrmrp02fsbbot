@@ -2101,26 +2101,23 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     awards = get_user_awards(target_id)
     award_count = len(awards) if awards else 0
     
-special = "🔐 Спецдопуск: Да\n" if has_special_access(target_id) else ""
-text = (
-    f"👤 ПРОФИЛЬ\n\n"
-    f"🎮 Ник: {user_data['nick']}\n"
-    f"📻 Позывной: {user_data['callsign']}\n"
-    f"🎫 Жетон: {user_data['token']}\n"
-    f"⭐ Ранг: {permissions['name']}\n"
-    f"📁 Отдел: {user_data['department']}\n"
-    f"⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
-    f"🏅 Наград: {award_count}\n"
-    f"{special}"
-    f"🆔 ID: {user_data['user_id']}\n"
-    f"📅 Зарегистрирован: {user_data['reg_date']}"
-)
+    special_text = "🔐 Спецдопуск: Да\n" if has_special_access(target_id) else ""
+    
+    text = (
+        f"👤 ПРОФИЛЬ\n\n"
+        f"🎮 Ник: {user_data['nick']}\n"
+        f"📻 Позывной: {user_data['callsign']}\n"
+        f"🎫 Жетон: {user_data['token']}\n"
+        f"⭐ Ранг: {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}\n"
+        f"⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
+        f"🏅 Наград: {award_count}\n"
+        f"{special_text}"
+        f"🆔 ID: {user_data['user_id']}\n"
+        f"📅 Зарегистрирован: {user_data['reg_date']}"
+    )
     
     await update.message.reply_text(text)
-
-
-
-
 # ============ AWARN ============
 
 async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
