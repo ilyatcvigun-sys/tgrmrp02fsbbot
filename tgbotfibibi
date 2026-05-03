@@ -733,7 +733,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.effective_chat.send_message(welcome_text)
         except Exception as e:
             logger.error(f"Welcome error: {e}")
-        # Уведомление 4+ о новом пользователе
+        # Уведомление 4+ о новом пользователе (кроме заблокированных)
         try:
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
@@ -1082,8 +1082,7 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
-        if resolved:
-            target_id = resolved
+        if resolved: target_id = resolved
         else:
             await update.message.reply_text("❌ Не удалось найти.")
             return
@@ -1091,10 +1090,25 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_data:
         await update.message.reply_text("❌ Пользователь не найден.")
         return
-    block_user_from_bot(target_id)
-    issuer_data = get_user_data(user_id)
-    issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
-    await update.message.reply_text(f"🚫 {target_data['nick']} отключён от бота\n👮 Отключил: {issuer_name}")
+    cursor.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    # Блокируем
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET bot_blocked = "Да" WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
+    issuer_name = get_admin_nick(user_id)
+    await update.message.reply_text(f"🚫 {target_data['nick']} отключён от бота!\n👮 Отключил: {issuer_name}")
+    
+    # Уведомление пользователю
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🚫 Вы отключены от бота!\n👮 Отключил: {issuer_name}"
+        )
+    except:
+        pass
 
 async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1109,8 +1123,7 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
-        if resolved:
-            target_id = resolved
+        if resolved: target_id = resolved
         else:
             await update.message.reply_text("❌ Не удалось найти.")
             return
@@ -1118,8 +1131,14 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_data:
         await update.message.reply_text("❌ Пользователь не найден.")
         return
-    unblock_user_from_bot(target_id)
-    await update.message.reply_text(f"✅ {target_data['callsign']} подключён к боту!")
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET bot_blocked = "Нет" WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ {target_data['nick']} подключён к боту!")
 
 # ============ НАСТРОЕНИЕ ЧАТА ============
 
