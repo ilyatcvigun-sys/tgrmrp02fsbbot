@@ -1144,17 +1144,65 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def amood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_messages:
-        positive = sum(1 for m in chat_messages if any(w in m.lower() for w in ['👍','🔥','❤','спасибо','хорош','красава','топ']))
-        negative = sum(1 for m in chat_messages if any(w in m.lower() for w in ['👎','ужас','плох','фу','отстой','бесит']))
+        positive_words = [
+            '👍', '🔥', '❤', '😊', '😍', '🥰', '😘', '💋', '💖', '💕', '💗', '💝', '💯', '✅', '☺', '😁', '😄', '😃', '😀',
+            'спасибо', 'спс', 'сяб', 'сяп', 'благодарю', 'мерси', 'спасибки', 'спасибочки', 'thanks', 'thx', 'ty',
+            'хорош', 'хорошо', 'отлично', 'отлишн', 'прекрасно', 'замечательно', 'великолепно', 'супер', 'круто', 'класс',
+            'красава', 'красавчик', 'красотка', 'молодец', 'умница', 'умничка', 'маладес', 'маладэц',
+            'топ', 'топчик', 'огонь', 'кайф', 'зашибись', 'обалденно', 'пушка', 'бомба', 'имба', 'легенда',
+            'люблю', 'обожаю', 'уважаю', 'респект', 'уважуха', 'почет', 'почёт',
+            'харош', 'харашо', 'збс', 'заебись', 'ахуенно', 'пиздато', 'еее', 'ура', 'йоу', 'йохоу', 'ееее',
+            'рад', 'счастлив', 'доволен', 'горжусь', 'восхищен', 'в восторге', 'кайфую', 'тащусь', 'балдею',
+            'лучший', 'лучшая', 'лучшие', 'номер один', '№1', 'на высоте', 'высший класс',
+            '💪', '👏', '🙌', '🤝', '🌟', '⭐', '✨', '🎉', '🎊', '🏆', '🥇', '💎', '🍾', '🥂', '🎆', '🎇',
+            'красиво', 'стильно', 'модно', 'приятно', 'вкусно', 'сладко', 'нежно', 'мягко', 'тепло', 'душевно',
+            'смеюсь', 'смешно', 'ржака', 'ржачно', 'угар', 'угарно', 'орать', 'ор', 'лол', 'лмао', 'ахаха', 'хд',
+            'поддерживаю', 'солидарен', 'плюсую', '++++', 'база', 'основа', 'истину глаголишь', 'прав', 'правда',
+            'хочу', 'нравится', 'нра', 'прикольно', 'клево', 'няшно', 'мило', 'милота', 'кавай', 'кавайно'
+        ]
+        negative_words = [
+            '👎', '😠', '😡', '🤬', '😤', '😒', '😞', '😔', '😢', '😭', '💔', '🤢', '🤮', '💀', '☠', '👿',
+            'ужас', 'ужасно', 'кошмар', 'жесть', 'пиздец', 'капец', 'трындец', 'хана', 'кранты', 'конец',
+            'плох', 'плохо', 'хреново', 'хуево', 'отвратительно', 'мерзко', 'гадко', 'противно', 'паршиво', 'дерьмово',
+            'фу', 'фуу', 'бе', 'бэ', 'буэ', 'отстой', 'отстойно', 'дно', 'днище', 'шлак', 'мусор', 'помойка',
+            'бесит', 'бесят', 'раздражает', 'злит', 'бесишь', 'заебал', 'заебали', 'достал', 'достали', 'выбешивает',
+            'грустно', 'тоскливо', 'печально', 'обидно', 'больно', 'тяжело', 'хреново', 'тоска', 'депрессия', 'печаль',
+            'не нравится', 'не нра', 'разочарован', 'расстроен', 'огорчен', 'опечален', 'обижен', 'зол', 'сердит',
+            'ужасный', 'отвратный', 'мерзкий', 'гадкий', 'противный', 'тупой', 'глупый', 'идиотский', 'дурацкий',
+            '❌', '⛔', '🚫', '⚠️', '😿', '💩', '🖕', '🤡', '👎🏻', '👎🏼', '👎🏽',
+            'надоело', 'задолбало', 'устал', 'утомился', 'вымотался', 'измучился', 'нет сил', 'сил нет',
+            'бред', 'чушь', 'фигня', 'херня', 'дичь', 'бредятина', 'ерунда', 'вздор', 'нонсенс',
+            'скучно', 'скучняк', 'не интересно', 'занудно', 'нудятина', 'тоска смертная',
+            'проиграл', 'проебал', 'слил', 'просрал', 'обосрался', 'лох', 'лузер', 'неудачник',
+            'одиноко', 'никому не нужен', 'бросили', 'кинули', 'предали', 'обманули', 'наебали'
+        ]
+        
+        positive = sum(1 for m in chat_messages if any(w in m.lower() for w in positive_words))
+        negative = sum(1 for m in chat_messages if any(w in m.lower() for w in negative_words))
         total = len(chat_messages)
-        mood_score = int((positive / max(total,1)) * 100)
-        if mood_score > 60:
-            mood_text = "😊 Позитивное"
-        elif mood_score > 30:
-            mood_text = "😐 Нейтральное"
-        else:
-            mood_text = "😠 Напряжённое"
-        await update.effective_chat.send_message(f"📊 НАСТРОЕНИЕ ЧАТА\n\n{mood_text} ({mood_score}%)\n📨 Сообщений: {total}\n👍 Позитив: {positive}\n👎 Негатив: {negative}")
+        
+        if total == 0:
+            await update.message.reply_text("Недостаточно данных.")
+            return
+        
+        mood_score = int((positive / max(total, 1)) * 100)
+        
+        if mood_score > 80: mood_text = "🥳 Праздничное"
+        elif mood_score > 65: mood_text = "😊 Отличное"
+        elif mood_score > 50: mood_text = "🙂 Хорошее"
+        elif mood_score > 35: mood_text = "😐 Нейтральное"
+        elif mood_score > 20: mood_text = "😟 Плохое"
+        elif mood_score > 10: mood_text = "😠 Ужасное"
+        else: mood_text = "💀 Катастрофа"
+        
+        await update.effective_chat.send_message(
+            f"📊 НАСТРОЕНИЕ ЧАТА\n\n"
+            f"{mood_text} ({mood_score}%)\n"
+            f"📨 Сообщений: {total}\n"
+            f"👍 Позитив: {positive}\n"
+            f"👎 Негатив: {negative}\n"
+            f"😐 Нейтрально: {total - positive - negative}"
+        )
     else:
         await update.message.reply_text("Недостаточно данных.")
 
@@ -1166,22 +1214,70 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
     if chat_messages and CONFERENCE_CHAT_ID:
-        positive = sum(1 for m in chat_messages if any(w in m.lower() for w in ['👍','🔥','❤','спасибо','хорош','красава','топ']))
+        positive_words = ['👍','🔥','❤','😊','😍','🥰','спасибо','спс','сяб','хорош','хорошо','отлично','прекрасно','супер','круто','класс','красава','молодец','топ','топчик','огонь','кайф','зашибись','пушка','бомба','имба','респект','уважаю','люблю','рад','счастлив','доволен','лучший','💪','👏','🌟','🏆','🎉','лол','смешно','ржака','угар','поддерживаю','прав','база','прикольно','клево','мило']
+        negative_words = ['👎','😠','😡','🤬','😤','😒','😞','😢','💔','ужас','ужасно','кошмар','жесть','пиздец','капец','плох','плохо','хреново','отвратительно','фу','отстой','дно','бесит','бесят','заебал','достал','грустно','тоскливо','обидно','разочарован','❌','💩','🖕','бред','чушь','фигня','херня','скучно','проиграл','лох','одиноко','предали']
+        
+        positive = sum(1 for m in chat_messages if any(w in m.lower() for w in positive_words))
+        negative = sum(1 for m in chat_messages if any(w in m.lower() for w in negative_words))
         total = len(chat_messages)
-        mood_score = int((positive / max(total,1)) * 100)
-        if mood_score > 60:
-            mood_text = "😊 Позитивное"
-        elif mood_score > 30:
-            mood_text = "😐 Нейтральное"
-        else:
-            mood_text = "😠 Напряжённое"
+        
+        if total == 0: return
+        mood_score = int((positive / max(total, 1)) * 100)
+        
+        if mood_score > 80: mood_text = "🥳 Праздничное"
+        elif mood_score > 65: mood_text = "😊 Отличное"
+        elif mood_score > 50: mood_text = "🙂 Хорошее"
+        elif mood_score > 35: mood_text = "😐 Нейтральное"
+        elif mood_score > 20: mood_text = "😟 Плохое"
+        elif mood_score > 10: mood_text = "😠 Ужасное"
+        else: mood_text = "💀 Катастрофа"
+        
         try:
-            await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=f"📊 Настроение чата: {mood_text} ({mood_score}%)")
-        except:
-            pass
+            await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=f"📊 Настроение: {mood_text} ({mood_score}%) | 👍{positive} 👎{negative}")
+        except: pass
 
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
-
+async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Смена ника (спецдопуск или 6+)"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id) and not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только со спецдопуском или генералы.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    new_nick = None
+    
+    if target_id:
+        new_nick = ' '.join(context.args) if context.args else None
+    else:
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /asetnick @user НовыйНик")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        new_nick = ' '.join(context.args[1:])
+    
+    if isinstance(target_id, str):
+        target_id = await resolve_user_id(update, context, target_id)
+    
+    if not target_id or not new_nick:
+        await update.message.reply_text("❌ Не найден или не указан ник.")
+        return
+    
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    old_nick = target_data['nick']
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET game_nick = ? WHERE user_id = ?', (new_nick, target_id))
+    conn.commit()
+    conn.close()
+    
+    await notify_user(context, target_id, f"📢 Ваш ник изменён!\n🎮 Было: {old_nick}\n🎮 Стало: {new_nick}\n👮 Изменил: {get_admin_nick(user_id)}")
+    await update.message.reply_text(f"✅ Ник изменён!\n🎮 {old_nick} → {new_nick}")
 
 # ============ РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ============
 
@@ -1935,7 +2031,7 @@ def main():
     init_database()
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration)], states={GAME_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_game_nick)], CALLSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_registration)]}, fallbacks=[CommandHandler('cancel', cancel)]))
-    for cmd, func in {'start':start,'ainfo':ainfo,'ahelp':ahelp,'aprofile':aprofile,'astats':astats,'aawards':aawards,'anick':anick,'asearch':asearch,'akick':akick,'aban':aban,'aunban':aunban,'awarn':awarn,'awarns':awarns,'awarnlist':awarns,'aunwarn':aunwarn,'aunwarnall':aunwarnall,'asetrank':asetrank,'asetdept':asetdept,'asettoken':asettoken,'aadmins':aadmins,'auserlist':auserlist,'awho':awhoprofile,'areports':areports,'achangelog':achangelog,'acallsign':acallsign,'ablock':ablock,'aunblock':aunblock,'amood':amood,'aspecial':aspecial,'awhois':awhois,'abroadcast':abroadcast,'abackup':abackup,'aregister':aregister,'aforcereg':aforcereg,'aadminlist':aadminlist,'areset_user':areset_user,'adelete_user':adelete_user,'aglobal_unban':aglobal_unban,'asetallrank':asetallrank,'areport_info':areport_info,'aspeciallist':aspeciallist,'atest':atest,'find':find}.items():
+    for cmd, func in {'start':start,'ainfo':ainfo,'ahelp':ahelp,'aprofile':aprofile,'astats':astats,'aawards':aawards,'anick':anick,'asearch':asearch,'akick':akick,'aban':aban,'aunban':aunban,'awarn':awarn,'awarns':awarns,'awarnlist':awarns,'aunwarn':aunwarn,'aunwarnall':aunwarnall,'asetrank':asetrank,'asetdept':asetdept,'asettoken':asettoken,'aadmins':aadmins,'auserlist':auserlist,'awho':awhoprofile,'areports':areports,'achangelog':achangelog,'acallsign':acallsign,'ablock':ablock,'aunblock':aunblock,'amood':amood,'aspecial':aspecial,'awhois':awhois,'abroadcast':abroadcast,'abackup':abackup,'aregister':aregister,'aforcereg':aforcereg,'aadminlist':aadminlist,'areset_user':areset_user,'adelete_user':adelete_user,'asetnick':asetnick,'aglobal_unban':aglobal_unban,'asetallrank':asetallrank,'areport_info':areport_info,'aspeciallist':aspeciallist,'atest':atest,'find':find}.items():
         application.add_handler(CommandHandler(cmd, func))
     for cmd, func in {'gban':gban_command,'ungban':ungban_command,'check_gban':check_gban_command,'gban_list':gban_list_command,'areport':areport_start}.items():
         application.add_handler(CommandHandler(cmd, func))
