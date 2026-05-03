@@ -533,20 +533,80 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
-    text = "📚 СПРАВКА\n\n"
-    text += "🔹 ДЛЯ ВСЕХ:\n/start\n/ainfo\n/ahelp\n/aprofile\n/find\n/aawards\n/anick\n/asearch\n/areport\n/check_gban\n/awarns\n\n"
+    
+    text = "╔══════════════════════╗\n"
+    text += "║   📚 СПРАВКА КОМАНД   ║\n"
+    text += "╚══════════════════════╝\n\n"
+    
+    text += "🔹 ДЛЯ ВСЕХ:\n"
+    text += "├ /start — Главное меню (ЛС)\n"
+    text += "├ /ainfo — Информация о профиле\n"
+    text += "├ /ahelp — Эта справка\n"
+    text += "├ /aprofile — Подробный профиль\n"
+    text += "├ /astats — Статистика конференции\n"
+    text += "├ /aawards — Ваши награды\n"
+    text += "├ /anick имя — Поиск по нику\n"
+    text += "├ /asearch 52**** — Поиск по жетону\n"
+    text += "├ /find — Список руководящего состава\n"
+    text += "├ /awarns [@user] — Предупреждения (свои/чужие)\n"
+    text += "├ /areport — Подать жалобу\n"
+    text += "├ /check_gban [@user] — Проверка ЧС\n"
+    text += "└ /amood — Настроение чата\n\n"
+    
     if rank >= 4:
-        text += "🔹 ПОДПОЛКОВНИК (4+):\n/areports\n/areport_info\n/acallsign\n\n"
+        text += "🔹 ПОДПОЛКОВНИК (4+):\n"
+        text += "├ /areports — Все жалобы\n"
+        text += "└ /acallsign [@user] Новый — Сменить позывной\n\n"
+    
     if rank >= 5:
-        text += "🔹 ПОЛКОВНИК (5+):\n/akick\n/aban\n/aunban\n/awarn\n/aunwarn\n/aunwarnall\n/asetrank\n/asetdept\n/aadmins\n/auserlist\n/ablock\n/aunblock\n\n"
+        text += "🔹 ПОЛКОВНИК (5+):\n"
+        text += "├ /akick @user [причина] — Кик\n"
+        text += "├ /aban @user причина — Бан\n"
+        text += "├ /aunban @user — Разбан\n"
+        text += "├ /awarn @user причина — Предупреждение\n"
+        text += "├ /aunwarn @user — Снять 1 предупреждение\n"
+        text += "├ /aunwarnall @user — Снять все предупреждения\n"
+        text += "├ /asetrank @user 0-7 — Установить ранг\n"
+        text += "├ /asetdept @user номер — Назначить отдел\n"
+        text += "├ /ablock @user — Отключить от бота\n"
+        text += "├ /aunblock @user — Подключить к боту\n"
+        text += "├ /aadmins — Список администрации\n"
+        text += "├ /auserlist — Список участников\n"
+        text += "└ /awho @user — Профиль другого пользователя\n\n"
+    
     if rank >= 6:
-        text += "🔹 ГЕНЕРАЛ (6):\n/gban\n/ungban\n/gban_list\n/asettoken\n/achangelog\n/aregister\n/aforcereg\n\n"
+        text += "🔹 ГЕНЕРАЛ (6):\n"
+        text += "├ /gban @user причина — Глобальный бан\n"
+        text += "├ /ungban @user — Снять глобальный бан\n"
+        text += "├ /gban_list — Список ЧС\n"
+        text += "├ /asettoken @user 52**** — Выдать жетон\n"
+        text += "├ /aregister @user Ник Позывной — Регистрация\n"
+        text += "├ /aforcereg @user Ник Позывной 52**** — Перерегистрация\n"
+        text += "└ /achangelog Текст — Объявление об обновлении\n\n"
+    
     if rank >= 7:
-        text += "🔹 СЛЕДЯЩИЙ (7):\n/aspecial\n/aspeciallist\n\n"
+        text += "🔹 СЛЕДЯЩИЙ ЗА ФСБ (7):\n"
+        text += "├ /aspecial @user — Выдать/отозвать спецдопуск\n"
+        text += "└ /aspeciallist — Список со спецдопуском\n\n"
+    
     if has_special_access(user_id):
-        text += "🔐 СПЕЦДОПУСК:\n/awhois\n/asetnick\n/acheckall\n\n"
+        text += "🔐 СПЕЦДОПУСК:\n"
+        text += "├ /awhois ID — Полная информация по ID\n"
+        text += "├ /asetnick @user Ник — Сменить ник\n"
+        text += "└ /acheckall — Все в ЧС\n\n"
+    
     if is_main_admin(user_id):
-        text += "👑 ГЛАВНЫЙ:\n/asetadmin\n/aunsetadmin\n/aadminlist\n/areset_user\n/adelete_user\n/abackup\n/abroadcast\n/aglobal_unban\n/asetallrank\n"
+        text += "👑 ГЛАВНЫЙ АДМИН:\n"
+        text += "├ /asetadmin @user — Назначить админа\n"
+        text += "├ /aunsetadmin @user — Снять админа\n"
+        text += "├ /aadminlist — Список админов\n"
+        text += "├ /areset_user @user — Сброс пользователя\n"
+        text += "├ /adelete_user @user — Удалить пользователя\n"
+        text += "├ /abackup — Экспорт базы\n"
+        text += "├ /abroadcast Текст — Рассылка всем\n"
+        text += "├ /aglobal_unban — Массовый разбан\n"
+        text += "└ /asetallrank 0-7 — Ранг всем\n"
+    
     await update.message.reply_text(text)
 
 async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
