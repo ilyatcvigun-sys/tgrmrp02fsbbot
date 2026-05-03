@@ -1454,6 +1454,56 @@ async def areports(update, context):
     else:
         await update.message.reply_text("Жалоб нет.")
 
+async def acallsign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Смена позывного"""
+    user_id = update.effective_user.id
+    target_id = extract_user_id(update, context)
+    
+    if target_id:
+        if not has_permission(user_id, 'search'):
+            await update.message.reply_text("❌ С 4 ранга для смены чужого позывного.")
+            return
+        if isinstance(target_id, str):
+            resolved = await resolve_user_id(update, context, target_id)
+            if resolved:
+                target_id = resolved
+            else:
+                await update.message.reply_text("❌ Не найден.")
+                return
+        if not context.args:
+            await update.message.reply_text("❌ /acallsign @user НовыйПозывной")
+            return
+        new_callsign = ' '.join(context.args)
+    else:
+        target_id = user_id
+        if not context.args:
+            await update.message.reply_text("❌ /acallsign НовыйПозывной")
+            return
+        new_callsign = ' '.join(context.args)
+    
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    old_callsign = target_data['callsign']
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET callsign = ? WHERE user_id = ?', (new_callsign, target_id))
+    conn.commit()
+    conn.close()
+    
+    if target_id != user_id:
+        issuer_data = get_user_data(user_id)
+        issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
+        try:
+            await context.bot.send_message(chat_id=target_id, text=f"📢 Ваш позывной изменён!\n📻 Было: {old_callsign}\n📻 Стало: {new_callsign}\n👮 Изменил: {issuer_name}")
+        except:
+            pass
+    
+    await update.message.reply_text(f"✅ Позывной изменён!\n📻 Было: {old_callsign}\n📻 Стало: {new_callsign}")
+
 # ============ СПЕЦДОПУСК ============
 
 async def aspecial(update, context):
