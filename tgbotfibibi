@@ -1094,7 +1094,7 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     block_user_from_bot(target_id)
     issuer_data = get_user_data(user_id)
     issuer_name = issuer_data['nick'] if issuer_data else "Администратор"
-    await update.message.reply_text(f"🚫 {target_data['callsign']} отключён от бота\n👮 Отключил: {issuer_name}")
+    await update.message.reply_text(f"🚫 {target_data['nick']} отключён от бота\n👮 Отключил: {issuer_name}")
 
 async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
