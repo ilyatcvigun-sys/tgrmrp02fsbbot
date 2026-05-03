@@ -1163,6 +1163,230 @@ async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
 
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
 
+
+# ============ РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ============
+
+async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Регистрация пользователя (6+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /aregister @user Ник Позывной")
+        return
+    if isinstance(target_id, str):
+        resolved = await resolve_user_id(update, context, target_id)
+        if resolved: target_id = resolved
+        else:
+            await update.message.reply_text("❌ Не найден.")
+            return
+    if get_user_data(target_id):
+        await update.message.reply_text("❌ Уже зарегистрирован.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /aregister @user Ник Позывной")
+        return
+    game_nick = context.args[0] if target_id else context.args[1]
+    callsign = context.args[1] if target_id else context.args[2]
+    token = add_user(target_id, game_nick, callsign)
+    if token:
+        await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
+        try:
+            issuer = get_admin_nick(user_id)
+            await context.bot.send_message(chat_id=target_id, text=f"✅ Вас зарегистрировал {issuer}!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
+        except: pass
+    else:
+        await update.message.reply_text("❌ Ошибка.")
+
+
+async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительная регистрация с жетоном (6+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+        return
+    if isinstance(target_id, str):
+        resolved = await resolve_user_id(update, context, target_id)
+        if resolved: target_id = resolved
+        else:
+            await update.message.reply_text("❌ Не найден.")
+            return
+    if len(context.args) < 3:
+        await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+        return
+    game_nick = context.args[0] if target_id else context.args[1]
+    callsign = context.args[1] if target_id else context.args[2]
+    token = context.args[2] if target_id else context.args[3]
+    # Удалить старую запись
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM users WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    new_token = add_user(target_id, game_nick, callsign, token)
+    if new_token:
+        await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {new_token}")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
+
+
+# ============ ГЛАВНЫЙ АДМИН ============
+
+async def aadminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_main_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только главный админ.")
+        return
+    text = "👥 АДМИНИСТРАТОРЫ:\n\n🌟 Главные:\n"
+    for aid in ADMIN_IDS:
+        ad = get_user_data(aid)
+        if ad: text += f"├ {ad['callsign']} ({ad['nick']}) — 🆔 {aid}\n"
+    await update.message.reply_text(text)
+
+async def areset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_main_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только главный админ.")
+        return
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str): target_id = await resolve_user_id(update, context, target_id)
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET rank=0, department="Не назначен", warns="0/0", ban_status="Нет", ban_reason="", ban_date="" WHERE user_id=?', (target_id,))
+    cursor.execute('DELETE FROM warnings WHERE user_id=?', (target_id,))
+    cursor.execute('DELETE FROM gban WHERE user_id=?', (target_id,))
+    conn.commit()
+    conn.close()
+    target_data = get_user_data(target_id)
+    await update.message.reply_text(f"✅ {target_data['callsign']} сброшен.")
+
+async def adelete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_main_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только главный админ.")
+        return
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str): target_id = await resolve_user_id(update, context, target_id)
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    target_data = get_user_data(target_id)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM users WHERE user_id=?', (target_id,))
+    cursor.execute('DELETE FROM warnings WHERE user_id=?', (target_id,))
+    cursor.execute('DELETE FROM gban WHERE user_id=?', (target_id,))
+    cursor.execute('DELETE FROM awards WHERE user_id=?', (target_id,))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ {target_data['callsign']} удалён.")
+
+async def aglobal_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_main_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только главный админ.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET ban_status="Нет", ban_reason="", ban_date=""')
+    u = cursor.rowcount
+    cursor.execute('DELETE FROM gban')
+    g = cursor.rowcount
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Разбанено: {u}\n🚫 Удалено из ЧС: {g}")
+
+async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_main_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только главный админ.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ /asetallrank 0-7")
+        return
+    new_rank = int(context.args[0])
+    if new_rank not in RANKS:
+        await update.message.reply_text("❌ Неверный ранг.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET rank=?', (new_rank,))
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Ранг {RANKS[new_rank]['name']} установлен {count} польз.")
+
+async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_permission(update.effective_user.id, 'search'):
+        await update.message.reply_text("❌ С 4 ранга.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ /areport_info номер")
+        return
+    report = get_report(int(context.args[0]))
+    if not report:
+        await update.message.reply_text("❌ Не найдена.")
+        return
+    mod_name = get_admin_nick(report['moderator_id']) if report['moderator_id'] else "—"
+    text = f"📋 ЖАЛОБА #{report['id']}\n📊 {report['status']}\n👤 {report['reporter_nick']}\n🎮 {report['violator_nick']}\n⚠️ {report['violation']}\n📎 {report['evidence']}\n💻 {report['command']}\n📅 {report['created_at']}"
+    if report['status'] != 'pending':
+        text += f"\n📊 {report['verdict']}\n👮 {mod_name}\n💬 {report['moderator_comment']}\n📅 {report['resolved_at']}"
+    await update.message.reply_text(text)
+
+
+
+
+async def aspeciallist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список со спецдопуском"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, game_nick, callsign FROM users WHERE special_access = "Да"')
+    users = cursor.fetchall()
+    conn.close()
+    
+    if users:
+        text = "🔐 СПЕЦДОПУСК:\n\n"
+        for u in users:
+            text += f"👤 {u[1]} | {u[2]} | 🆔 {u[0]}\n"
+        await update.message.reply_text(text)
+    else:
+        await update.message.reply_text("🔐 Ни у кого нет спецдопуска.")
+
+async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только главный администратор.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users')
+    users = cursor.fetchall()
+    conn.close()
+    
+    text = f"📋 ЭКСПОРТ ({len(users)} польз.):\n\n"
+    for u in users[:100]:
+        text += f"🆔 {u[1]} | {u[2]} | {u[3]} | 🎫 {u[4]}\n"
+    
+    await update.message.reply_text(text)
+
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
@@ -1649,7 +1873,7 @@ def main():
     init_database()
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration)], states={GAME_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_game_nick)], CALLSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_registration)]}, fallbacks=[CommandHandler('cancel', cancel)]))
-    for cmd, func in {'start':start,'ainfo':ainfo,'ahelp':ahelp,'aprofile':aprofile,'astats':astats,'aawards':aawards,'anick':anick,'asearch':asearch,'akick':akick,'aban':aban,'aunban':aunban,'awarn':awarn,'awarns':awarns,'awarnlist':awarns,'aunwarn':aunwarn,'aunwarnall':aunwarnall,'asetrank':asetrank,'asetdept':asetdept,'asettoken':asettoken,'aadmins':aadmins,'auserlist':auserlist,'awho':awhoprofile,'areports':areports,'achangelog':achangelog,'acallsign':acallsign,'ablock':ablock,'aunblock':aunblock,'amood':amood,'aspecial':aspecial,'awhois':awhois,'abroadcast':abroadcast,'atest':atest,'find':find}.items():
+    for cmd, func in {'start':start,'ainfo':ainfo,'ahelp':ahelp,'aprofile':aprofile,'astats':astats,'aawards':aawards,'anick':anick,'asearch':asearch,'akick':akick,'aban':aban,'aunban':aunban,'awarn':awarn,'awarns':awarns,'awarnlist':awarns,'aunwarn':aunwarn,'aunwarnall':aunwarnall,'asetrank':asetrank,'asetdept':asetdept,'asettoken':asettoken,'aadmins':aadmins,'auserlist':auserlist,'awho':awhoprofile,'areports':areports,'achangelog':achangelog,'acallsign':acallsign,'ablock':ablock,'aunblock':aunblock,'amood':amood,'aspecial':aspecial,'awhois':awhois,'abroadcast':abroadcast,'abackup':abackup,'aregister':aregister,'aforcereg':aforcereg,'aadminlist':aadminlist,'areset_user':areset_user,'adelete_user':adelete_user,'aglobal_unban':aglobal_unban,'asetallrank':asetallrank,'areport_info':areport_info,'aspeciallist':aspeciallist,'atest':atest,'find':find}.items():
         application.add_handler(CommandHandler(cmd, func))
     for cmd, func in {'gban':gban_command,'ungban':ungban_command,'check_gban':check_gban_command,'gban_list':gban_list_command,'areport':areport_start}.items():
         application.add_handler(CommandHandler(cmd, func))
