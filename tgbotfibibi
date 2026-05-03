@@ -1692,16 +1692,59 @@ async def report_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Жалоба #{report_id} отправлена!")
     return ConversationHandler.END
 
-async def handle_report_callback(update, context):
+async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок модерации — только первый модератор рассматривает"""
     query = update.callback_query
     await query.answer()
-    if not has_permission(query.from_user.id, 'search'):
+    
+    user_id = query.from_user.id
+    
+    # Проверка прав (4+ ранг)
+    if not has_permission(user_id, 'search'):
         await query.edit_message_text("❌ Только с 4 ранга.")
         return
-    action, rid = query.data.split('_')
-    context.user_data['pending_report'] = int(rid)
-    context.user_data['pending_action'] = action
-    await query.edit_message_text(f"{query.message.text}\n\n{'✅ ОДОБРЕНО' if action == 'approve' else '❌ ОТКАЗАНО'}\nВведите комментарий:")
+    
+    data = query.data
+    action, report_id = data.split('_')
+    report_id = int(report_id)
+    
+    report = get_report(report_id)
+    if not report:
+        await query.edit_message_text("❌ Жалоба не найдена.")
+        return
+    
+    # Проверяем, не обработана ли уже
+    if report['status'] != 'pending':
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            f"❌ Жалоба уже обработана!\n"
+            f"📊 Статус: {report['verdict']}\n"
+            f"💬 {report['moderator_comment']}"
+        )
+        return
+    
+    # Блокируем жалобу — ставим статус 'review'
+    update_report(report_id, 'review', user_id, 'На рассмотрении...')
+    
+    if action == 'approve':
+        context.user_data['pending_report'] = report_id
+        context.user_data['pending_action'] = 'approve'
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            f"✅ ОДОБРЕНО (на рассмотрении)\n"
+            f"👮 Модератор: {get_admin_nick(user_id)}\n"
+            f"Введите комментарий (или '-' без комментария):"
+        )
+    
+    elif action == 'reject':
+        context.user_data['pending_report'] = report_id
+        context.user_data['pending_action'] = 'reject'
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            f"❌ ОТКАЗАНО (на рассмотрении)\n"
+            f"👮 Модератор: {get_admin_nick(user_id)}\n"
+            f"Введите причину отказа:"
+        )
 
 async def handle_moderator_comment(update, context):
     if 'pending_report' not in context.user_data:
