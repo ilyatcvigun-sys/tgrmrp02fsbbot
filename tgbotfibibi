@@ -101,7 +101,7 @@ def has_permission(user_id, action):
         "manage_ranks": rank >= 5,
         "ban": rank >= 5,
         "kick": rank >= 5,
-        "gban": rank >= 6
+        # "gban": rank >= 6
     }
     return permissions.get(action, False)
 
@@ -573,12 +573,10 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "├ /aadmins — Список администрации\n"
         text += "├ /auserlist — Список участников\n"
         text += "└ /awho @user — Профиль другого пользователя\n\n"
+        text += "├ /abroadcast Текст — Рассылка всем\n"
     
     if rank >= 6:
         text += "🔹 ГЕНЕРАЛ (6):\n"
-        text += "├ /gban @user причина — Глобальный бан\n"
-        text += "├ /ungban @user — Снять глобальный бан\n"
-        text += "├ /gban_list — Список ЧС\n"
         text += "├ /asettoken @user 52**** — Выдать жетон\n"
         text += "├ /aregister @user Ник Позывной — Регистрация\n"
         text += "├ /aforcereg @user Ник Позывной 52**** — Перерегистрация\n"
@@ -594,16 +592,18 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "├ /awhois ID — Полная информация по ID\n"
         text += "├ /asetnick @user Ник — Сменить ник\n"
         text += "└ /acheckall — Все в ЧС\n\n"
+        text += "├ /gban @user причина — Глобальный бан\n"
+        text += "├ /ungban @user — Снять глобальный бан\n"
+        text += "├ /gban_list — Список ЧС\n"
     
     if is_main_admin(user_id):
-        text += "👑 ГЛАВНЫЙ АДМИН:\n"
+        text += "👑 типа разраб:\n"
         text += "├ /asetadmin @user — Назначить админа\n"
         text += "├ /aunsetadmin @user — Снять админа\n"
         text += "├ /aadminlist — Список админов\n"
         text += "├ /areset_user @user — Сброс пользователя\n"
         text += "├ /adelete_user @user — Удалить пользователя\n"
         text += "├ /abackup — Экспорт базы\n"
-        text += "├ /abroadcast Текст — Рассылка всем\n"
         text += "├ /aglobal_unban — Массовый разбан\n"
         text += "└ /asetallrank 0-7 — Ранг всем\n"
     
@@ -857,8 +857,8 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban'):
-        await update.message.reply_text("❌ Только генералы.")
+    if not has_special_access(user_id):
+        await update.message.reply_text("❌ Недоступно.")
         return
     target_id = extract_user_id(update, context)
     reason = "Без причины"
@@ -1355,11 +1355,11 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка.")
 
 
-# ============ ГЛАВНЫЙ АДМИН ============
+# ============ разраб ============
 
 async def aadminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_main_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только главный админ.")
+        await update.message.reply_text("❌ Только кто-то.")
         return
     text = "👥 АДМИНИСТРАТОРЫ:\n\n🌟 Главные:\n"
     for aid in ADMIN_IDS:
@@ -1369,7 +1369,7 @@ async def aadminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def areset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_main_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только главный админ.")
+        await update.message.reply_text("❌ Только кто-то.")
         return
     target_id = extract_user_id(update, context)
     if not target_id and context.args:
@@ -1390,7 +1390,7 @@ async def areset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def adelete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_main_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только главный админ.")
+        await update.message.reply_text("❌ Только кто-то.")
         return
     target_id = extract_user_id(update, context)
     if not target_id and context.args:
@@ -1412,7 +1412,7 @@ async def adelete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def aglobal_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_main_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только главный админ.")
+        await update.message.reply_text("❌ Только кто-то.")
         return
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -1426,7 +1426,7 @@ async def aglobal_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_main_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только главный админ.")
+        await update.message.reply_text("❌ Только кто-то.")
         return
     if not context.args:
         await update.message.reply_text("❌ /asetallrank 0-7")
@@ -1487,7 +1487,7 @@ async def aspeciallist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_main_admin(user_id):
-        await update.message.reply_text("❌ Только главный администратор.")
+        await update.message.reply_text("❌ Только кто-то.")
         return
     
     conn = sqlite3.connect(DB_FILE)
@@ -1678,8 +1678,8 @@ async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban'):
-        await update.message.reply_text("❌ Только генералы.")
+    if not has_special_access(user_id):
+        await update.message.reply_text("❌ Недоступно.")
         return
     target_id = extract_user_id(update, context)
     if not target_id and context.args:
@@ -1695,8 +1695,8 @@ async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не в ЧС")
 
 async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'gban'):
-        await update.message.reply_text("❌ Только генералы.")
+    if not has_special_access(update.effective_user.id):
+        await update.message.reply_text("❌ Недоступно.")
         return
     bans = get_gban_list()
     if bans:
@@ -1755,8 +1755,8 @@ async def aunsetadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Снят.")
 
 async def abroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Только кто-то.")
+    if not has_permission(update.effective_user.id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
         return
     if not context.args:
         await update.message.reply_text("❌ /abroadcast Текст")
