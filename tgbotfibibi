@@ -2041,7 +2041,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
-    application.job_queue.run_repeating(auto_mood, interval=3600, first=10)
+    application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
     print("🤖 Бот запущен!")
     application.run_polling()
 
