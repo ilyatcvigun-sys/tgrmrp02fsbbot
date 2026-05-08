@@ -1764,20 +1764,37 @@ async def abroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("❌ /abroadcast Текст")
         return
+    
     message = ' '.join(context.args)
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    cursor.execute('SELECT user_id, game_nick FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
     users = cursor.fetchall()
     conn.close()
-    sent, failed = 0, 0
+    
+    await update.message.reply_text(f"📤 Рассылка на {len(users)} чел...")
+    
+    sent = 0
+    failed = []
+    
     for u in users:
         try:
             await context.bot.send_message(chat_id=u[0], text=f"📢 {message}")
             sent += 1
         except:
-            failed += 1
-    await update.message.reply_text(f"✅ Отправлено: {sent}\n❌ Ошибок: {failed}")
+            failed.append(f"{u[1]} (ID: {u[0]})")
+    
+    text = f"✅ Отправлено: {sent}\n❌ Ошибок: {len(failed)}"
+    
+    if failed:
+        text += "\n\n❌ Не доставлено:\n"
+        text += "\n".join(failed[:10])
+        if len(failed) > 10:
+            text += f"\n... и еще {len(failed) - 10}"
+    
+    await update.message.reply_text(text)
+
 
 async def areport_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
