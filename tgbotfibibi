@@ -14,7 +14,24 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
- 
+
+MOODIX_API_URL = "http://moodix_api:8000/analyze"
+
+import httpx
+
+async def analyze_mood_with_moodix(messages):
+    if not messages:
+        return {"error": "no messages"}
+    combined_text = "\n".join(messages[-50:])
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(MOODIX_API_URL, json={"text": combined_text})
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Moodix API error: {e}")
+        return {"main": {"label_ru": "не определено", "confidence": 0}, "top3_sub": [], "destructive": {"top3": []}}
+
 # Состояния
 GAME_NICK, CALLSIGN = range(2)
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
@@ -1143,98 +1160,34 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ НАСТРОЕНИЕ ЧАТА ============
 
 async def amood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if chat_messages:
-        positive_words = [
-            '👍', '🔥', '❤', '😊', '😍', '🥰', '😘', '💋', '💖', '💕', '💗', '💝', '💯', '✅', '☺', '😁', '😄', '😃', '😀',
-            'спасибо', 'спс', 'сяб', 'сяп', 'благодарю', 'мерси', 'спасибки', 'спасибочки', 'thanks', 'thx', 'ty',
-            'хорош', 'хорошо', 'отлично', 'отлишн', 'прекрасно', 'замечательно', 'великолепно', 'супер', 'круто', 'класс',
-            'красава', 'красавчик', 'красотка', 'молодец', 'умница', 'умничка', 'маладес', 'маладэц',
-            'топ', 'топчик', 'огонь', 'кайф', 'зашибись', 'обалденно', 'пушка', 'бомба', 'имба', 'легенда',
-            'люблю', 'обожаю', 'уважаю', 'респект', 'уважуха', 'почет', 'почёт',
-            'харош', 'харашо', 'збс', 'заебись', 'ахуенно', 'пиздато', 'еее', 'ура', 'йоу', 'йохоу', 'ееее',
-            'рад', 'счастлив', 'доволен', 'горжусь', 'восхищен', 'в восторге', 'кайфую', 'тащусь', 'балдею',
-            'лучший', 'лучшая', 'лучшие', 'номер один', '№1', 'на высоте', 'высший класс',
-            '💪', '👏', '🙌', '🤝', '🌟', '⭐', '✨', '🎉', '🎊', '🏆', '🥇', '💎', '🍾', '🥂', '🎆', '🎇',
-            'красиво', 'стильно', 'модно', 'приятно', 'вкусно', 'сладко', 'нежно', 'мягко', 'тепло', 'душевно',
-            'смеюсь', 'смешно', 'ржака', 'ржачно', 'угар', 'угарно', 'орать', 'ор', 'лол', 'лмао', 'ахаха', 'хд',
-            'поддерживаю', 'солидарен', 'плюсую', '++++', 'база', 'основа', 'истину глаголишь', 'прав', 'правда',
-            'хочу', 'нравится', 'нра', 'прикольно', 'клево', 'няшно', 'мило', 'милота', 'кавай', 'кавайно'
-        ]
-        negative_words = [
-            '👎', '😠', '😡', '🤬', '😤', '😒', '😞', '😔', '😢', '😭', '💔', '🤢', '🤮', '💀', '☠', '👿',
-            'ужас', 'ужасно', 'кошмар', 'жесть', 'пиздец', 'капец', 'трындец', 'хана', 'кранты', 'конец',
-            'плох', 'плохо', 'хреново', 'хуево', 'отвратительно', 'мерзко', 'гадко', 'противно', 'паршиво', 'дерьмово',
-            'фу', 'фуу', 'бе', 'бэ', 'буэ', 'отстой', 'отстойно', 'дно', 'днище', 'шлак', 'мусор', 'помойка',
-            'бесит', 'бесят', 'раздражает', 'злит', 'бесишь', 'заебал', 'заебали', 'достал', 'достали', 'выбешивает',
-            'грустно', 'тоскливо', 'печально', 'обидно', 'больно', 'тяжело', 'хреново', 'тоска', 'депрессия', 'печаль',
-            'не нравится', 'не нра', 'разочарован', 'расстроен', 'огорчен', 'опечален', 'обижен', 'зол', 'сердит',
-            'ужасный', 'отвратный', 'мерзкий', 'гадкий', 'противный', 'тупой', 'глупый', 'идиотский', 'дурацкий',
-            '❌', '⛔', '🚫', '⚠️', '😿', '💩', '🖕', '🤡', '👎🏻', '👎🏼', '👎🏽',
-            'надоело', 'задолбало', 'устал', 'утомился', 'вымотался', 'измучился', 'нет сил', 'сил нет',
-            'бред', 'чушь', 'фигня', 'херня', 'дичь', 'бредятина', 'ерунда', 'вздор', 'нонсенс',
-            'скучно', 'скучняк', 'не интересно', 'занудно', 'нудятина', 'тоска смертная',
-            'проиграл', 'проебал', 'слил', 'просрал', 'обосрался', 'лох', 'лузер', 'неудачник',
-            'одиноко', 'никому не нужен', 'бросили', 'кинули', 'предали', 'обманули', 'наебали'
-        ]
-        
-        positive = sum(1 for m in chat_messages if any(w in m.lower() for w in positive_words))
-        negative = sum(1 for m in chat_messages if any(w in m.lower() for w in negative_words))
-        total = len(chat_messages)
-        
-        if total == 0:
-            await update.message.reply_text("Недостаточно данных.")
-            return
-        
-        mood_score = int((positive / max(total, 1)) * 100)
-        
-        if mood_score > 80: mood_text = "🥳 Праздничное"
-        elif mood_score > 65: mood_text = "😊 Отличное"
-        elif mood_score > 50: mood_text = "🙂 Хорошее"
-        elif mood_score > 35: mood_text = "😐 Нейтральное"
-        elif mood_score > 20: mood_text = "😟 Плохое"
-        elif mood_score > 10: mood_text = "😠 Ужасное"
-        else: mood_text = "💀 Катастрофа"
-        
-        await update.effective_chat.send_message(
-            f"📊 НАСТРОЕНИЕ ЧАТА\n\n"
-            f"{mood_text} ({mood_score}%)\n"
-            f"📨 Сообщений: {total}\n"
-            f"👍 Позитив: {positive}\n"
-            f"👎 Негатив: {negative}\n"
-            f"😐 Нейтрально: {total - positive - negative}"
-        )
-    else:
+    if not chat_messages:
         await update.message.reply_text("Недостаточно данных.")
+        return
 
-async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id == CONFERENCE_CHAT_ID and update.message and update.message.text:
-        chat_messages.append(update.message.text)
-        if len(chat_messages) > 100:
-            chat_messages.pop(0)
+    analysis = await analyze_mood_with_moodix(chat_messages)
+    
+    main = analysis.get('main', {})
+    sub_top = analysis.get('top3_sub', [])
+    destructive_top = analysis.get('destructive', {}).get('top3', [])
+    
+    text = f"📊 АНАЛИЗ НАСТРОЕНИЯ (Moodix)\n\n"
+    text += f"Основное: {main.get('label_ru', 'не определено')} ({main.get('confidence', 0)}%)\n\n"
+    text += f"Эмоции: {', '.join(sub_top) if sub_top else 'нет данных'}\n"
+    text += f"Деструктивность: {', '.join(destructive_top) if destructive_top else 'нет данных'}"
+    
+    await update.message.reply_text(text)
 
 async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
     if chat_messages and CONFERENCE_CHAT_ID:
-        positive_words = ['👍','🔥','❤','😊','😍','🥰','спасибо','спс','сяб','хорош','хорошо','отлично','прекрасно','супер','круто','класс','красава','молодец','топ','топчик','огонь','кайф','зашибись','пушка','бомба','имба','респект','уважаю','люблю','рад','счастлив','доволен','лучший','💪','👏','🌟','🏆','🎉','лол','смешно','ржака','угар','поддерживаю','прав','база','прикольно','клево','мило']
-        negative_words = ['👎','😠','😡','🤬','😤','😒','😞','😢','💔','ужас','ужасно','кошмар','жесть','пиздец','капец','плох','плохо','хреново','отвратительно','фу','отстой','дно','бесит','бесят','заебал','достал','грустно','тоскливо','обидно','разочарован','❌','💩','🖕','бред','чушь','фигня','херня','скучно','проиграл','лох','одиноко','предали']
-        
-        positive = sum(1 for m in chat_messages if any(w in m.lower() for w in positive_words))
-        negative = sum(1 for m in chat_messages if any(w in m.lower() for w in negative_words))
-        total = len(chat_messages)
-        
-        if total == 0: return
-        mood_score = int((positive / max(total, 1)) * 100)
-        
-        if mood_score > 80: mood_text = "🥳 Праздничное"
-        elif mood_score > 65: mood_text = "😊 Отличное"
-        elif mood_score > 50: mood_text = "🙂 Хорошее"
-        elif mood_score > 35: mood_text = "😐 Нейтральное"
-        elif mood_score > 20: mood_text = "😟 Плохое"
-        elif mood_score > 10: mood_text = "😠 Ужасное"
-        else: mood_text = "💀 Катастрофа"
-        
+        analysis = await analyze_mood_with_moodix(chat_messages)
+        main = analysis.get('main', {})
         try:
-            await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=f"📊 Настроение: {mood_text} ({mood_score}%) | 👍{positive} 👎{negative}")
-        except: pass
+            await context.bot.send_message(
+                chat_id=CONFERENCE_CHAT_ID,
+                text=f"📊 Настроение: {main.get('label_ru', 'не определено')} ({main.get('confidence', 0)}%)"
+            )
+        except:
+            pass
 
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
 async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
