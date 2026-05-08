@@ -15,22 +15,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MOODIX_API_URL = "http://moodix_api:8000/analyze"
+import openai
 
-import httpx
-
-async def analyze_mood_with_moodix(messages):
-    if not messages:
-        return {"error": "no messages"}
-    combined_text = "\n".join(messages[-50:])
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(MOODIX_API_URL, json={"text": combined_text})
-            response.raise_for_status()
-            return response.json()
-    except Exception as e:
-        logger.error(f"Moodix API error: {e}")
-        return {"main": {"label_ru": "не определено", "confidence": 0}, "top3_sub": [], "destructive": {"top3": []}}
+OPENROUTER_API_KEY = "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"
+OPENROUTER_MODEL = "google/gemma-3-27b-it:free"
 
 # Состояния
 GAME_NICK, CALLSIGN = range(2)
@@ -1159,192 +1147,98 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# ============ MOODIX ИНТЕГРАЦИЯ ============
+# ============ AI АНАЛИЗ  ============
 
-import numpy as np
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import load_model
-import pickle
-import re
-
-main_sentiment_ru = {
-    "positive": "Позитивное",
-    "neutrally": "Нейтральное",
-    "negative": "Негативное"
-}
-
-sub_sentiment_ru = {
-    "admiration": "восхищение", "excitement": "волнение", "gratitude": "благодарность",
-    "inspiration": "вдохновение", "joy": "радость", "love": "любовь",
-    "optimism": "оптимизм", "curiosity": "любопытство", "informative": "информативность",
-    "realization": "осознание", "anger": "гнев", "annoyance": "раздражение",
-    "disappointment": "разочарование", "disgust": "отвращение", "fear": "страх", "sadness": "грусть"
-}
-
-destructive_ru = {
-    "destructive": "деструктивность", "extremist": "экстремизм", "threat": "угроза",
-    "hate": "ненависть", "obscene": "непристойность", "insult": "оскорбление"
-}
-
-def split_into_paragraphs(text):
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
-    out = []
-    for p in paragraphs:
-        if len(p) > 300:
-            sentences = re.split(r'(?<=[.!?…])\s+', p)
-            buf = ""
-            for s in sentences:
-                if len(buf) + len(s) < 300:
-                    buf += (s + " ")
-                else:
-                    out.append(buf.strip())
-                    buf = s + " "
-            if buf.strip():
-                out.append(buf.strip())
-        else:
-            out.append(p)
-    return out
-
-class SentimentAnalyzer:
-    def __init__(self, model_path, tokenizer_path, maxlen=50):
-        self.model = None
-        self.tokenizer = None
-        self.model_path = model_path
-        self.tokenizer_path = tokenizer_path
-        self.maxlen = maxlen
-        self.sentiment_mapping = {0: 'negative', 1: 'neutrally', 2: 'positive'}
-        self.sub_categories = list(sub_sentiment_ru.keys())
-        self.destructive_categories = list(destructive_ru.keys())
-
-    def load_model(self):
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"Модель не найдена: {self.model_path}")
-        if not os.path.exists(self.tokenizer_path):
-            raise FileNotFoundError(f"Токенизатор не найден: {self.tokenizer_path}")
-        self.model = load_model(self.model_path)
-        with open(self.tokenizer_path, 'rb') as f:
-            self.tokenizer = pickle.load(f)
-
-    def clean_text(self, text):
-        text = text.lower()
-        text = re.sub(r"[^а-яёa-z0-9\s!?]", "", text)
-        return re.sub(r"\s+", " ", text).strip()
-
-    def analyze_sentiment(self, text):
-        if self.model is None or self.tokenizer is None:
-            return None
-        cleaned = self.clean_text(text)
-        seq = self.tokenizer.texts_to_sequences([cleaned])
-        if not seq or not seq[0]:
-            return None
-        padded = pad_sequences(seq, maxlen=self.maxlen, padding='post')
-        pred_main, pred_sub, pred_destr = self.model.predict(padded, verbose=0)
-        idx = int(np.argmax(pred_main[0]))
-        main_label = self.sentiment_mapping[idx]
-        confidence = float(pred_main[0][idx])
-        sub_probs = {cat: round(float(prob) * 100, 2) for cat, prob in zip(self.sub_categories, pred_sub[0])}
-        destr_probs = {cat: round(float(prob) * 100, 2) for cat, prob in zip(self.destructive_categories, pred_destr[0])}
-        return {
-            'main': {'label': main_label, 'label_ru': main_sentiment_ru[main_label], 'confidence': round(confidence * 100, 2)},
-            'sub': sub_probs,
-            'destructive': {'probs': destr_probs}
-        }
-
-def aggregate_results(paragraph_results):
-    main_labels = [r['main']['label'] for r in paragraph_results]
-    main_count = {l: main_labels.count(l) for l in main_sentiment_ru.keys()}
-    agg_main = max(main_count, key=main_count.get)
-    if list(main_count.values()).count(max(main_count.values())) > 1:
-        if main_count['neutrally'] == max(main_count.values()):
-            agg_main = 'neutrally'
-        elif main_count['positive'] == max(main_count.values()):
-            agg_main = 'positive'
-        else:
-            agg_main = 'negative'
-    confidence = np.mean([r['main']['confidence'] for r in paragraph_results])
-    sub_agg = {}
-    for cat in sub_sentiment_ru:
-        vals = [r['sub'][cat] for r in paragraph_results]
-        sub_agg[cat] = round(float(np.mean(vals)), 2)
-    top3_sub = sorted(sub_agg.items(), key=lambda x: x[1], reverse=True)[:3]
-    destr_agg = {}
-    for cat in destructive_ru:
-        vals = [r['destructive']['probs'][cat] for r in paragraph_results]
-        destr_agg[cat] = round(float(np.mean(vals)), 2)
-    top3_destr = sorted(destr_agg.items(), key=lambda x: x[1], reverse=True)[:3]
-    return {
-        'main': {'label': agg_main, 'label_ru': main_sentiment_ru[agg_main], 'confidence': round(confidence, 2)},
-        'top3_sub': [sub_sentiment_ru[c] for c, _ in top3_sub],
-        'destructive': {'top3': [destructive_ru[c] for c, _ in top3_destr]}
-    }
-
-# Инициализация анализатора
-MODEL_PATH = str(DATA_DIR / "model" / "model.keras")
-TOKENIZER_PATH = str(DATA_DIR / "model" / "tokenizer.pickle")
-moodix_analyzer = None
-
-def init_moodix():
-    global moodix_analyzer
+async def analyze_mood_with_ai(messages):
+    """Анализ настроения через OpenRouter"""
+    if not messages:
+        return {"mood_text": "Нет данных", "mood_score": 0}
+    
+    combined_text = "\n".join(messages[-200:])
+    
+    if len(combined_text) < 10:
+        return {"mood_text": "Недостаточно данных", "mood_score": 0}
+    
     try:
-        moodix_analyzer = SentimentAnalyzer(MODEL_PATH, TOKENIZER_PATH)
-        moodix_analyzer.load_model()
-        logger.info("Moodix loaded!")
-        return True
+        client = openai.OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+        
+        completion = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты анализатор настроения русскоязычного чата. "
+                        "Проанализируй сообщения и верни ТОЛЬКО JSON в формате:\n"
+                        '{"mood_score": число 1-100, "mood_label": "Позитивное/Нейтральное/Негативное", '
+                        '"summary": "краткий вывод 1 предложение на русском"}'
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Оцени настроение чата:\n{combined_text}"
+                }
+            ],
+            temperature=0.3,
+            max_tokens=150,
+        )
+        
+        import json
+        result = json.loads(completion.choices[0].message.content)
+        return result
+    
     except Exception as e:
-        logger.error(f"Moodix error: {e}")
-        return False
-
-
-# ============ НАСТРОЕНИЕ ЧАТА ============
-
-
+        logger.error(f"AI mood error: {e}")
+        return {"mood_text": "Ошибка анализа", "mood_score": 0}
 
 
 async def amood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not moodix_analyzer:
-        await update.message.reply_text("❌ Moodix не загружен.")
-        return
     if not chat_messages:
         await update.message.reply_text("Недостаточно данных.")
         return
     
-    combined_text = "\n".join(chat_messages[-50:])
-    paragraphs = split_into_paragraphs(combined_text)
-    results = [moodix_analyzer.analyze_sentiment(p) for p in paragraphs if p]
-    results = [r for r in results if r]
+    await update.message.reply_text("🤖 Анализирую настроение...")
     
-    if not results:
-        await update.message.reply_text("Не удалось проанализировать.")
-        return
+    analysis = await analyze_mood_with_ai(chat_messages)
     
-    agg = aggregate_results(results)
-    main = agg['main']
+    mood_score = analysis.get('mood_score', 0)
+    mood_label = analysis.get('mood_label', 'Не определено')
+    summary = analysis.get('summary', '')
     
-    text = f"📊 НАСТРОЕНИЕ ЧАТА (Moodix)\n\n"
-    text += f"Основное: {main['label_ru']} ({main['confidence']}%)\n"
-    text += f"Эмоции: {', '.join(agg['top3_sub'])}\n"
-    text += f"Деструктивность: {', '.join(agg['destructive']['top3'])}"
+    if mood_score > 70:
+        emoji = "😊"
+    elif mood_score > 40:
+        emoji = "😐"
+    else:
+        emoji = "😟"
+    
+    text = (
+        f"{emoji} НАСТРОЕНИЕ ЧАТА (AI)\n\n"
+        f"Основное: {mood_label} ({mood_score}%)\n"
+        f"📨 Сообщений: {len(chat_messages)}\n"
+        f"📝 {summary}"
+    )
     
     await update.message.reply_text(text)
 
+
 async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
-    if not moodix_analyzer or not chat_messages or not CONFERENCE_CHAT_ID:
-        return
-    
-    combined_text = "\n".join(chat_messages[-50:])
-    paragraphs = split_into_paragraphs(combined_text)
-    results = [moodix_analyzer.analyze_sentiment(p) for p in paragraphs if p]
-    results = [r for r in results if r]
-    
-    if results:
-        agg = aggregate_results(results)
+    if chat_messages and CONFERENCE_CHAT_ID:
+        analysis = await analyze_mood_with_ai(chat_messages)
+        mood_label = analysis.get('mood_label', 'Не определено')
+        mood_score = analysis.get('mood_score', 0)
+        
         try:
             await context.bot.send_message(
                 chat_id=CONFERENCE_CHAT_ID,
-                text=f"📊 Настроение: {agg['main']['label_ru']} ({agg['main']['confidence']}%)"
+                text=f"📊 Настроение: {mood_label} ({mood_score}%)"
             )
         except:
             pass
+
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
 async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Смена ника (спецдопуск или 6+)"""
