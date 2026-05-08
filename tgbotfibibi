@@ -2032,8 +2032,6 @@ async def handle_message(update, context):
 
 def main():
     init_database()
-    init_moodix()
-
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration)], states={GAME_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_game_nick)], CALLSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_registration)]}, fallbacks=[CommandHandler('cancel', cancel)]))
     for cmd, func in {'start':start,'ainfo':ainfo,'ahelp':ahelp,'aprofile':aprofile,'astats':astats,'aawards':aawards,'anick':anick,'asearch':asearch,'akick':akick,'aban':aban,'aunban':aunban,'awarn':awarn,'awarns':awarns,'awarnlist':awarns,'aunwarn':aunwarn,'aunwarnall':aunwarnall,'asetrank':asetrank,'asetdept':asetdept,'asettoken':asettoken,'aadmins':aadmins,'auserlist':auserlist,'awho':awhoprofile,'areports':areports,'achangelog':achangelog,'acallsign':acallsign,'ablock':ablock,'aunblock':aunblock,'amood':amood,'aspecial':aspecial,'awhois':awhois,'abroadcast':abroadcast,'abackup':abackup,'aregister':aregister,'aforcereg':aforcereg,'aadminlist':aadminlist,'areset_user':areset_user,'adelete_user':adelete_user,'asetnick':asetnick,'aglobal_unban':aglobal_unban,'asetallrank':asetallrank,'areport_info':areport_info,'aspeciallist':aspeciallist,'atest':atest,'find':find}.items():
