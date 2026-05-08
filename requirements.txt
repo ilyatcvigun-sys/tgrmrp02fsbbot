@@ -1,11 +1,11 @@
 python-telegram-bot==20.7
 python-telegram-bot[job-queue]==20.7
-tensorflow==2.15.0
+tensorflow==2.16.1
 numpy==1.26.4
-scikit-learn==1.2.2
+scikit-learn
 nltk
-transformers==4.40.2
-torch==2.2.2
-langdetect==1.0.9
+transformers
+torch
+langdetect
 sentencepiece
 httpx
