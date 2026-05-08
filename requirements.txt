@@ -1,11 +1,4 @@
 python-telegram-bot==20.7
 python-telegram-bot[job-queue]==20.7
-tensorflow==2.17.0
-numpy==1.26.4
-scikit-learn
-nltk
-transformers
-torch
-langdetect
-sentencepiece
+openai
 httpx
