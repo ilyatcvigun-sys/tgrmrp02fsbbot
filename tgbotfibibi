@@ -2028,6 +2028,13 @@ async def handle_message(update, context):
     if text in handlers:
         return await handlers[text](update, context)
 
+async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбор сообщений для анализа настроения"""
+    if update.effective_chat.id == CONFERENCE_CHAT_ID and update.message and update.message.text:
+        chat_messages.append(update.message.text)
+        if len(chat_messages) > 100:
+            chat_messages.pop(0)
+
 # ============ ЗАПУСК ============
 
 def main():
