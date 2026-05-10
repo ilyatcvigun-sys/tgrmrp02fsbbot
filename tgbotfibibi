@@ -719,12 +719,15 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============ ПРИВЕТСТВИЕ НОВЫХ УЧАСТНИКОВ ============
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие с меню-знакомством"""
     chat_member_update = update.chat_member
     old_status = chat_member_update.old_chat_member.status
     new_status = chat_member_update.new_chat_member.status
+    
     if old_status in ['left', 'kicked'] and new_status in ['member', 'administrator']:
         user = chat_member_update.new_chat_member.user
         user_id = user.id
+        
         # Проверка гбана
         gban = check_gban(user_id)
         if gban['is_banned']:
@@ -732,30 +735,89 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await update.effective_chat.ban_member(user_id)
                 await asyncio.sleep(1)
                 await update.effective_chat.unban_member(user_id)
-                await update.effective_chat.send_message(f"🚫 {user.first_name} в ЧС и был удалён")
+                await update.effective_chat.send_message(f"🚫 {user.first_name} в ЧС и был удалён!")
                 return
             except:
                 pass
+        
+        # Получаем статистику
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users')
+        total_users = cursor.fetchone()[0]
+        cursor.execute('SELECT game_nick, callsign, rank FROM users WHERE rank >= 5 ORDER BY rank DESC LIMIT 5')
+        admins = cursor.fetchall()
+        conn.close()
+        
         user_data = get_user_data(user_id)
+        
+        # Формируем приветствие
         if user_data:
             permissions = get_user_permissions(user_id)
-            welcome_text = f"👋 Приветствуем, {user_data['nick']}!\n\n📻 Позывной: {user_data['callsign']}\n🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n📁 Отдел: {user_data['department']}\n\nДобро пожаловать в конференцию!"
+            welcome_text = (
+                f"👋 **{user_data['nick']}**, добро пожаловать в конференцию!\n\n"
+                f"📻 Позывной: `{user_data['callsign']}`\n"
+                f"🎫 Жетон: `{user_data['token']}`\n"
+                f"⭐ Ранг: **{permissions['name']}**\n"
+                f"📁 Отдел: _{user_data['department']}_\n\n"
+            )
         else:
-            welcome_text = f"👋 Приветствуем, {user.first_name}!\n\nВы не зарегистрированы.\nНапишите боту в ЛС: /start\n\nДобро пожаловать в конференцию!"
+            welcome_text = (
+                f"👋 **{user.first_name}**, добро пожаловать в конференцию!\n\n"
+                f"⚠️ Вы не зарегистрированы.\n"
+                f"📝 Напишите мне в ЛС: [@{(await context.bot.get_me()).username}](https://t.me/{(await context.bot.get_me()).username})\n\n"
+            )
+        
+        # Общая информация
+        welcome_text += (
+            f"▫️ Всего участников: **{total_users}**\n\n"
+            f"📋 **ПОЛЕЗНЫЕ КОМАНДЫ:**\n"
+            f"├ /ainfo — Ваш профиль\n"
+            f"├ /ahelp — Команды\n"
+            f"├ /find — Руководящий состав\n"
+            f"├ /anick имя — Найти по нику\n"
+            f"├ /awarns — Ваши преды\n"
+            f"└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
+        )
+        
+        # Руководство
+        if admins:
+            welcome_text += "👥 **РУКОВОДСТВО:**\n"
+            for a in admins:
+                welcome_text += f"├ {a[1]} ({a[0]}) — {RANKS.get(a[2], RANKS[0])['name']}\n"
+            welcome_text += "\n"
+        
+        welcome_text += (
+            f"📜 **ПРАВИЛА:**\n"
+            f"├ Обязательно подписаться на: Ну вопщем ТГК чайника, хз. Твич - https://www.twitch.tv/chainikk01\n"
+            f"├ Оскорбление - бан\n"
+            f"├ Оскорбление администрации - расстрел, а потом бан\n"
+
+            f"🆘 По вопросам — к руководству"
+        )
+        
         try:
-            await update.effective_chat.send_message(welcome_text)
-        except Exception as e:
-            logger.error(f"Welcome error: {e}")
-        # Уведомление 4+ о новом пользователе (кроме заблокированных)
+            await update.effective_chat.send_message(welcome_text, parse_mode='Markdown', disable_web_page_preview=True)
+        except:
+            # Fallback без Markdown если не получилось
+            try:
+                await update.effective_chat.send_message(welcome_text.replace('**','').replace('`','').replace('_','').replace('▫️','•'))
+            except Exception as e:
+                logger.error(f"Welcome error: {e}")
+        
+        # Уведомление 5+ о новом
         try:
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
-            cursor.execute('SELECT user_id FROM users WHERE rank >= 4 AND bot_blocked = "Нет"')
+            cursor.execute('SELECT user_id FROM users WHERE rank >= 5 AND bot_blocked = "Нет"')
             mods = cursor.fetchall()
             conn.close()
             for m in mods:
                 try:
-                    await context.bot.send_message(chat_id=m[0], text=f"👤 Новый участник: {user.first_name} (ID: {user_id})")
+                    await context.bot.send_message(
+                        chat_id=m[0],
+                        text=f"👤 Новый участник: {user.first_name} (ID: {user_id})"
+                    )
                 except:
                     pass
         except:
