@@ -789,7 +789,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         welcome_text += (
             f"📜 **ПРАВИЛА:**\n"
-            f"├ Обязательно подписаться на: Ну вопщем ТГК чайника, хз. Твич - https://www.twitch.tv/chainikk01\n"
+            f"├ Обязательно подписаться на: ТГК чайника - https://t.me/chainikk01_TGK ; Твич - https://www.twitch.tv/chainikk01\n"
             f"├ Оскорбление - бан\n"
             f"├ Оскорбление администрации - расстрел, а потом бан\n"
 
