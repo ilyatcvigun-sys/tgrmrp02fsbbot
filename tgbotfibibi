@@ -540,11 +540,12 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
     
-    text = "╔══════════════════════╗\n"
-    text += "║   📚 СПРАВКА КОМАНД   ║\n"
+    text = " ╔══════════════════════╗\n"
+    text += "║  📚 СПРАВКА КОМАНД   ║\n"
     text += "╚══════════════════════╝\n\n"
     
     text += "🔹 ДЛЯ ВСЕХ:\n"
+
     text += "├ /start — Главное меню (ЛС)\n"
     text += "├ /ainfo — Информация о профиле\n"
     text += "├ /ahelp — Эта справка\n"
@@ -561,11 +562,13 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if rank >= 4:
         text += "🔹 ПОДПОЛКОВНИК (4+):\n"
+
         text += "├ /areports — Все жалобы\n"
         text += "└ /acallsign [@user] Новый — Сменить позывной\n\n"
     
     if rank >= 5:
         text += "🔹 ПОЛКОВНИК (5+):\n"
+
         text += "├ /akick @user [причина] — Кик\n"
         text += "├ /aban @user причина — Бан\n"
         text += "├ /aunban @user — Разбан\n"
@@ -583,6 +586,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if rank >= 6:
         text += "🔹 ГЕНЕРАЛ (6):\n"
+
         text += "├ /asettoken @user 52**** — Выдать жетон\n"
         text += "├ /aregister @user Ник Позывной — Регистрация\n"
         text += "├ /aforcereg @user Ник Позывной 52**** — Перерегистрация\n"
@@ -590,11 +594,13 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if rank >= 7:
         text += "🔹 СЛЕДЯЩИЙ ЗА ФСБ (7):\n"
+
         text += "├ /aspecial @user — Выдать/отозвать спецдопуск\n"
         text += "└ /aspeciallist — Список со спецдопуском\n\n"
     
     if has_special_access(user_id):
         text += "🔐 СПЕЦДОПУСК:\n"
+
         text += "├ /awhois ID — Полная информация по ID\n"
         text += "├ /asetnick @user Ник — Сменить ник\n"
         text += "└ /acheckall — Все в ЧС\n\n"
@@ -604,6 +610,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_main_admin(user_id):
         text += "👑 типа разраб:\n"
+
         text += "├ /asetadmin @user — Назначить админа\n"
         text += "├ /aunsetadmin @user — Снять админа\n"
         text += "├ /aadminlist — Список админов\n"
@@ -1155,7 +1162,7 @@ async def analyze_mood_with_ai(messages):
     if not messages:
         return {"mood_text": "Нет данных", "mood_score": 0}
     
-    combined_text = "\n".join(messages[-200:])
+    combined_text = "\n".join(messages[-100:])
     
     if len(combined_text) < 10:
         return {"mood_text": "Недостаточно данных", "mood_score": 0}
@@ -1217,7 +1224,7 @@ async def amood(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = "😟"
     
     text = (
-        f"{emoji} НАСТРОЕНИЕ ЧАТА (AI)\n\n"
+        f"{emoji} Настроение\n\n"
         f"Основное: {mood_label} ({mood_score}%)\n"
         f"📨 Сообщений: {len(chat_messages)}\n"
         f"📝 {summary}"
