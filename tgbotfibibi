@@ -369,10 +369,20 @@ def get_gban_list():
 def get_warn_list(user_id=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    
     if user_id:
-        cursor.execute('SELECT * FROM warnings WHERE user_id = ? ORDER BY id DESC', (user_id,))
+        cursor.execute('''
+            SELECT * FROM warnings 
+            WHERE user_id = ? AND counter != "0/0" 
+            ORDER BY id DESC
+        ''', (user_id,))
     else:
-        cursor.execute('SELECT * FROM warnings ORDER BY id DESC LIMIT 50')
+        cursor.execute('''
+            SELECT * FROM warnings 
+            WHERE counter != "0/0" 
+            ORDER BY id DESC LIMIT 50
+        ''')
+    
     warns = cursor.fetchall()
     conn.close()
     return warns
@@ -855,15 +865,15 @@ async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_data:
         permissions = get_user_permissions(user_id)
         welcome_text = (
-            f"👋 **{user_data['nick']}**, добро пожаловать в конференцию!\n\n"
+            f"👋 *{user_data['nick']}*, добро пожаловать в конференцию!\n\n"
             f"📻 Позывной: `{user_data['callsign']}`\n"
             f"🎫 Жетон: `{user_data['token']}`\n"
-            f"⭐ Ранг: **{permissions['name']}**\n"
+            f"⭐ Ранг: *{permissions['name']}*\n"
             f"📁 Отдел: _{user_data['department']}_\n\n"
         )
     else:
         welcome_text = (
-            f"👋 **{user.first_name}**, добро пожаловать в конференцию!\n\n"
+            f"👋 *{user.first_name}*, добро пожаловать в конференцию!\n\n"
             f"⚠️ Вы не зарегистрированы.\n\n"
         )
     
@@ -1102,28 +1112,32 @@ async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = user_id
     if isinstance(target_id, str):
         resolved = await resolve_user_id(update, context, target_id)
-        if resolved:
-            target_id = resolved
+        if resolved: target_id = resolved
         else:
             await update.message.reply_text("❌ Не удалось найти.")
             return
-    if target_id == -1:
-        await update.message.reply_text("❌ Уточните ID.")
-        return
+    
     if target_id != user_id and not has_permission(user_id, 'warn'):
-        await update.message.reply_text("❌ С 5 ранга")
+        await update.message.reply_text("❌ С 5 ранга.")
         return
+    
     target_data = get_user_data(target_id)
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
-    title = f"⚠️ Преды: {target_name}\nТекущий счёт: {target_data['warns']}\n\n"
+    
+    # Текущий счёт
+    current_warns = target_data['warns']
+    
+    # Активные предупреждения
     warns = get_warn_list(target_id)
+    
     if warns:
-        text = title
-        for w in warns[:20]:
+        text = f"⚠️ Предупреждения: {target_name}\n"
+        text += f"📊 Счёт: {current_warns}\n\n"
+        for w in warns:
             text += f"📅 {w[6]} | {w[3]}\n📝 {w[5]}\n\n"
         await update.message.reply_text(text)
     else:
-        await update.message.reply_text(f"{title}✅ Нет.")
+        await update.message.reply_text(f"⚠️ {target_name}\n📊 Счёт: {current_warns}\n✅ Активных предупреждений нет.")
 
 async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1173,9 +1187,31 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка.")
         return
     new_warns = f"{verbal}/{written}"
+    
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, target_id))
+    
+    # Удаляем последнее предупреждение этого типа
+    if removed_type == "письменное":
+        cursor.execute('''
+            UPDATE warnings SET counter = "0/0" 
+            WHERE id = (
+                SELECT id FROM warnings 
+                WHERE user_id = ? AND warn_type = "Письменное" AND counter != "0/0"
+                ORDER BY id DESC LIMIT 1
+            )
+        ''', (target_id,))
+    else:
+        cursor.execute('''
+            UPDATE warnings SET counter = "0/0" 
+            WHERE id = (
+                SELECT id FROM warnings 
+                WHERE user_id = ? AND warn_type = "Устное" AND counter != "0/0"
+                ORDER BY id DESC LIMIT 1
+            )
+        ''', (target_id,))
+    
     conn.commit()
     conn.close()
     await update.message.reply_text(f"✅ Снят {removed_type} пред\n👤 {target_data['callsign']}\n⚠️ Было: {current_warns} → Стало: {new_warns}")
@@ -1215,7 +1251,7 @@ async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', ("0/0", target_id))
-    cursor.execute('DELETE FROM warnings WHERE user_id = ?', (target_id,))
+    cursor.execute('UPDATE warnings SET counter = "0/0" WHERE user_id = ?', (target_id,))
     conn.commit()
     conn.close()
     await update.message.reply_text(f"✅ Все предупреждения сняты\n👤 {target_data['callsign']}\n⚠️ Было: {old_warns} → Стало: 0/0")
