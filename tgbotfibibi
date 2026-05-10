@@ -8,6 +8,9 @@ import sqlite3
 import os
 from pathlib import Path
 
+
+os.environ['TZ'] = 'Europe/Moscow'
+
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
