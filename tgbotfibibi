@@ -2380,12 +2380,12 @@ async def report_violator(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_faction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['report_faction'] = update.message.text
-    await update.message.reply_text("Шаг 3/5 — Нарушение:")
+    await update.message.reply_text("Шаг 3/5 — !!!ОПИСАНИЕ!!! + Нарушение:")
     return REPORT_VIOLATION
 
 async def report_violation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['report_violation'] = update.message.text
-    await update.message.reply_text("Шаг 4/5 — Доказательства:")
+    await update.message.reply_text("Шаг 4/5 — Доказательства !!!!!!!!!!! Time-Code при длительности больше 1 минуты !!!!!!!!!!!:")
     return REPORT_EVIDENCE
 
 async def report_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
