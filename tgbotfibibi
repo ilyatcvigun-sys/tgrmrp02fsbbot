@@ -12,41 +12,29 @@ import json
 
 os.environ['TZ'] = 'Europe/Moscow'
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 OPENROUTER_API_KEY = "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"
 OPENROUTER_MODEL = "google/gemma-3-27b-it:free"
 
-# Состояния
 GAME_NICK, CALLSIGN = range(2)
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
 
-# Токен бота
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
-
-# ID администраторов (главные)
 ADMIN_IDS = [8026911824]
 
-# Папки и БД
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR = DATA_DIR / "audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE = str(DATA_DIR / "conference.db")
 
-# ID темы для вердиктов и конференции
 VERDICT_TOPIC_ID = 40224
 CONFERENCE_CHAT_ID = -1003389197905
 
-# Для настроения чата
 chat_messages = []
 
-# Ранги
 RANKS = {
     0: {"name": "👤 Гость"},
     1: {"name": "⭐ Старший лейтенант"},
@@ -58,7 +46,6 @@ RANKS = {
     7: {"name": "⚜️ Следящий за ФСБ"}
 }
 
-# Отделы (начальные)
 DEPARTMENTS_INITIAL = [
     "🎯 Руководящий состав",
     "🔍 Начальник ОСБ",
@@ -75,7 +62,6 @@ DEPARTMENTS_INITIAL = [
     "📡 Оперативно-розыскной отдел 2-й службы ФСБ "
 ]
 
-# Награды
 AWARDS = {
     "🏅 Боевые награды": ["Орден Мужества", "Медаль за Отвагу", "Крест Доблести", "Звезда Героя"],
     "📜 Заслуги": ["За выслугу лет (1)", "За выслугу лет (2)", "За выслугу лет (3)", "Ветеран"],
@@ -88,18 +74,22 @@ AWARDS = {
 def is_private_chat(update: Update) -> bool:
     return update.effective_chat.type == 'private'
 
-def is_main_admin(user_id):
+def is_main_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def has_permission(user_id, action):
+def get_admin_nick(user_id: int) -> str:
+    ud = get_user_data(user_id)
+    return ud['nick'] if ud else str(user_id)
+
+def has_permission(user_id: int, action: str) -> bool:
     if is_main_admin(user_id):
         return True
     if has_special_access(user_id):
         return True
-    user_data = get_user_data(user_id)
-    if not user_data:
+    ud = get_user_data(user_id)
+    if not ud:
         return False
-    rank = user_data['rank']
+    rank = ud['rank']
     if rank >= 7:
         return True
     permissions = {
@@ -112,7 +102,36 @@ def has_permission(user_id, action):
     }
     return permissions.get(action, False)
 
+async def resolve_tg_username(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str) -> int:
+    """Поиск пользователя по Telegram @username через API"""
+    username = target.replace('@', '').strip()
+    try:
+        chat = await context.bot.get_chat(f"@{username}")
+        return chat.id
+    except Exception as e:
+        logger.error(f"TG resolve error for @{username}: {e}")
+    return None
+
+def find_user_in_db(username: str) -> int:
+    """Поиск в базе по нику или позывному"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE game_nick = ? OR callsign = ?', (username, username))
+    r = c.fetchone()
+    if r:
+        conn.close()
+        return r[0]
+    c.execute('SELECT user_id FROM users WHERE game_nick LIKE ? OR callsign LIKE ?', (f'{username}%', f'{username}%'))
+    results = c.fetchall()
+    conn.close()
+    if len(results) == 1:
+        return results[0][0]
+    elif len(results) > 1:
+        return -1
+    return None
+
 def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
+    """Извлечение ID: reply → число → @/ссылка → поиск в БД"""
     if update.message and update.message.reply_to_message:
         return update.message.reply_to_message.from_user.id
     if text:
@@ -122,61 +141,34 @@ def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
         username = text.replace('@', '').strip()
         if 't.me/' in username:
             username = username.split('t.me/')[-1].split()[0].strip()
+        if text.startswith('@') or 't.me/' in text:
+            return f"@{username}"
         if username:
-            user_id = find_user_in_db(username)
-            if user_id and user_id != -1:
-                return user_id
+            db_result = find_user_in_db(username)
+            if db_result is not None:
+                return db_result
             return f"@{username}"
     return None
 
-async def resolve_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, target) -> int:
-    if isinstance(target, int):
-        return target
-    if isinstance(target, str) and target.startswith('@'):
-        username = target[1:]
-        try:
-            chat = await context.bot.get_chat(f"@{username}")
-            return chat.id
-        except Exception as e:
-            logger.error(f"Resolve error: {e}")
-            return None
-    return None
-
 async def get_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE, target):
+    """Обрабатывает строку @username через TG API"""
     if isinstance(target, int):
         return target
     if isinstance(target, str) and target.startswith('@'):
-        return await resolve_user_id(update, context, target)
+        return await resolve_tg_username(update, context, target)
     return None
 
-def find_user_in_db(username):
+def find_users_by_nickname(nickname: str) -> list:
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users WHERE game_nick = ? OR callsign = ?', (username, username))
-    result = cursor.fetchone()
-    if result:
-        conn.close()
-        return result[0]
-    cursor.execute('SELECT user_id FROM users WHERE game_nick LIKE ? OR callsign LIKE ?', (f'{username}%', f'{username}%'))
-    results = cursor.fetchall()
-    if len(results) == 1:
-        conn.close()
-        return results[0][0]
-    elif len(results) > 1:
-        conn.close()
-        return -1
-    conn.close()
-    return None
-
-def find_users_by_nickname(nickname):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''SELECT user_id, game_nick, callsign, token, rank, department FROM users WHERE game_nick LIKE ? OR callsign LIKE ? ORDER BY rank DESC''', (f'%{nickname}%', f'%{nickname}%'))
-    results = cursor.fetchall()
+    c = conn.cursor()
+    c.execute('''SELECT user_id, game_nick, callsign, token, rank, department 
+                 FROM users WHERE game_nick LIKE ? OR callsign LIKE ? 
+                 ORDER BY rank DESC''', (f'%{nickname}%', f'%{nickname}%'))
+    results = c.fetchall()
     conn.close()
     return results
 
-async def kick_user_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+async def kick_user_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
     try:
         chat_id = update.effective_chat.id
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
@@ -187,7 +179,7 @@ async def kick_user_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Kick error: {e}")
         return False
 
-async def ban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+async def ban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
     try:
         chat_id = update.effective_chat.id
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
@@ -196,7 +188,7 @@ async def ban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         logger.error(f"Ban error: {e}")
         return False
 
-async def unban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+async def unban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
     try:
         chat_id = update.effective_chat.id
         await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
@@ -204,12 +196,6 @@ async def unban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception as e:
         logger.error(f"Unban error: {e}")
         return False
-
-def get_admin_nick(user_id):
-    user_data = get_user_data(user_id)
-    if user_data:
-        return user_data['nick']
-    return str(user_id)
 
 async def notify_user(context: ContextTypes.DEFAULT_TYPE, target_id: int, text: str):
     """Отправка уведомления с проверкой блокировки"""
@@ -224,57 +210,135 @@ async def notify_user(context: ContextTypes.DEFAULT_TYPE, target_id: int, text: 
 
 def init_database():
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, reporter_id INTEGER NOT NULL, reporter_nick TEXT, violator_nick TEXT NOT NULL, faction TEXT, violation TEXT NOT NULL, evidence TEXT, command TEXT, status TEXT DEFAULT 'pending', moderator_id INTEGER, moderator_comment TEXT, verdict TEXT, created_at TEXT DEFAULT '', resolved_at TEXT DEFAULT '')''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER UNIQUE NOT NULL, game_nick TEXT NOT NULL, callsign TEXT NOT NULL, token TEXT UNIQUE NOT NULL, rank INTEGER DEFAULT 0, department TEXT DEFAULT 'Не назначен', warns TEXT DEFAULT '0/0', ban_status TEXT DEFAULT 'Нет', ban_reason TEXT DEFAULT '', ban_date TEXT DEFAULT '', special_access TEXT DEFAULT 'Нет', bot_blocked TEXT DEFAULT 'Нет', created_at TEXT DEFAULT '')''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS gban (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, nick TEXT, reason TEXT, date TEXT, banned_by INTEGER)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS awards (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, nick TEXT, award_name TEXT, award_type TEXT, date TEXT, issued_by INTEGER)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, nick TEXT, warn_type TEXT, counter TEXT, reason TEXT, date TEXT, issued_by INTEGER)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS departments (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)''')
-    cursor.execute('SELECT COUNT(*) FROM departments')
-    if cursor.fetchone()[0] == 0:
+    c = conn.cursor()
+    
+    # Таблица жалоб
+    c.execute('''CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reporter_id INTEGER NOT NULL,
+        reporter_nick TEXT,
+        violator_nick TEXT NOT NULL,
+        faction TEXT,
+        violation TEXT NOT NULL,
+        evidence TEXT,
+        command TEXT,
+        status TEXT DEFAULT 'pending',
+        moderator_id INTEGER,
+        moderator_comment TEXT,
+        verdict TEXT,
+        created_at TEXT DEFAULT '',
+        resolved_at TEXT DEFAULT ''
+    )''')
+    
+    # Таблица пользователей
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE NOT NULL,
+        game_nick TEXT NOT NULL,
+        callsign TEXT NOT NULL,
+        token TEXT UNIQUE NOT NULL,
+        rank INTEGER DEFAULT 0,
+        department TEXT DEFAULT 'Не назначен',
+        warns TEXT DEFAULT '0/0',
+        ban_status TEXT DEFAULT 'Нет',
+        ban_reason TEXT DEFAULT '',
+        ban_date TEXT DEFAULT '',
+        special_access TEXT DEFAULT 'Нет',
+        bot_blocked TEXT DEFAULT 'Нет',
+        created_at TEXT DEFAULT ''
+    )''')
+    
+    # Таблица глобального бана
+    c.execute('''CREATE TABLE IF NOT EXISTS gban (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        nick TEXT,
+        reason TEXT,
+        date TEXT,
+        banned_by INTEGER
+    )''')
+    
+    # Таблица наград
+    c.execute('''CREATE TABLE IF NOT EXISTS awards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        nick TEXT,
+        award_name TEXT,
+        award_type TEXT,
+        date TEXT,
+        issued_by INTEGER
+    )''')
+    
+    # Таблица предупреждений
+    c.execute('''CREATE TABLE IF NOT EXISTS warnings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        nick TEXT,
+        warn_type TEXT,
+        counter TEXT,
+        reason TEXT,
+        date TEXT,
+        issued_by INTEGER
+    )''')
+    
+    # Таблица департаментов
+    c.execute('''CREATE TABLE IF NOT EXISTS departments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL
+    )''')
+    
+    # Заполняем начальные департаменты если таблица пуста
+    c.execute('SELECT COUNT(*) FROM departments')
+    if c.fetchone()[0] == 0:
         for dept in DEPARTMENTS_INITIAL:
             try:
-                cursor.execute('INSERT INTO departments (name) VALUES (?)', (dept,))
+                c.execute('INSERT INTO departments (name) VALUES (?)', (dept,))
             except:
                 pass
+    
+    # Добавляем колонки если их нет
     try:
-        cursor.execute('ALTER TABLE users ADD COLUMN special_access TEXT DEFAULT "Нет"')
+        c.execute('ALTER TABLE users ADD COLUMN special_access TEXT DEFAULT "Нет"')
     except:
         pass
     try:
-        cursor.execute('ALTER TABLE users ADD COLUMN bot_blocked TEXT DEFAULT "Нет"')
+        c.execute('ALTER TABLE users ADD COLUMN bot_blocked TEXT DEFAULT "Нет"')
     except:
         pass
+    
     conn.commit()
     conn.close()
 
-def get_departments():
+def get_departments() -> list:
+    """Получение списка отделов из базы"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT name FROM departments')
-    depts = [row[0] for row in cursor.fetchall()]
+    c = conn.cursor()
+    c.execute('SELECT name FROM departments')
+    depts = [row[0] for row in c.fetchall()]
     conn.close()
     return depts
 
-def generate_unique_token():
+def generate_unique_token() -> str:
+    """Генерация уникального жетона"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    c = conn.cursor()
     while True:
-        random_digits = ''.join([str(random.randint(0, 9)) for _ in range(4)])
-        token = f"52{random_digits}"
-        cursor.execute('SELECT token FROM users WHERE token = ?', (token,))
-        if not cursor.fetchone():
+        token = f"52{''.join([str(random.randint(0, 9)) for _ in range(4)])}"
+        c.execute('SELECT token FROM users WHERE token = ?', (token,))
+        if not c.fetchone():
             conn.close()
             return token
 
-def add_user(user_id, game_nick, callsign, token=None):
-    if token is None:
+def add_user(user_id: int, game_nick: str, callsign: str, token: str = None) -> str:
+    """Добавление пользователя"""
+    if not token:
         token = generate_unique_token()
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    c = conn.cursor()
     try:
-        cursor.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at) VALUES (?, ?, ?, ?, ?)''', (user_id, game_nick, callsign, token, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at) 
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (user_id, game_nick, callsign, token, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         conn.close()
         return token
@@ -282,68 +346,82 @@ def add_user(user_id, game_nick, callsign, token=None):
         conn.close()
         return None
 
-def set_user_token(user_id, new_token):
+def set_user_token(user_id: int, new_token: str) -> tuple:
+    """Установка нового жетона"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users WHERE token = ?', (new_token,))
-    if cursor.fetchone():
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE token = ?', (new_token,))
+    if c.fetchone():
         conn.close()
         return False, "Жетон уже занят"
-    cursor.execute('UPDATE users SET token = ? WHERE user_id = ?', (new_token, user_id))
+    c.execute('UPDATE users SET token = ? WHERE user_id = ?', (new_token, user_id))
     conn.commit()
-    success = cursor.rowcount > 0
+    ok = c.rowcount > 0
     conn.close()
-    return success, "Жетон обновлен" if success else "Пользователь не найден"
+    return ok, "Жетон обновлен" if ok else "Пользователь не найден"
 
-def get_user_data(user_id):
+def get_user_data(user_id: int) -> dict:
+    """Получение данных пользователя"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
     conn.close()
     if row:
         return {
-            "user_id": row[1], "nick": row[2], "callsign": row[3],
-            "token": row[4], "rank": row[5], "department": row[6],
-            "warns": row[7], "ban_status": row[8], "ban_reason": row[9],
-            "ban_date": row[10], "special_access": row[12] if len(row) > 12 else 'Нет',
+            "user_id": row[1],
+            "nick": row[2],
+            "callsign": row[3],
+            "token": row[4],
+            "rank": row[5],
+            "department": row[6],
+            "warns": row[7],
+            "ban_status": row[8],
+            "ban_reason": row[9],
+            "ban_date": row[10],
+            "special_access": row[12] if len(row) > 12 else 'Нет',
             "bot_blocked": row[13] if len(row) > 13 else 'Нет',
             "reg_date": row[14] if len(row) > 14 else row[11]
         }
     return None
 
-def update_user_rank(user_id, new_rank):
+def update_user_rank(user_id: int, new_rank: int) -> bool:
+    """Обновление ранга"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET rank = ? WHERE user_id = ?', (new_rank, user_id))
+    c = conn.cursor()
+    c.execute('UPDATE users SET rank = ? WHERE user_id = ?', (new_rank, user_id))
     conn.commit()
-    success = cursor.rowcount > 0
+    ok = c.rowcount > 0
     conn.close()
-    return success
+    return ok
 
-def update_user_department(user_id, department):
+def update_user_department(user_id: int, department: str) -> bool:
+    """Обновление отдела"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET department = ? WHERE user_id = ?', (department, user_id))
+    c = conn.cursor()
+    c.execute('UPDATE users SET department = ? WHERE user_id = ?', (department, user_id))
     conn.commit()
-    success = cursor.rowcount > 0
+    ok = c.rowcount > 0
     conn.close()
-    return success
+    return ok
 
-def add_warning(user_id, issuer_id, reason):
+def add_warning(user_id: int, issuer_id: int, reason: str) -> tuple:
+    """Добавление предупреждения"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT warns, game_nick FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute('SELECT warns, game_nick FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
     if not row:
         conn.close()
         return False, "Пользователь не найден", None
+    
     current_warns = row[0]
     user_nick = row[1]
     parts = current_warns.split('/')
     verbal = int(parts[0]) if len(parts) == 2 else 0
     written = int(parts[1]) if len(parts) == 2 else 0
     kicked = False
+    
     if verbal < 2:
         verbal += 1
         warn_type = "Устное"
@@ -355,187 +433,264 @@ def add_warning(user_id, issuer_id, reason):
     else:
         conn.close()
         return False, "Достигнут лимит предупреждений", None
+    
     new_warns = f"{verbal}/{written}"
-    cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, user_id))
-    cursor.execute('''INSERT INTO warnings (user_id, nick, warn_type, counter, reason, date, issued_by) VALUES (?, ?, ?, ?, ?, ?, ?)''', (user_id, user_nick, warn_type, new_warns, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issuer_id))
+    c.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, user_id))
+    c.execute('''INSERT INTO warnings (user_id, nick, warn_type, counter, reason, date, issued_by) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+              (user_id, user_nick, warn_type, new_warns, reason,
+               datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issuer_id))
     conn.commit()
     conn.close()
     return True, f"Выдано {warn_type.lower()} предупреждение ({new_warns})", kicked
 
-def add_gban(user_id, reason, banned_by):
+def add_gban(user_id: int, reason: str, banned_by: int) -> bool:
+    """Добавление в глобальный бан"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    user_data = get_user_data(user_id)
-    user_nick = user_data['nick'] if user_data else f"User {user_id}"
-    cursor.execute('''INSERT INTO gban (user_id, nick, reason, date, banned_by) VALUES (?, ?, ?, ?, ?)''', (user_id, user_nick, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), banned_by))
+    c = conn.cursor()
+    ud = get_user_data(user_id)
+    nick = ud['nick'] if ud else f"User {user_id}"
+    c.execute('''INSERT INTO gban (user_id, nick, reason, date, banned_by) 
+                 VALUES (?, ?, ?, ?, ?)''',
+              (user_id, nick, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), banned_by))
     conn.commit()
     conn.close()
     return True
 
-def check_gban(user_id):
+def check_gban(user_id: int) -> dict:
+    """Проверка глобального бана"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM gban WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute('SELECT * FROM gban WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
     conn.close()
     if row:
-        return {"is_banned": True, "nick": row[2], "reason": row[3], "date": row[4], "banned_by": row[5]}
+        return {
+            "is_banned": True,
+            "nick": row[2],
+            "reason": row[3],
+            "date": row[4],
+            "banned_by": row[5]
+        }
     return {"is_banned": False}
 
-def remove_gban(user_id):
+def remove_gban(user_id: int) -> bool:
+    """Удаление из глобального бана"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM gban WHERE user_id = ?', (user_id,))
-    deleted = cursor.rowcount > 0
+    c = conn.cursor()
+    c.execute('DELETE FROM gban WHERE user_id = ?', (user_id,))
+    deleted = c.rowcount > 0
     conn.commit()
     conn.close()
     return deleted
 
-def get_gban_list():
+def get_gban_list() -> list:
+    """Список глобального бана"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, nick, reason, date, banned_by FROM gban ORDER BY id DESC')
-    bans = cursor.fetchall()
+    c = conn.cursor()
+    c.execute('SELECT user_id, nick, reason, date, banned_by FROM gban ORDER BY id DESC')
+    bans = c.fetchall()
     conn.close()
     return bans
 
-def get_warn_list(user_id=None):
+def get_warn_list(user_id: int = None) -> list:
+    """Список активных предупреждений"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    c = conn.cursor()
     if user_id:
-        cursor.execute('''SELECT * FROM warnings WHERE user_id = ? AND counter != "0/0" ORDER BY id DESC''', (user_id,))
+        c.execute('''SELECT * FROM warnings 
+                     WHERE user_id = ? AND counter != "0/0" 
+                     ORDER BY id DESC''', (user_id,))
     else:
-        cursor.execute('''SELECT * FROM warnings WHERE counter != "0/0" ORDER BY id DESC LIMIT 50''')
-    warns = cursor.fetchall()
+        c.execute('''SELECT * FROM warnings 
+                     WHERE counter != "0/0" 
+                     ORDER BY id DESC LIMIT 50''')
+    warns = c.fetchall()
     conn.close()
     return warns
 
-def add_award(user_id, award_name, award_type, issued_by):
+def add_award(user_id: int, award_name: str, award_type: str, issued_by: int) -> bool:
+    """Добавление награды"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    user_data = get_user_data(user_id)
-    user_nick = user_data['nick'] if user_data else f"User {user_id}"
-    cursor.execute('''INSERT INTO awards (user_id, nick, award_name, award_type, date, issued_by) VALUES (?, ?, ?, ?, ?, ?)''', (user_id, user_nick, award_name, award_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issued_by))
+    c = conn.cursor()
+    ud = get_user_data(user_id)
+    nick = ud['nick'] if ud else f"User {user_id}"
+    c.execute('''INSERT INTO awards (user_id, nick, award_name, award_type, date, issued_by) 
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (user_id, nick, award_name, award_type,
+               datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issued_by))
     conn.commit()
     conn.close()
     return True
 
-def get_statistics():
+def get_statistics() -> dict:
+    """Получение статистики"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM users')
-    total = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM users WHERE ban_status = "Нет"')
-    active = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM users WHERE rank = 6')
-    generals = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM users WHERE rank = 7')
-    marshals = cursor.fetchone()[0]
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM users')
+    total = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM users WHERE ban_status = "Нет"')
+    active = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM users WHERE rank = 6')
+    generals = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM users WHERE rank = 7')
+    marshals = c.fetchone()[0]
     conn.close()
-    return {"total": total, "active": active, "banned": total - active, "generals": generals, "marshals": marshals}
+    return {
+        "total": total,
+        "active": active,
+        "banned": total - active,
+        "generals": generals,
+        "marshals": marshals
+    }
 
-def get_user_awards(user_id):
+def get_user_awards(user_id: int) -> list:
+    """Получение наград пользователя"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT award_name, award_type, date FROM awards WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,))
-    awards = cursor.fetchall()
+    c = conn.cursor()
+    c.execute('SELECT award_name, award_type, date FROM awards WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,))
+    awards = c.fetchall()
     conn.close()
     return awards
 
-def get_user_permissions(user_id):
-    user_data = get_user_data(user_id)
-    if not user_data:
+def get_user_permissions(user_id: int) -> dict:
+    """Получение прав пользователя"""
+    ud = get_user_data(user_id)
+    if not ud:
         return RANKS[0]
-    return RANKS.get(user_data['rank'], RANKS[0])
+    return RANKS.get(ud['rank'], RANKS[0])
 
-def get_admins():
+def get_admins() -> list:
+    """Список администраторов (5+ ранг)"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, game_nick, callsign, token, rank, department FROM users WHERE rank >= 5 ORDER BY rank DESC')
-    admins = cursor.fetchall()
+    c = conn.cursor()
+    c.execute('''SELECT user_id, game_nick, callsign, token, rank, department 
+                 FROM users WHERE rank >= 5 ORDER BY rank DESC''')
+    admins = c.fetchall()
     conn.close()
     return admins
 
-def get_all_users_list():
+def get_all_users_list() -> list:
+    """Полный список пользователей"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id, game_nick, callsign, token, rank, department FROM users ORDER BY rank DESC')
-    users = cursor.fetchall()
+    c = conn.cursor()
+    c.execute('''SELECT user_id, game_nick, callsign, token, rank, department 
+                 FROM users ORDER BY rank DESC''')
+    users = c.fetchall()
     conn.close()
     return users
 
 # ============ СПЕЦДОПУСК И БЛОКИРОВКА ============
 
-def grant_special_access(user_id):
+def grant_special_access(user_id: int):
+    """Выдача спецдопуска"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET special_access = "Да" WHERE user_id = ?', (user_id,))
+    c = conn.cursor()
+    c.execute('UPDATE users SET special_access = "Да" WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
 
-def revoke_special_access(user_id):
+def revoke_special_access(user_id: int):
+    """Отзыв спецдопуска"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET special_access = "Нет" WHERE user_id = ?', (user_id,))
+    c = conn.cursor()
+    c.execute('UPDATE users SET special_access = "Нет" WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
 
-def has_special_access(user_id):
+def has_special_access(user_id: int) -> bool:
+    """Проверка спецдопуска"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT special_access FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute('SELECT special_access FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
     conn.close()
     return row and row[0] == 'Да'
 
-def is_user_blocked(user_id):
+def is_user_blocked(user_id: int) -> bool:
+    """Проверка блокировки от бота"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT bot_blocked FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute('SELECT bot_blocked FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
     conn.close()
     return row and row[0] == 'Да'
 
 # ============ ЖАЛОБЫ ============
 
-def save_report(reporter_id, reporter_nick, violator_nick, faction, violation, evidence, command):
+def save_report(reporter_id: int, reporter_nick: str, violator_nick: str,
+                faction: str, violation: str, evidence: str, command: str) -> int:
+    """Сохранение жалобы"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''INSERT INTO reports (reporter_id, reporter_nick, violator_nick, faction, violation, evidence, command, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', (reporter_id, reporter_nick, violator_nick, faction, violation, evidence, command, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    report_id = cursor.lastrowid
+    c = conn.cursor()
+    c.execute('''INSERT INTO reports (reporter_id, reporter_nick, violator_nick, faction, 
+                 violation, evidence, command, created_at) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+              (reporter_id, reporter_nick, violator_nick, faction, violation, evidence, command,
+               datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    report_id = c.lastrowid
     conn.commit()
     conn.close()
     return report_id
 
-def update_report(report_id, status, moderator_id, verdict, comment=""):
+def update_report(report_id: int, status: str, moderator_id: int, verdict: str, comment: str = ""):
+    """Обновление жалобы"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''UPDATE reports SET status = ?, moderator_id = ?, verdict = ?, moderator_comment = ?, resolved_at = ? WHERE id = ?''', (status, moderator_id, verdict, comment, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), report_id))
+    c = conn.cursor()
+    c.execute('''UPDATE reports 
+                 SET status = ?, moderator_id = ?, verdict = ?, moderator_comment = ?, resolved_at = ? 
+                 WHERE id = ?''',
+              (status, moderator_id, verdict, comment,
+               datetime.now().strftime("%Y-%m-%d %H:%M:%S"), report_id))
     conn.commit()
     conn.close()
 
-def get_report(report_id):
+def get_report(report_id: int) -> dict:
+    """Получение жалобы"""
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM reports WHERE id = ?', (report_id,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute('SELECT * FROM reports WHERE id = ?', (report_id,))
+    row = c.fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "reporter_id": row[1], "reporter_nick": row[2], "violator_nick": row[3], "faction": row[4], "violation": row[5], "evidence": row[6], "command": row[7], "status": row[8], "moderator_id": row[9], "moderator_comment": row[10], "verdict": row[11], "created_at": row[12], "resolved_at": row[13]}
+        return {
+            "id": row[0],
+            "reporter_id": row[1],
+            "reporter_nick": row[2],
+            "violator_nick": row[3],
+            "faction": row[4],
+            "violation": row[5],
+            "evidence": row[6],
+            "command": row[7],
+            "status": row[8],
+            "moderator_id": row[9],
+            "moderator_comment": row[10],
+            "verdict": row[11],
+            "created_at": row[12],
+            "resolved_at": row[13]
+        }
     return None
 
 # ============ КОМАНДЫ ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню (ЛС)"""
     if not is_private_chat(update):
         return
+    
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
+    
     if user_data:
         rank = user_data['rank']
-        keyboard = [[KeyboardButton("👤 Информация")], [KeyboardButton("🔍 Проверить ЧС"), KeyboardButton("ℹ️ Помощь")], [KeyboardButton("📝 Подать жалобу")]]
+        keyboard = [
+            [KeyboardButton("👤 Информация")],
+            [KeyboardButton("🔍 Проверить ЧС"), KeyboardButton("ℹ️ Помощь")],
+            [KeyboardButton("📝 Подать жалобу")]
+        ]
         if rank >= 5:
             keyboard.append([KeyboardButton("📋 Список участников")])
+        
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text("🤖 Бот конференции\n\nВыберите действие:", reply_markup=reply_markup)
     else:
@@ -544,99 +699,214 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Добро пожаловать! Пройдите регистрацию:", reply_markup=reply_markup)
 
 async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Информация о профиле"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     if not user_data:
         await update.message.reply_text("❌ Не зарегистрированы.")
         return
+    
     permissions = get_user_permissions(user_id)
     special = "🔐 Спецдопуск: Да\n" if has_special_access(user_id) else ""
     blocked = "🚫 Отключён от бота\n" if is_user_blocked(user_id) else ""
-    await update.message.reply_text(f"🎮 Бот конференции\n\n👤 {user_data['callsign']}\n🎫 Жетон: {user_data['token']}\n⭐️ {permissions['name']}\n📁 Отдел: {user_data['department']}\n{special}{blocked}")
+    
+    await update.message.reply_text(
+        f"🎮 Бот конференции\n\n"
+        f"👤 {user_data['callsign']}\n"
+        f"🎫 Жетон: {user_data['token']}\n"
+        f"⭐️ {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}\n"
+        f"{special}{blocked}"
+    )
 
 async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Справка по командам"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
-    text = " ╔══════════════════════╗\n║  📚 СПРАВКА КОМАНД   ║\n╚══════════════════════╝\n\n"
-    text += "🔹 ДЛЯ ВСЕХ:\n├ /start\n├ /ainfo\n├ /ahelp\n├ /aprofile\n├ /astats\n├ /aawards\n├ /anick\n├ /asearch\n├ /find\n├ /awarns\n├ /areport\n├ /check_gban\n└ /amood\n\n"
-    if rank >= 4: text += "🔹 ПОДПОЛКОВНИК (4+):\n├ /areports\n├ /areport_info\n└ /acallsign\n\n"
-    if rank >= 5: text += "🔹 ПОЛКОВНИК (5+):\n├ /akick\n├ /aban\n├ /aunban\n├ /awarn\n├ /aunwarn\n├ /aunwarnall\n├ /asetrank\n├ /asetdept\n├ /ablock\n├ /aunblock\n├ /aadmins\n├ /auserlist\n├ /awho\n├ /abroadcast\n├ /adepartment\n└ /asetalldept\n\n"
-    if rank >= 6: text += "🔹 ГЕНЕРАЛ (6):\n├ /asettoken\n├ /aregister\n├ /aforcereg\n└ /achangelog\n\n"
-    if rank >= 7: text += "🔹 СЛЕДЯЩИЙ ЗА ФСБ (7):\n├ /aspecial\n└ /aspeciallist\n\n"
-    if has_special_access(user_id): text += "🔐 СПЕЦДОПУСК:\n├ /awhois\n├ /asetnick\n├ /acheckall\n├ /gban\n├ /ungban\n└ /gban_list\n\n"
-    if is_main_admin(user_id): text += "👑 РАЗРАБ:\n├ /asetadmin\n├ /aunsetadmin\n├ /aadminlist\n├ /areset_user\n├ /adelete_user\n├ /abackup\n├ /aglobal_unban\n└ /asetallrank\n"
+    
+    text = "╔══════════════════════╗\n"
+    text += "║  📚 СПРАВКА КОМАНД   ║\n"
+    text += "╚══════════════════════╝\n\n"
+    
+    text += "🔹 ДЛЯ ВСЕХ:\n"
+    text += "├ /start\n├ /ainfo\n├ /ahelp\n├ /aprofile\n├ /astats\n├ /aawards\n"
+    text += "├ /anick\n├ /asearch\n├ /find\n├ /awarns\n├ /areport\n"
+    text += "├ /check_gban\n└ /amood\n\n"
+    
+    if rank >= 4:
+        text += "🔹 ПОДПОЛКОВНИК (4+):\n├ /areports\n├ /areport_info\n└ /acallsign\n\n"
+    
+    if rank >= 5:
+        text += "🔹 ПОЛКОВНИК (5+):\n├ /akick\n├ /aban\n├ /aunban\n├ /awarn\n"
+        text += "├ /aunwarn\n├ /aunwarnall\n├ /asetrank\n├ /asetdept\n"
+        text += "├ /ablock\n├ /aunblock\n├ /aadmins\n├ /auserlist\n"
+        text += "├ /awho\n├ /abroadcast\n├ /adepartment\n└ /asetalldept\n\n"
+    
+    if rank >= 6:
+        text += "🔹 ГЕНЕРАЛ (6):\n├ /asettoken\n├ /aregister\n├ /aforcereg\n└ /achangelog\n\n"
+    
+    if rank >= 7:
+        text += "🔹 СЛЕДЯЩИЙ ЗА ФСБ (7):\n├ /aspecial\n└ /aspeciallist\n\n"
+    
+    if has_special_access(user_id):
+        text += "🔐 СПЕЦДОПУСК:\n├ /awhois\n├ /asetnick\n├ /acheckall\n"
+        text += "├ /gban\n├ /ungban\n└ /gban_list\n\n"
+    
+    if is_main_admin(user_id):
+        text += "👑 РАЗРАБ:\n├ /asetadmin\n├ /aunsetadmin\n├ /aadminlist\n"
+        text += "├ /areset_user\n├ /adelete_user\n├ /abackup\n"
+        text += "├ /aglobal_unban\n└ /asetallrank\n"
+    
     await update.message.reply_text(text)
 
 async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подробный профиль"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
-    if not user_data: await update.message.reply_text("❌ Не зарегистрированы."); return
+    if not user_data:
+        await update.message.reply_text("❌ Не зарегистрированы.")
+        return
+    
     permissions = get_user_permissions(user_id)
-    await update.message.reply_text(f"👤 ПРОФИЛЬ\n\n🎮 Ник: {user_data['nick']}\n📻 Позывной: {user_data['callsign']}\n🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n📁 Отдел: {user_data['department']}\n⚠️ Предупреждения: {user_data['warns']}\n📅 Зарегистрирован: {user_data['reg_date']}")
+    await update.message.reply_text(
+        f"👤 ПРОФИЛЬ\n\n"
+        f"🎮 Ник: {user_data['nick']}\n"
+        f"📻 Позывной: {user_data['callsign']}\n"
+        f"🎫 Жетон: {user_data['token']}\n"
+        f"⭐ Ранг: {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}\n"
+        f"⚠️ Предупреждения: {user_data['warns']}\n"
+        f"📅 Зарегистрирован: {user_data['reg_date']}"
+    )
 
 async def astats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика"""
     stats = get_statistics()
-    await update.message.reply_text(f"📊 СТАТИСТИКА\n\n👥 Всего: {stats['total']}\n✅ Активных: {stats['active']}\n🚫 Забанено: {stats['banned']}\n🌟 Генералов: {stats['generals']}")
+    await update.message.reply_text(
+        f"📊 СТАТИСТИКА\n\n"
+        f"👥 Всего: {stats['total']}\n"
+        f"✅ Активных: {stats['active']}\n"
+        f"🚫 Забанено: {stats['banned']}\n"
+        f"🌟 Генералов: {stats['generals']}"
+    )
 
 async def aawards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Награды"""
     user_id = update.effective_user.id
     awards = get_user_awards(user_id)
     if awards:
         text = "🏅 НАГРАДЫ:\n\n"
-        for a in awards: text += f"• {a[0]} ({a[1]}) — {a[2]}\n"
+        for a in awards:
+            text += f"• {a[0]} ({a[1]}) — {a[2]}\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text("❌ У вас пока нет наград.")
+    else:
+        await update.message.reply_text("❌ У вас пока нет наград.")
 
 async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("❌ /anick имя"); return
-    users = find_users_by_nickname(' '.join(context.args))
+    """Поиск по нику"""
+    if not context.args:
+        await update.message.reply_text("❌ /anick имя")
+        return
+    
+    nickname = ' '.join(context.args)
+    users = find_users_by_nickname(nickname)
+    
     if users:
-        text = f"🔍 Поиск:\n\n"
-        for u in users[:20]: text += f"🎮 {u[1]} | 📻 {u[2]}\n⭐ {RANKS.get(u[4], RANKS[0])['name']} | 📁 {u[5]}\n🆔 {u[0]}\n\n"
+        text = f"🔍 Поиск: {nickname}\n\n"
+        for u in users[:20]:
+            text += f"🎮 {u[1]} | 📻 {u[2]}\n"
+            text += f"⭐ {RANKS.get(u[4], RANKS[0])['name']} | 📁 {u[5]}\n"
+            text += f"🆔 {u[0]}\n\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text("❌ Ничего не найдено.")
+    else:
+        await update.message.reply_text("❌ Ничего не найдено.")
 
 async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'manage_ranks'): await update.message.reply_text("❌ С 5 ранга."); return
+    """Список участников (5+)"""
+    if not has_permission(update.effective_user.id, 'manage_ranks'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     users = get_all_users_list()
     if users:
-        text = "📋 СПИСОК:\n\n"
-        for u in users[:50]: text += f"🎮 {u[1]} | 📻 {u[2]}\n🎫 {u[3]} | ⭐ {RANKS.get(u[4], RANKS[0])['name']}\n🆔 {u[0]} | 📁 {u[5]}\n\n"
+        text = "📋 СПИСОК УЧАСТНИКОВ:\n\n"
+        for u in users[:50]:
+            text += f"🎮 {u[1]} | 📻 {u[2]}\n"
+            text += f"🎫 {u[3]} | ⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
+            text += f"🆔 {u[0]} | 📁 {u[5]}\n\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text("Список пуст.")
+    else:
+        await update.message.reply_text("Список пуст.")
 
 async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("❌ /asearch 52****"); return
-    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE token = ?', (context.args[0],)); row = c.fetchone(); conn.close()
-    if row: await update.message.reply_text(f"🎫 {context.args[0]}\n🎮 {row[2]}\n📻 {row[3]}\n⭐ {RANKS.get(row[5], RANKS[0])['name']}\n📁 {row[6]}")
-    else: await update.message.reply_text("❌ Не найден.")
+    """Поиск по жетону"""
+    if not context.args:
+        await update.message.reply_text("❌ /asearch 52****")
+        return
+    
+    token = context.args[0]
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE token = ?', (token,))
+    row = c.fetchone()
+    conn.close()
+    
+    if row:
+        await update.message.reply_text(
+            f"🎫 {token}\n🎮 {row[2]}\n📻 {row[3]}\n"
+            f"⭐ {RANKS.get(row[5], RANKS[0])['name']}\n📁 {row[6]}"
+        )
+    else:
+        await update.message.reply_text("❌ Не найден.")
 
 async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка ЧС"""
     target_id = extract_user_id(update, context)
     checker_id = update.effective_user.id
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: target_id = checker_id
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
-    if target_id == -1: await update.message.reply_text("❌ Уточните ID."); return
+    
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        target_id = checker_id
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Уточните ID.")
+        return
+    
     result = check_gban(target_id)
     if result['is_banned']:
         if has_permission(checker_id, 'warn') or has_special_access(checker_id):
-            await update.message.reply_text(f"🚫 В ЧС\n👤 {result['nick']}\n📝 {result['reason']}\n📅 {result['date']}\n👮 Выдал: {get_admin_nick(result['banned_by'])}")
-        else: await update.message.reply_text(f"🚫 Пользователь в ЧС\n👤 {result['nick']}")
-    else: await update.message.reply_text("✅ Не в ЧС.")
+            admin_nick = get_admin_nick(result['banned_by'])
+            await update.message.reply_text(
+                f"🚫 В ЧС\n👤 {result['nick']}\n"
+                f"📝 {result['reason']}\n📅 {result['date']}\n"
+                f"👮 Выдал: {admin_nick}"
+            )
+        else:
+            await update.message.reply_text(f"🚫 Пользователь в ЧС\n👤 {result['nick']}")
+    else:
+        await update.message.reply_text("✅ Не в ЧС.")
 
 # ============ ПРИВЕТСТВИЕ ============
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие нового участника"""
     chat_member_update = update.chat_member
     old_status = chat_member_update.old_chat_member.status
     new_status = chat_member_update.new_chat_member.status
+    
     if old_status in ['left', 'kicked'] and new_status in ['member', 'administrator']:
         user = chat_member_update.new_chat_member.user
         user_id = user.id
+        
+        # Проверка гбана
         gban = check_gban(user_id)
         if gban['is_banned']:
             try:
@@ -645,790 +915,1874 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await update.effective_chat.unban_member(user_id)
                 await update.effective_chat.send_message(f"🚫 {user.first_name} в ЧС и был удалён!")
                 return
-            except: pass
-        conn = sqlite3.connect(DB_FILE); c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM users'); total_users = c.fetchone()[0]
-        c.execute('SELECT game_nick, callsign, rank FROM users WHERE rank >= 5 ORDER BY rank DESC LIMIT 5'); admins = c.fetchall(); conn.close()
+            except:
+                pass
+        
+        # Получаем статистику
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM users')
+        total_users = c.fetchone()[0]
+        c.execute('SELECT game_nick, callsign, rank FROM users WHERE rank >= 5 ORDER BY rank DESC LIMIT 5')
+        admins = c.fetchall()
+        conn.close()
+        
         user_data = get_user_data(user_id)
+        
+        # Формируем приветствие
         if user_data:
             permissions = get_user_permissions(user_id)
-            welcome_text = f"👋 *{user_data['nick']}*, добро пожаловать в конференцию!\n\n📻 Позывной: `{user_data['callsign']}`\n🎫 Жетон: `{user_data['token']}`\n⭐ Ранг: *{permissions['name']}*\n📁 Отдел: _{user_data['department']}_\n\n"
-        else: welcome_text = f"👋 *{user.first_name}*, добро пожаловать в конференцию!\n\n⚠️ Вы не зарегистрированы.\n📝 Напишите мне в ЛС: [@{(await context.bot.get_me()).username}](https://t.me/{(await context.bot.get_me()).username})\n\n"
-        welcome_text += f"▫️ Всего участников: *{total_users}*\n\n📋 *ПОЛЕЗНЫЕ КОМАНДЫ:*\n├ /ainfo — Ваш профиль\n├ /ahelp — Команды\n├ /find — Руководящий состав\n├ /anick имя — Найти по нику\n├ /awarns — Ваши преды\n└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
+            welcome_text = (
+                f"👋 *{user_data['nick']}*, добро пожаловать в конференцию!\n\n"
+                f"📻 Позывной: `{user_data['callsign']}`\n"
+                f"🎫 Жетон: `{user_data['token']}`\n"
+                f"⭐ Ранг: *{permissions['name']}*\n"
+                f"📁 Отдел: _{user_data['department']}_\n\n"
+            )
+        else:
+            bot_username = (await context.bot.get_me()).username
+            welcome_text = (
+                f"👋 *{user.first_name}*, добро пожаловать в конференцию!\n\n"
+                f"⚠️ Вы не зарегистрированы.\n"
+                f"📝 Напишите мне в ЛС: [@{bot_username}](https://t.me/{bot_username})\n\n"
+            )
+        
+        welcome_text += (
+            f"▫️ Всего участников: *{total_users}*\n\n"
+            f"📋 *ПОЛЕЗНЫЕ КОМАНДЫ:*\n"
+            f"├ /ainfo — Ваш профиль\n"
+            f"├ /ahelp — Команды\n"
+            f"├ /find — Руководящий состав\n"
+            f"├ /anick имя — Найти по нику\n"
+            f"├ /awarns — Ваши преды\n"
+            f"└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
+        )
+        
         if admins:
             welcome_text += "👥 *РУКОВОДСТВО:*\n"
-            for a in admins: welcome_text += f"├ {a[1]} ({a[0]}) — {RANKS.get(a[2], RANKS[0])['name']}\n"
+            for a in admins:
+                welcome_text += f"├ {a[1]} ({a[0]}) — {RANKS.get(a[2], RANKS[0])['name']}\n"
             welcome_text += "\n"
-        welcome_text += f"📜 *ПРАВИЛА:*\n├ Обязательно подписаться на: ТГК чайника - https://t.me/chainikk01_TGK ; Твич - https://www.twitch.tv/chainikk01\n├ Оскорбление - бан\n├ Оскорбление администрации - расстрел, а потом бан\n\n🆘 По вопросам — к руководству"
-        try: await update.effective_chat.send_message(welcome_text, parse_mode='Markdown', disable_web_page_preview=True)
-        except:
-            try: await update.effective_chat.send_message(welcome_text.replace('*','').replace('`','').replace('_','').replace('▫️','•'))
-            except Exception as e: logger.error(f"Welcome error: {e}")
+        
+        welcome_text += (
+            f"📜 *ПРАВИЛА:*\n"
+            f"├ Обязательно подписаться на: ТГК чайника - https://t.me/chainikk01_TGK ; Твич - https://www.twitch.tv/chainikk01\n"
+            f"├ Оскорбление - бан\n"
+            f"├ Оскорбление администрации - расстрел, а потом бан\n\n"
+            f"🆘 По вопросам — к руководству"
+        )
+        
         try:
-            conn = sqlite3.connect(DB_FILE); c = conn.cursor()
-            c.execute('SELECT user_id FROM users WHERE rank >= 5 AND bot_blocked = "Нет"'); mods = c.fetchall(); conn.close()
+            await update.effective_chat.send_message(welcome_text, parse_mode='Markdown', disable_web_page_preview=True)
+        except:
+            try:
+                await update.effective_chat.send_message(welcome_text.replace('*','').replace('`','').replace('_','').replace('▫️','•'))
+            except Exception as e:
+                logger.error(f"Welcome error: {e}")
+        
+        # Уведомление 5+ о новом
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('SELECT user_id FROM users WHERE rank >= 5 AND bot_blocked = "Нет"')
+            mods = c.fetchall()
+            conn.close()
             for m in mods:
-                try: await context.bot.send_message(chat_id=m[0], text=f"👤 Новый участник: {user.first_name} (ID: {user_id})")
-                except: pass
-        except: pass
+                try:
+                    await context.bot.send_message(chat_id=m[0], text=f"👤 Новый участник: {user.first_name} (ID: {user_id})")
+                except:
+                    pass
+        except:
+            pass
 
 async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
-    user = update.effective_user; user_id = user.id
-    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM users'); total_users = c.fetchone()[0]
-    c.execute('SELECT game_nick, callsign, rank FROM users WHERE rank >= 5 ORDER BY rank DESC LIMIT 5'); admins = c.fetchall(); conn.close()
+    """Тест приветствия"""
+    if not has_permission(update.effective_user.id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    user = update.effective_user
+    user_id = user.id
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM users')
+    total_users = c.fetchone()[0]
+    c.execute('SELECT game_nick, callsign, rank FROM users WHERE rank >= 5 ORDER BY rank DESC LIMIT 5')
+    admins = c.fetchall()
+    conn.close()
+    
     user_data = get_user_data(user_id)
+    
     if user_data:
         permissions = get_user_permissions(user_id)
-        welcome_text = f"👋 *{user_data['nick']}*, добро пожаловать в конференцию!\n\n📻 Позывной: `{user_data['callsign']}`\n🎫 Жетон: `{user_data['token']}`\n⭐ Ранг: *{permissions['name']}*\n📁 Отдел: _{user_data['department']}_\n\n"
-    else: welcome_text = f"👋 *{user.first_name}*, добро пожаловать в конференцию!\n\n⚠️ Вы не зарегистрированы.\n\n"
-    welcome_text += f"▫️ Всего участников: *{total_users}*\n\n📋 *ПОЛЕЗНЫЕ КОМАНДЫ:*\n├ /ainfo — Ваш профиль\n├ /ahelp — Команды\n├ /find — Руководящий состав\n├ /anick имя — Найти по нику\n├ /awarns — Ваши преды\n└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
+        welcome_text = (
+            f"👋 *{user_data['nick']}*, добро пожаловать в конференцию!\n\n"
+            f"📻 Позывной: `{user_data['callsign']}`\n"
+            f"🎫 Жетон: `{user_data['token']}`\n"
+            f"⭐ Ранг: *{permissions['name']}*\n"
+            f"📁 Отдел: _{user_data['department']}_\n\n"
+        )
+    else:
+        welcome_text = f"👋 *{user.first_name}*, добро пожаловать в конференцию!\n\n⚠️ Вы не зарегистрированы.\n\n"
+    
+    welcome_text += (
+        f"▫️ Всего участников: *{total_users}*\n\n"
+        f"📋 *ПОЛЕЗНЫЕ КОМАНДЫ:*\n"
+        f"├ /ainfo — Ваш профиль\n├ /ahelp — Команды\n├ /find — Руководящий состав\n"
+        f"├ /anick имя — Найти по нику\n├ /awarns — Ваши преды\n"
+        f"└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
+    )
+    
     if admins:
         welcome_text += "👥 *РУКОВОДСТВО:*\n"
-        for a in admins: welcome_text += f"├ {a[1]} ({a[0]}) — {RANKS.get(a[2], RANKS[0])['name']}\n"
+        for a in admins:
+            welcome_text += f"├ {a[1]} ({a[0]}) — {RANKS.get(a[2], RANKS[0])['name']}\n"
         welcome_text += "\n"
-    welcome_text += f"📜 *ПРАВИЛА:*\n├ Обязательно подписаться на: ТГК чайника - https://t.me/chainikk01_TGK ; Твич - https://www.twitch.tv/chainikk01\n├ Оскорбление - бан\n├ Оскорбление администрации - расстрел, а потом бан\n\n🆘 По вопросам — к руководству"
-    try: await update.effective_chat.send_message(welcome_text, parse_mode='Markdown', disable_web_page_preview=True)
-    except: await update.message.reply_text(welcome_text.replace('*','').replace('`','').replace('_',''))
+    
+    welcome_text += (
+        f"📜 *ПРАВИЛА:*\n"
+        f"├ Обязательно подписаться на: ТГК чайника - https://t.me/chainikk01_TGK ; Твич - https://www.twitch.tv/chainikk01\n"
+        f"├ Оскорбление - бан\n├ Оскорбление администрации - расстрел, а потом бан\n\n"
+        f"🆘 По вопросам — к руководству"
+    )
+    
+    try:
+        await update.effective_chat.send_message(welcome_text, parse_mode='Markdown', disable_web_page_preview=True)
+    except:
+        await update.message.reply_text(welcome_text.replace('*','').replace('`','').replace('_',''))
 
 # ============ КИК/БАН ============
 
 async def send_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int, action: str, reason: str = ""):
+    """Сообщение с аудио перед действием"""
     try:
         target_data = get_user_data(target_id)
-        target_name = target_data['callsign'] if target_data else f"User {target_id}"
         target_nick = target_data['nick'] if target_data else "Unknown"
         mention = f'<a href="tg://user?id={target_id}">{target_nick}</a>'
-        if action == "kick": text = f"👢 {mention} что-то натворил..."; audio_file = str(AUDIO_DIR / "kick_audio.mp3")
-        elif action == "ban": text = f"🚫 {mention} будет забанен..."; audio_file = str(AUDIO_DIR / "ban_audio.mp3")
-        elif action == "warn_kick": text = f"🚨 {mention} лимит предупреждений..."; audio_file = str(AUDIO_DIR / "warn_kick_audio.mp3")
-        elif action == "gban": text = f"🌍 {mention} залутал чс..."; audio_file = str(AUDIO_DIR / "gban_audio.mp3")
-        else: text = f"⚠️ {mention} {action}..."; audio_file = None
-        if reason: text += f"\n📝 Причина: {reason}"
+        
+        if action == "kick":
+            text = f"👢 {mention} что-то натворил..."
+            audio_file = str(AUDIO_DIR / "kick_audio.mp3")
+        elif action == "ban":
+            text = f"🚫 {mention} будет забанен..."
+            audio_file = str(AUDIO_DIR / "ban_audio.mp3")
+        elif action == "warn_kick":
+            text = f"🚨 {mention} лимит предупреждений..."
+            audio_file = str(AUDIO_DIR / "warn_kick_audio.mp3")
+        elif action == "gban":
+            text = f"🌍 {mention} залутал чс..."
+            audio_file = str(AUDIO_DIR / "gban_audio.mp3")
+        else:
+            text = f"⚠️ {mention} {action}..."
+            audio_file = None
+        
+        if reason:
+            text += f"\n📝 Причина: {reason}"
+        
         if audio_file and os.path.exists(audio_file):
-            with open(audio_file, 'rb') as audio: await update.effective_chat.send_audio(audio=audio, caption=text, parse_mode='HTML')
-        else: await update.effective_chat.send_message(text, parse_mode='HTML')
-    except Exception as e: logger.error(f"Action error: {e}")
+            with open(audio_file, 'rb') as audio:
+                await update.effective_chat.send_audio(audio=audio, caption=text, parse_mode='HTML')
+        else:
+            await update.effective_chat.send_message(text, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Action error: {e}")
 
 async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'kick'): await update.message.reply_text("❌ С 5 ранга."); return
-    target_id = extract_user_id(update, context); reason = ""
-    if target_id: reason = ' '.join(context.args) if context.args else ""
+    """Кик пользователя"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'kick'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    reason = ""
+    
+    if target_id:
+        reason = ' '.join(context.args) if context.args else ""
     else:
-        if not context.args: await update.message.reply_text("❌ /akick @user причина"); return
-        target_id = extract_user_id(update, context, context.args[0]); reason = ' '.join(context.args[1:]) if len(context.args) > 1 else ""
-    if not target_id: await update.message.reply_text("❌ Укажите @username или ответьте на сообщение."); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
-    target_data = get_user_data(target_id); target_name = target_data['callsign'] if target_data else f"User {target_id}"
+        if not context.args:
+            await update.message.reply_text("❌ /akick @user причина")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        reason = ' '.join(context.args[1:]) if len(context.args) > 1 else ""
+    
+    if not target_id:
+        await update.message.reply_text("❌ Укажите @username или ответьте на сообщение.")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
+    target_data = get_user_data(target_id)
+    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    
     await send_action_message(update, context, target_id, "kick", reason)
-    if await kick_user_from_chat(update, context, target_id): await update.message.reply_text(f"👢 {target_name} кикнут.")
-    else: await update.message.reply_text("❌ Не удалось кикнуть.")
+    
+    if await kick_user_from_chat(update, context, target_id):
+        await update.message.reply_text(f"👢 {target_name} кикнут.")
+    else:
+        await update.message.reply_text("❌ Не удалось кикнуть.")
 
 async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'ban'): await update.message.reply_text("❌ С 5 ранга."); return
-    target_id = extract_user_id(update, context); reason = "Без причины"
-    if target_id: reason = ' '.join(context.args) if context.args else "Без причины"
+    """Бан пользователя"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'ban'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    reason = "Без причины"
+    
+    if target_id:
+        reason = ' '.join(context.args) if context.args else "Без причины"
     else:
-        if not context.args: await update.message.reply_text("❌ /aban @user причина"); return
-        target_id = extract_user_id(update, context, context.args[0]); reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
-    target_data = get_user_data(target_id); target_name = target_data['callsign'] if target_data else f"User {target_id}"
+        if not context.args:
+            await update.message.reply_text("❌ /aban @user причина")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
+    target_data = get_user_data(target_id)
+    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    
     await send_action_message(update, context, target_id, "ban", reason)
+    
     if await ban_user_in_chat(update, context, target_id):
         await update.message.reply_text(f"🚫 БАН\n👤 {target_name}\n📝 {reason}")
-        await notify_user(context, target_id, f"🚫 Вы забанены\n📝 {reason}\n👮 Забанил: {get_admin_nick(update.effective_user.id)}")
-    else: await update.message.reply_text("❌ Не удалось забанить.")
+        await notify_user(context, target_id,
+                         f"🚫 Вы забанены\n📝 {reason}\n👮 Забанил: {get_admin_nick(user_id)}")
+    else:
+        await update.message.reply_text("❌ Не удалось забанить.")
 
 async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_special_access(update.effective_user.id): await update.message.reply_text("❌ Недоступно."); return
-    target_id = extract_user_id(update, context); reason = "Без причины"
-    if target_id: reason = ' '.join(context.args) if context.args else "Без причины"
+    """Глобальный бан"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id):
+        await update.message.reply_text("❌ Недоступно.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    reason = "Без причины"
+    
+    if target_id:
+        reason = ' '.join(context.args) if context.args else "Без причины"
     else:
-        if not context.args: await update.message.reply_text("❌ /gban @user причина"); return
-        target_id = extract_user_id(update, context, context.args[0]); reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
+        if not context.args:
+            await update.message.reply_text("❌ /gban @user причина")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
     if target_id == -1:
-        username = context.args[0].replace('@', ''); users = find_users_by_nickname(username)
+        username = context.args[0].replace('@', '')
+        users = find_users_by_nickname(username)
         text = "🔍 Найдено несколько:\n\n"
-        for u in users: text += f"🆔 {u[0]} | {u[1]} | {u[2]}\n"
-        await update.message.reply_text(text + "\nУточните: /gban ID причина"); return
+        for u in users:
+            text += f"🆔 {u[0]} | {u[1]} | {u[2]}\n"
+        await update.message.reply_text(text + "\nУточните: /gban ID причина")
+        return
+    
     await send_action_message(update, context, target_id, "gban", reason)
-    add_gban(target_id, reason, update.effective_user.id)
+    add_gban(target_id, reason, user_id)
     await kick_user_from_chat(update, context, target_id)
-    target_data = get_user_data(target_id); target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    
+    target_data = get_user_data(target_id)
+    target_name = target_data['callsign'] if target_data else f"User {target_id}"
     await update.message.reply_text(f"🚫 ОЧС\n👤 {target_name}\n📝 {reason}")
 
 # ============ ВАРНЫ ============
 
 async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
-    target_id = extract_user_id(update, context); reason = "Без причины"
-    if target_id: reason = ' '.join(context.args) if context.args else "Без причины"
+    """Выдача предупреждения"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    reason = "Без причины"
+    
+    if target_id:
+        reason = ' '.join(context.args) if context.args else "Без причины"
     else:
-        if len(context.args) < 2: await update.message.reply_text("❌ /awarn @user причина"); return
-        target_id = extract_user_id(update, context, context.args[0]); reason = ' '.join(context.args[1:])
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
-    success, message, kicked = add_warning(target_id, update.effective_user.id, reason)
-    target_data = get_user_data(target_id); target_name = target_data['callsign'] if target_data else f"User {target_id}"
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /awarn @user причина")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        reason = ' '.join(context.args[1:])
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
+    success, message, kicked = add_warning(target_id, user_id, reason)
+    target_data = get_user_data(target_id)
+    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    
     if success:
         await update.message.reply_text(f"⚠️ {message}\n👤 {target_name}\n📝 {reason}")
-        await notify_user(context, target_id, f"⚠️ Вам выдан пред!\n📊 {message}\n📝 {reason}\n👮 Выдал: {get_admin_nick(update.effective_user.id)}")
+        await notify_user(context, target_id,
+                         f"⚠️ Вам выдан пред!\n📊 {message}\n📝 {reason}\n👮 Выдал: {get_admin_nick(user_id)}")
         if kicked:
             await send_action_message(update, context, target_id, "warn_kick", "Лимит (3/3)")
             await kick_user_from_chat(update, context, target_id)
-    else: await update.message.reply_text(f"❌ {message}")
+    else:
+        await update.message.reply_text(f"❌ {message}")
 
 async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр предупреждений"""
     user_id = update.effective_user.id
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: target_id = user_id
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
-    if target_id != user_id and not has_permission(user_id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
-    target_data = get_user_data(target_id); target_name = target_data['callsign'] if target_data else f"User {target_id}"
-    current_warns = target_data['warns']; warns = get_warn_list(target_id)
+    
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        target_id = user_id
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
+    if target_id != user_id and not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_data = get_user_data(target_id)
+    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    current_warns = target_data['warns']
+    warns = get_warn_list(target_id)
+    
     if warns:
         text = f"⚠️ Предупреждения: {target_name}\n📊 Счёт: {current_warns}\n\n"
-        for w in warns: text += f"📅 {w[6]} | {w[3]}\n📝 {w[5]}\n\n"
+        for w in warns:
+            text += f"📅 {w[6]} | {w[3]}\n📝 {w[5]}\n\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text(f"⚠️ {target_name}\n📊 Счёт: {current_warns}\n✅ Активных предупреждений нет.")
+    else:
+        await update.message.reply_text(f"⚠️ {target_name}\n📊 Счёт: {current_warns}\n✅ Активных предупреждений нет.")
 
 async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
+    """Снятие одного предупреждения"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: await update.message.reply_text("❌ /aunwarn @user"); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /aunwarn @user")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
     target_data = get_user_data(target_id)
-    if not target_data: await update.message.reply_text("❌ Пользователь не найден."); return
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
     current_warns = target_data['warns']
-    if current_warns == "0/0": await update.message.reply_text(f"❌ У {target_data['callsign']} нет предов."); return
-    parts = current_warns.split('/'); verbal = int(parts[0]) if len(parts) == 2 else 0; written = int(parts[1]) if len(parts) == 2 else 0
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
+    if current_warns == "0/0":
+        await update.message.reply_text(f"❌ У {target_data['callsign']} нет предов.")
+        return
+    
+    parts = current_warns.split('/')
+    verbal = int(parts[0]) if len(parts) == 2 else 0
+    written = int(parts[1]) if len(parts) == 2 else 0
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
     if written > 0:
-        written -= 1; removed_type = "письменное"
-        cursor.execute('''UPDATE warnings SET counter = "0/0" WHERE id = (SELECT id FROM warnings WHERE user_id = ? AND warn_type = "Письменное" AND counter != "0/0" ORDER BY id DESC LIMIT 1)''', (target_id,))
+        written -= 1
+        removed_type = "письменное"
+        c.execute('''UPDATE warnings SET counter = "0/0" 
+                     WHERE id = (SELECT id FROM warnings 
+                     WHERE user_id = ? AND warn_type = "Письменное" AND counter != "0/0" 
+                     ORDER BY id DESC LIMIT 1)''', (target_id,))
     elif verbal > 0:
-        verbal -= 1; removed_type = "устное"
-        cursor.execute('''UPDATE warnings SET counter = "0/0" WHERE id = (SELECT id FROM warnings WHERE user_id = ? AND warn_type = "Устное" AND counter != "0/0" ORDER BY id DESC LIMIT 1)''', (target_id,))
-    else: conn.close(); await update.message.reply_text("❌ Ошибка."); return
+        verbal -= 1
+        removed_type = "устное"
+        c.execute('''UPDATE warnings SET counter = "0/0" 
+                     WHERE id = (SELECT id FROM warnings 
+                     WHERE user_id = ? AND warn_type = "Устное" AND counter != "0/0" 
+                     ORDER BY id DESC LIMIT 1)''', (target_id,))
+    else:
+        conn.close()
+        await update.message.reply_text("❌ Ошибка.")
+        return
+    
     new_warns = f"{verbal}/{written}"
-    cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, target_id))
-    conn.commit(); conn.close()
-    await update.message.reply_text(f"✅ Снят {removed_type} пред\n👤 {target_data['callsign']}\n⚠️ Было: {current_warns} → Стало: {new_warns}")
-    await notify_user(context, target_id, f"✅ С вас снят пред\n⚠️ Было: {current_warns} → Стало: {new_warns}\n👮 Снял: {get_admin_nick(update.effective_user.id)}")
+    c.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, target_id))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"✅ Снят {removed_type} пред\n"
+        f"👤 {target_data['callsign']}\n"
+        f"⚠️ Было: {current_warns} → Стало: {new_warns}"
+    )
+    await notify_user(context, target_id,
+                     f"✅ С вас снят пред\n⚠️ Было: {current_warns} → Стало: {new_warns}\n👮 Снял: {get_admin_nick(user_id)}")
 
 async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
+    """Снятие всех предупреждений"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: await update.message.reply_text("❌ /aunwarnall @user"); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /aunwarnall @user")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
     target_data = get_user_data(target_id)
-    if not target_data: await update.message.reply_text("❌ Пользователь не найден."); return
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
     old_warns = target_data['warns']
-    if old_warns == "0/0": await update.message.reply_text(f"❌ У {target_data['callsign']} нет предупреждений."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET warns = ? WHERE user_id = ?', ("0/0", target_id))
-    cursor.execute('UPDATE warnings SET counter = "0/0" WHERE user_id = ?', (target_id,))
-    conn.commit(); conn.close()
-    await update.message.reply_text(f"✅ Все предупреждения сняты\n👤 {target_data['callsign']}\n⚠️ Было: {old_warns} → Стало: 0/0")
+    if old_warns == "0/0":
+        await update.message.reply_text(f"❌ У {target_data['callsign']} нет предупреждений.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET warns = ? WHERE user_id = ?', ("0/0", target_id))
+    c.execute('UPDATE warnings SET counter = "0/0" WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"✅ Все предупреждения сняты\n👤 {target_data['callsign']}\n"
+        f"⚠️ Было: {old_warns} → Стало: 0/0"
+    )
 
 # ============ БЛОКИРОВКА ОТ БОТА ============
 
 async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
+    """Отключение от бота"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: await update.message.reply_text("❌ /ablock @user"); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /ablock @user")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
     target_data = get_user_data(target_id)
-    if not target_data: await update.message.reply_text("❌ Пользователь не найден."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET bot_blocked = "Да" WHERE user_id = ?', (target_id,))
-    conn.commit(); conn.close()
-    issuer_name = get_admin_nick(update.effective_user.id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET bot_blocked = "Да" WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
+    issuer_name = get_admin_nick(user_id)
     await update.message.reply_text(f"🚫 {target_data['nick']} отключён от бота!\n👮 Отключил: {issuer_name}")
     await notify_user(context, target_id, f"🚫 Вы отключены от бота!\n👮 Отключил: {issuer_name}")
 
 async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
+    """Подключение к боту"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: await update.message.reply_text("❌ /aunblock @user"); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /aunblock @user")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
     target_data = get_user_data(target_id)
-    if not target_data: await update.message.reply_text("❌ Пользователь не найден."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET bot_blocked = "Нет" WHERE user_id = ?', (target_id,))
-    conn.commit(); conn.close()
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET bot_blocked = "Нет" WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
     await update.message.reply_text(f"✅ {target_data['nick']} подключён к боту!")
 
-# ============ AI АНАЛИЗ ============
+# ============ AI АНАЛИЗ НАСТРОЕНИЯ ============
 
-async def analyze_mood_with_ai(messages):
-    if not messages: return {"mood_text": "Нет данных", "mood_score": 0}
+async def analyze_mood_with_ai(messages: list) -> dict:
+    """Анализ настроения через OpenRouter"""
+    if not messages:
+        return {"mood_text": "Нет данных", "mood_score": 0}
+    
     combined_text = "\n".join(messages[-100:])
-    if len(combined_text) < 10: return {"mood_text": "Недостаточно данных", "mood_score": 0}
+    if len(combined_text) < 10:
+        return {"mood_text": "Недостаточно данных", "mood_score": 0}
+    
     try:
         client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
         completion = client.chat.completions.create(
             model=OPENROUTER_MODEL,
             messages=[
-                {"role": "system", "content": "Ты анализатор настроения русскоязычного чата. Проанализируй сообщения и верни ТОЛЬКО JSON в формате:\n{\"mood_score\": число 1-100, \"mood_label\": \"Позитивное/Нейтральное/Негативное\", \"summary\": \"краткий вывод 1 предложение на русском\"}"},
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты анализатор настроения русскоязычного чата. "
+                        "Проанализируй сообщения и верни ТОЛЬКО JSON в формате:\n"
+                        '{"mood_score": число 1-100, "mood_label": "Позитивное/Нейтральное/Негативное", '
+                        '"summary": "краткий вывод 1 предложение на русском"}'
+                    )
+                },
                 {"role": "user", "content": f"Оцени настроение чата:\n{combined_text}"}
             ],
-            temperature=0.3, max_tokens=150,
+            temperature=0.3,
+            max_tokens=150,
         )
         result = json.loads(completion.choices[0].message.content)
         return result
-    except Exception as e: logger.error(f"AI mood error: {e}"); return {"mood_text": "Ошибка анализа", "mood_score": 0}
+    except Exception as e:
+        logger.error(f"AI mood error: {e}")
+        return {"mood_text": "Ошибка анализа", "mood_score": 0}
 
 async def amood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not chat_messages: await update.message.reply_text("Недостаточно данных."); return
+    """Настроение чата"""
+    if not chat_messages:
+        await update.message.reply_text("Недостаточно данных.")
+        return
+    
     await update.message.reply_text("🤖 Анализирую настроение...")
     analysis = await analyze_mood_with_ai(chat_messages)
-    mood_score = analysis.get('mood_score', 0); mood_label = analysis.get('mood_label', 'Не определено'); summary = analysis.get('summary', '')
-    emoji = "😊" if mood_score > 70 else ("😐" if mood_score > 40 else "😟")
-    await update.message.reply_text(f"{emoji} Настроение\n\nОсновное: {mood_label} ({mood_score}%)\n📨 Сообщений: {len(chat_messages)}\n📝 {summary}")
+    
+    mood_score = analysis.get('mood_score', 0)
+    mood_label = analysis.get('mood_label', 'Не определено')
+    summary = analysis.get('summary', '')
+    
+    if mood_score > 70:
+        emoji = "😊"
+    elif mood_score > 40:
+        emoji = "😐"
+    else:
+        emoji = "😟"
+    
+    await update.message.reply_text(
+        f"{emoji} Настроение\n\n"
+        f"Основное: {mood_label} ({mood_score}%)\n"
+        f"📨 Сообщений: {len(chat_messages)}\n"
+        f"📝 {summary}"
+    )
 
 async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
+    """Автоматический анализ настроения"""
     if chat_messages and CONFERENCE_CHAT_ID:
         analysis = await analyze_mood_with_ai(chat_messages)
-        mood_label = analysis.get('mood_label', 'Не определено'); mood_score = analysis.get('mood_score', 0)
-        try: await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=f"📊 Настроение: {mood_label} ({mood_score}%)")
-        except: pass
+        mood_label = analysis.get('mood_label', 'Не определено')
+        mood_score = analysis.get('mood_score', 0)
+        try:
+            await context.bot.send_message(
+                chat_id=CONFERENCE_CHAT_ID,
+                text=f"📊 Настроение: {mood_label} ({mood_score}%)"
+            )
+        except:
+            pass
 
 # ============ УПРАВЛЕНИЕ ДЕПАРТАМЕНТАМИ ============
 
 async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление отделами: add/remove/rename/list"""
-    if not has_permission(update.effective_user.id, 'manage_ranks'): await update.message.reply_text("❌ С 5 ранга."); return
-    if not context.args: await update.message.reply_text("❌ /adepartment add/remove/rename/list"); return
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /adepartment add/remove/rename/list")
+        return
+    
     action = context.args[0].lower()
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
     if action == 'add':
-        if len(context.args) < 2: await update.message.reply_text("❌ /adepartment add Название"); conn.close(); return
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /adepartment add Название")
+            conn.close()
+            return
         name = ' '.join(context.args[1:])
         try:
-            cursor.execute('INSERT INTO departments (name) VALUES (?)', (name,)); conn.commit()
+            c.execute('INSERT INTO departments (name) VALUES (?)', (name,))
+            conn.commit()
             await update.message.reply_text(f"✅ Отдел '{name}' добавлен.")
-        except: await update.message.reply_text("❌ Такой отдел уже есть.")
+        except:
+            await update.message.reply_text("❌ Такой отдел уже есть.")
+    
     elif action == 'remove':
-        if len(context.args) < 2: await update.message.reply_text("❌ /adepartment remove Номер"); conn.close(); return
-        try: num = int(context.args[1])
-        except: await update.message.reply_text("❌ Укажите номер."); conn.close(); return
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /adepartment remove Номер")
+            conn.close()
+            return
+        try:
+            num = int(context.args[1])
+        except:
+            await update.message.reply_text("❌ Укажите номер.")
+            conn.close()
+            return
         depts = get_departments()
         if 1 <= num <= len(depts):
-            name = depts[num-1]
-            cursor.execute('DELETE FROM departments WHERE name = ?', (name,)); conn.commit()
+            name = depts[num - 1]
+            c.execute('DELETE FROM departments WHERE name = ?', (name,))
+            conn.commit()
             await update.message.reply_text(f"✅ Отдел '{name}' удалён.")
-        else: await update.message.reply_text("❌ Неверный номер.")
+        else:
+            await update.message.reply_text("❌ Неверный номер.")
+    
     elif action == 'rename':
-        if len(context.args) < 3: await update.message.reply_text("❌ /adepartment rename Номер НовоеНазвание"); conn.close(); return
-        try: num = int(context.args[1])
-        except: await update.message.reply_text("❌ Укажите номер."); conn.close(); return
+        if len(context.args) < 3:
+            await update.message.reply_text("❌ /adepartment rename Номер НовоеНазвание")
+            conn.close()
+            return
+        try:
+            num = int(context.args[1])
+        except:
+            await update.message.reply_text("❌ Укажите номер.")
+            conn.close()
+            return
         depts = get_departments()
         if 1 <= num <= len(depts):
-            old_name = depts[num-1]; new_name = ' '.join(context.args[2:])
-            cursor.execute('UPDATE users SET department = ? WHERE department = ?', (new_name, old_name))
-            cursor.execute('UPDATE departments SET name = ? WHERE name = ?', (new_name, old_name))
+            old_name = depts[num - 1]
+            new_name = ' '.join(context.args[2:])
+            c.execute('UPDATE users SET department = ? WHERE department = ?', (new_name, old_name))
+            c.execute('UPDATE departments SET name = ? WHERE name = ?', (new_name, old_name))
             conn.commit()
             await update.message.reply_text(f"✅ '{old_name}' → '{new_name}'")
-        else: await update.message.reply_text("❌ Неверный номер.")
+        else:
+            await update.message.reply_text("❌ Неверный номер.")
+    
     elif action == 'list':
-        depts = get_departments(); text = "📁 ОТДЕЛЫ:\n\n"
-        for i, d in enumerate(depts, 1): text += f"{i}. {d}\n"
+        depts = get_departments()
+        text = "📁 ОТДЕЛЫ:\n\n"
+        for i, d in enumerate(depts, 1):
+            text += f"{i}. {d}\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text("❌ Действие: add, remove, rename, list")
+    
+    else:
+        await update.message.reply_text("❌ Действие: add, remove, rename, list")
+    
     conn.close()
 
 async def asetalldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Назначить департамент всем"""
-    if not has_permission(update.effective_user.id, 'manage_ranks'): await update.message.reply_text("❌ С 5 ранга."); return
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     depts = get_departments()
     if not context.args:
         deps_list = "\n".join([f"{i+1}. {d}" for i, d in enumerate(depts)])
-        await update.message.reply_text(f"❌ /asetalldept номер\n\n{deps_list}"); return
-    try: dept_num = int(context.args[0]) - 1
-    except: await update.message.reply_text("❌ Укажите номер."); return
-    if dept_num < 0 or dept_num >= len(depts): await update.message.reply_text("❌ Неверный номер."); return
+        await update.message.reply_text(f"❌ /asetalldept номер\n\n{deps_list}")
+        return
+    
+    try:
+        dept_num = int(context.args[0]) - 1
+    except:
+        await update.message.reply_text("❌ Укажите номер.")
+        return
+    
+    if dept_num < 0 or dept_num >= len(depts):
+        await update.message.reply_text("❌ Неверный номер.")
+        return
+    
     dept_name = depts[dept_num]
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET department = ?', (dept_name,)); count = cursor.rowcount
-    conn.commit(); conn.close()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET department = ?', (dept_name,))
+    count = c.rowcount
+    conn.commit()
+    conn.close()
+    
     await update.message.reply_text(f"✅ Отдел '{dept_name}' назначен {count} пользователям.")
 
 # ============ ЕЖЕНЕДЕЛЬНАЯ ПРОВЕРКА РАНГОВ ============
 
 async def weekly_rank_check(context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute("SELECT user_id, game_nick, rank FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'")
-    users = cursor.fetchall(); conn.close()
+    """Еженедельная проверка рангов (воскресенье 11:00 МСК)"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id, game_nick, rank FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'")
+    users = c.fetchall()
+    conn.close()
+    
     for u in users:
-        user_id, nick, rank = u; rank_name = RANKS.get(rank, RANKS[0])['name']
+        user_id, nick, rank = u
+        rank_name = RANKS.get(rank, RANKS[0])['name']
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"📋 Еженедельная проверка\n\n👤 {nick}\n⭐ Ваш текущий ранг: {rank_name}\n\nЕсли ранг изменился — обратитесь к руководству.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📋 Еженедельная проверка\n\n"
+                     f"👤 {nick}\n"
+                     f"⭐ Ваш текущий ранг: {rank_name}\n\n"
+                     f"Если ранг изменился — обратитесь к руководству."
+            )
             await asyncio.sleep(0.3)
-        except: pass
+        except:
+            pass
+    
     if CONFERENCE_CHAT_ID:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text="📢 Всем пользователям отправлена еженедельная проверка рангов.")
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text="📢 Всем пользователям отправлена еженедельная проверка рангов."
+        )
 
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
 
 async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_special_access(update.effective_user.id) and not has_permission(update.effective_user.id, 'gban'): await update.message.reply_text("❌ Только со спецдопуском или генералы."); return
-    target_id = extract_user_id(update, context); new_nick = None
-    if target_id: new_nick = ' '.join(context.args) if context.args else None
+    """Смена ника (спецдопуск)"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id) and not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только со спецдопуском или генералы.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    new_nick = None
+    
+    if target_id:
+        new_nick = ' '.join(context.args) if context.args else None
     else:
-        if len(context.args) < 2: await update.message.reply_text("❌ /asetnick @user НовыйНик"); return
-        target_id = extract_user_id(update, context, context.args[0]); new_nick = ' '.join(context.args[1:])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id or not new_nick: await update.message.reply_text("❌ Не найден или не указан ник."); return
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /asetnick @user НовыйНик")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        new_nick = ' '.join(context.args[1:])
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id or not new_nick:
+        await update.message.reply_text("❌ Не найден или не указан ник.")
+        return
+    
     target_data = get_user_data(target_id)
-    if not target_data: await update.message.reply_text("❌ Пользователь не найден."); return
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
     old_nick = target_data['nick']
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET game_nick = ? WHERE user_id = ?', (new_nick, target_id))
-    conn.commit(); conn.close()
-    await notify_user(context, target_id, f"📢 Ваш ник изменён!\n🎮 Было: {old_nick}\n🎮 Стало: {new_nick}\n👮 Изменил: {get_admin_nick(update.effective_user.id)}")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET game_nick = ? WHERE user_id = ?', (new_nick, target_id))
+    conn.commit()
+    conn.close()
+    
+    await notify_user(context, target_id,
+                     f"📢 Ваш ник изменён!\n🎮 Было: {old_nick}\n🎮 Стало: {new_nick}\n👮 Изменил: {get_admin_nick(user_id)}")
     await update.message.reply_text(f"✅ Ник изменён!\n🎮 {old_nick} → {new_nick}")
 
 async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'gban'): await update.message.reply_text("❌ Только генералы."); return
+    """Регистрация пользователя (6+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: await update.message.reply_text("❌ /aregister @user Ник Позывной"); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if get_user_data(target_id): await update.message.reply_text("❌ Уже зарегистрирован."); return
-    if len(context.args) < 2: await update.message.reply_text("❌ /aregister @user Ник Позывной"); return
-    game_nick = context.args[0] if target_id else context.args[1]; callsign = context.args[1] if target_id else context.args[2]
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /aregister @user Ник Позывной")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if get_user_data(target_id):
+        await update.message.reply_text("❌ Уже зарегистрирован.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /aregister @user Ник Позывной")
+        return
+    
+    game_nick = context.args[0] if target_id else context.args[1]
+    callsign = context.args[1] if target_id else context.args[2]
     token = add_user(target_id, game_nick, callsign)
+    
     if token:
         await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
-        await notify_user(context, target_id, f"✅ Вас зарегистрировал {get_admin_nick(update.effective_user.id)}!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
-    else: await update.message.reply_text("❌ Ошибка.")
+        await notify_user(context, target_id,
+                         f"✅ Вас зарегистрировал {get_admin_nick(user_id)}!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
 
 async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'gban'): await update.message.reply_text("❌ Только генералы."); return
+    """Принудительная регистрация с жетоном (6+ ранг)"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****"); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if len(context.args) < 3: await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****"); return
-    game_nick = context.args[0] if target_id else context.args[1]; callsign = context.args[1] if target_id else context.args[2]; token = context.args[2] if target_id else context.args[3]
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('DELETE FROM users WHERE user_id = ?', (target_id,)); conn.commit(); conn.close()
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if len(context.args) < 3:
+        await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+        return
+    
+    game_nick = context.args[0] if target_id else context.args[1]
+    callsign = context.args[1] if target_id else context.args[2]
+    token = context.args[2] if target_id else context.args[3]
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM users WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
     new_token = add_user(target_id, game_nick, callsign, token)
-    if new_token: await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {new_token}")
-    else: await update.message.reply_text("❌ Ошибка.")
-
-# ============ РАЗРАБ ============
+    if new_token:
+        await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {new_token}")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
 
 async def aadminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id): await update.message.reply_text("❌ Только кто-то."); return
+    """Список администраторов"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
     text = "👥 АДМИНИСТРАТОРЫ:\n\n🌟 Главные:\n"
-    for aid in ADMIN_IDS:
-        ad = get_user_data(aid)
-        if ad: text += f"├ {ad['callsign']} ({ad['nick']}) — 🆔 {aid}\n"
+    for admin_id in ADMIN_IDS:
+        admin_data = get_user_data(admin_id)
+        if admin_data:
+            text += f"├ {admin_data['callsign']} ({admin_data['nick']}) — 🆔 {admin_id}\n"
     await update.message.reply_text(text)
 
 async def areset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id): await update.message.reply_text("❌ Только кто-то."); return
+    """Сброс пользователя"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET rank=0, department="Не назначен", warns="0/0", ban_status="Нет", ban_reason="", ban_date="" WHERE user_id=?', (target_id,))
-    cursor.execute('DELETE FROM warnings WHERE user_id=?', (target_id,)); cursor.execute('DELETE FROM gban WHERE user_id=?', (target_id,))
-    conn.commit(); conn.close()
-    await update.message.reply_text(f"✅ {get_user_data(target_id)['callsign']} сброшен.")
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''UPDATE users SET rank = 0, department = "Не назначен", warns = "0/0", 
+                 ban_status = "Нет", ban_reason = "", ban_date = "" WHERE user_id = ?''', (target_id,))
+    c.execute('DELETE FROM warnings WHERE user_id = ?', (target_id,))
+    c.execute('DELETE FROM gban WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
+    target_data = get_user_data(target_id)
+    await update.message.reply_text(f"✅ {target_data['callsign']} сброшен.")
 
 async def adelete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id): await update.message.reply_text("❌ Только кто-то."); return
+    """Удаление пользователя"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
     target_data = get_user_data(target_id)
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('DELETE FROM users WHERE user_id=?', (target_id,)); cursor.execute('DELETE FROM warnings WHERE user_id=?', (target_id,))
-    cursor.execute('DELETE FROM gban WHERE user_id=?', (target_id,)); cursor.execute('DELETE FROM awards WHERE user_id=?', (target_id,))
-    conn.commit(); conn.close()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM users WHERE user_id = ?', (target_id,))
+    c.execute('DELETE FROM warnings WHERE user_id = ?', (target_id,))
+    c.execute('DELETE FROM gban WHERE user_id = ?', (target_id,))
+    c.execute('DELETE FROM awards WHERE user_id = ?', (target_id,))
+    conn.commit()
+    conn.close()
+    
     await update.message.reply_text(f"✅ {target_data['callsign']} удалён.")
 
 async def aglobal_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id): await update.message.reply_text("❌ Только кто-то."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET ban_status="Нет", ban_reason="", ban_date=""'); u = cursor.rowcount
-    cursor.execute('DELETE FROM gban'); g = cursor.rowcount
-    conn.commit(); conn.close()
+    """Массовый разбан"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET ban_status = "Нет", ban_reason = "", ban_date = ""')
+    u = c.rowcount
+    c.execute('DELETE FROM gban')
+    g = c.rowcount
+    conn.commit()
+    conn.close()
+    
     await update.message.reply_text(f"✅ Разбанено: {u}\n🚫 Удалено из ЧС: {g}")
 
 async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id): await update.message.reply_text("❌ Только кто-то."); return
-    if not context.args: await update.message.reply_text("❌ /asetallrank 0-7"); return
+    """Установить ранг всем"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /asetallrank 0-7")
+        return
+    
     new_rank = int(context.args[0])
-    if new_rank not in RANKS: await update.message.reply_text("❌ Неверный ранг."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET rank=?', (new_rank,)); count = cursor.rowcount
-    conn.commit(); conn.close()
+    if new_rank not in RANKS:
+        await update.message.reply_text("❌ Неверный ранг.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET rank = ?', (new_rank,))
+    count = c.rowcount
+    conn.commit()
+    conn.close()
+    
     await update.message.reply_text(f"✅ Ранг {RANKS[new_rank]['name']} установлен {count} польз.")
 
 async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'search'): await update.message.reply_text("❌ С 4 ранга."); return
-    if not context.args: await update.message.reply_text("❌ /areport_info номер"); return
+    """Информация о жалобе"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'search'):
+        await update.message.reply_text("❌ С 4 ранга.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /areport_info номер")
+        return
+    
     report = get_report(int(context.args[0]))
-    if not report: await update.message.reply_text("❌ Не найдена."); return
+    if not report:
+        await update.message.reply_text("❌ Не найдена.")
+        return
+    
     mod_name = get_admin_nick(report['moderator_id']) if report['moderator_id'] else "—"
-    text = f"📋 ЖАЛОБА #{report['id']}\n📊 {report['status']}\n👤 {report['reporter_nick']}\n🎮 {report['violator_nick']}\n⚠️ {report['violation']}\n📎 {report['evidence']}\n💻 {report['command']}\n📅 {report['created_at']}"
-    if report['status'] != 'pending': text += f"\n📊 {report['verdict']}\n👮 {mod_name}\n💬 {report['moderator_comment']}\n📅 {report['resolved_at']}"
+    text = (
+        f"📋 ЖАЛОБА #{report['id']}\n📊 {report['status']}\n"
+        f"👤 {report['reporter_nick']}\n🎮 {report['violator_nick']}\n"
+        f"⚠️ {report['violation']}\n📎 {report['evidence']}\n💻 {report['command']}\n"
+        f"📅 {report['created_at']}"
+    )
+    if report['status'] != 'pending':
+        text += f"\n📊 {report['verdict']}\n👮 {mod_name}\n💬 {report['moderator_comment']}\n📅 {report['resolved_at']}"
     await update.message.reply_text(text)
 
 async def aspeciallist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'gban'): await update.message.reply_text("❌ Только генералы."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('SELECT user_id, game_nick, callsign FROM users WHERE special_access = "Да"'); users = cursor.fetchall(); conn.close()
+    """Список со спецдопуском"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id, game_nick, callsign FROM users WHERE special_access = "Да"')
+    users = c.fetchall()
+    conn.close()
+    
     if users:
         text = "🔐 СПЕЦДОПУСК:\n\n"
-        for u in users: text += f"👤 {u[1]} | {u[2]} | 🆔 {u[0]}\n"
+        for u in users:
+            text += f"👤 {u[1]} | {u[2]} | 🆔 {u[0]}\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text("🔐 Ни у кого нет спецдопуска.")
+    else:
+        await update.message.reply_text("🔐 Ни у кого нет спецдопуска.")
 
 async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id): await update.message.reply_text("❌ Только кто-то."); return
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users'); users = cursor.fetchall(); conn.close()
+    """Экспорт базы"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM users')
+    users = c.fetchall()
+    conn.close()
+    
     text = f"📋 ЭКСПОРТ ({len(users)} польз.):\n\n"
-    for u in users[:100]: text += f"🆔 {u[1]} | {u[2]} | {u[3]} | 🎫 {u[4]}\n"
+    for u in users[:100]:
+        text += f"🆔 {u[1]} | {u[2]} | {u[3]} | 🎫 {u[4]}\n"
     await update.message.reply_text(text)
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Руководящий состав"""
     user_data = get_user_data(update.effective_user.id)
-    if not user_data: await update.message.reply_text("❌ Вы не зарегистрированы."); return
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
     depts = get_departments()[:-2]  # Все кроме последних двух
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    text = "👥 РУКОВОДЯЩИЙ СОСТАВ:\n\n"; total = 0
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    text = "👥 РУКОВОДЯЩИЙ СОСТАВ:\n\n"
+    total = 0
+    
     for dept in depts:
-        cursor.execute('SELECT game_nick, callsign, rank FROM users WHERE department = ? ORDER BY rank DESC', (dept,)); members = cursor.fetchall()
+        c.execute('SELECT game_nick, callsign, rank FROM users WHERE department = ? ORDER BY rank DESC', (dept,))
+        members = c.fetchall()
         if members:
             text += f"📁 {dept}:\n"
-            for m in members: text += f"├ {m[1]} ({m[0]}) — {RANKS.get(m[2], RANKS[0])['name']}\n"
-            text += "\n"; total += len(members)
+            for m in members:
+                text += f"├ {m[1]} ({m[0]}) — {RANKS.get(m[2], RANKS[0])['name']}\n"
+            text += "\n"
+            total += len(members)
+    
     conn.close()
-    await update.message.reply_text(text + f"👥 Всего в руководстве: {total}")
+    text += f"👥 Всего в руководстве: {total}"
+    await update.message.reply_text(text)
 
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'manage_ranks'): await update.message.reply_text("❌ С 5 ранга."); return
+    """Профиль другого пользователя"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if not target_id: await update.message.reply_text("❌ /awho @user"); return
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не удалось найти."); return
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ /awho @user")
+        return
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не удалось найти.")
+        return
+    
     user_data = get_user_data(target_id)
-    if not user_data: await update.message.reply_text("❌ Пользователь не зарегистрирован."); return
-    permissions = get_user_permissions(target_id); warns = get_warn_list(target_id); awards = get_user_awards(target_id)
-    warn_count = len(warns) if warns else 0; award_count = len(awards) if awards else 0
+    if not user_data:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован.")
+        return
+    
+    permissions = get_user_permissions(target_id)
+    warns = get_warn_list(target_id)
+    warn_count = len(warns) if warns else 0
+    awards = get_user_awards(target_id)
+    award_count = len(awards) if awards else 0
     special_text = "🔐 Спецдопуск: Да\n" if has_special_access(target_id) else ""
-    await update.message.reply_text(f"👤 ПРОФИЛЬ\n\n🎮 Ник: {user_data['nick']}\n📻 Позывной: {user_data['callsign']}\n🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n📁 Отдел: {user_data['department']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n🏅 Наград: {award_count}\n{special_text}🆔 ID: {user_data['user_id']}\n📅 Зарегистрирован: {user_data['reg_date']}")
+    
+    await update.message.reply_text(
+        f"👤 ПРОФИЛЬ\n\n"
+        f"🎮 Ник: {user_data['nick']}\n📻 Позывной: {user_data['callsign']}\n"
+        f"🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
+        f"🏅 Наград: {award_count}\n{special_text}🆔 ID: {user_data['user_id']}\n"
+        f"📅 Зарегистрирован: {user_data['reg_date']}"
+    )
 
 async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'gban'): await update.message.reply_text("❌ Только генералы."); return
-    if not context.args: await update.message.reply_text("❌ /achangelog Текст"); return
+    """Отправка changelog в конференцию"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /achangelog Текст")
+        return
+    
     changes = ' '.join(context.args)
+    changelog_text = f"🔄 ОБНОВЛЕНИЕ БОТА\n\n📝 {changes}\n\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    
     try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=f"🔄 ОБНОВЛЕНИЕ БОТА\n\n📝 {changes}\n\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=changelog_text)
         await update.message.reply_text("✅ Изменения отправлены в конфу")
-    except Exception as e: await update.message.reply_text(f"❌ Ошибка: {e}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'gban'): await update.message.reply_text("❌ Только генералы."); return
-    target_id = extract_user_id(update, context); new_token = None
-    if target_id: new_token = context.args[0] if context.args else None
+    """Выдача жетона"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только генералы.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    new_token = None
+    
+    if target_id:
+        new_token = context.args[0] if context.args else None
     else:
-        if len(context.args) < 2: await update.message.reply_text("❌ /asettoken @user 52****"); return
-        target_id = extract_user_id(update, context, context.args[0]); new_token = context.args[1]
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id or not new_token: await update.message.reply_text("❌ Не найден."); return
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /asettoken @user 52****")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        new_token = context.args[1]
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id or not new_token:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
     success, message = set_user_token(target_id, new_token)
-    if success: await update.message.reply_text(f"✅ {get_user_data(target_id)['callsign']}\n🎫 {new_token}")
-    else: await update.message.reply_text(f"❌ {message}")
+    if success:
+        target_data = get_user_data(target_id)
+        await update.message.reply_text(f"✅ {target_data['callsign']}\n🎫 {new_token}")
+    else:
+        await update.message.reply_text(f"❌ {message}")
 
 async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'manage_ranks'): await update.message.reply_text("❌ С 5 ранга."); return
-    target_id = extract_user_id(update, context); new_rank = None
-    if target_id: new_rank = int(context.args[0]) if context.args else None
+    """Установка ранга"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    new_rank = None
+    
+    if target_id:
+        new_rank = int(context.args[0]) if context.args else None
     else:
-        if len(context.args) < 2: await update.message.reply_text("❌ /asetrank @user 0-7"); return
-        target_id = extract_user_id(update, context, context.args[0]); new_rank = int(context.args[1])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id or new_rank not in RANKS: await update.message.reply_text("❌ Ошибка."); return
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ /asetrank @user 0-7")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        new_rank = int(context.args[1])
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id or new_rank not in RANKS:
+        await update.message.reply_text("❌ Ошибка.")
+        return
+    
     if update_user_rank(target_id, new_rank):
-        target_data = get_user_data(target_id); issuer_name = get_admin_nick(update.effective_user.id)
+        target_data = get_user_data(target_id)
+        issuer_name = get_admin_nick(user_id)
         await update.message.reply_text(f"✅ {target_data['callsign']} → {RANKS[new_rank]['name']}")
-        await notify_user(context, target_id, f"📢 Ваш ранг изменён!\n⭐ Новый ранг: {RANKS[new_rank]['name']}\n👮 Изменил: {issuer_name}")
+        await notify_user(context, target_id,
+                         f"📢 Ваш ранг изменён!\n⭐ Новый ранг: {RANKS[new_rank]['name']}\n👮 Изменил: {issuer_name}")
 
 async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'manage_ranks'): await update.message.reply_text("❌ С 5 ранга."); return
-    target_id = extract_user_id(update, context); dept_num = None
+    """Назначение отдела"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    dept_num = None
     depts = get_departments()
-    if target_id: dept_num = int(context.args[0]) - 1 if context.args else None
+    
+    if target_id:
+        dept_num = int(context.args[0]) - 1 if context.args else None
     else:
         if len(context.args) < 2:
             deps = "\n".join([f"{i+1}. {d}" for i, d in enumerate(depts)])
-            await update.message.reply_text(f"❌ /asetdept @user номер\n\n{deps}"); return
-        target_id = extract_user_id(update, context, context.args[0]); dept_num = int(context.args[1]) - 1
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id or dept_num is None or dept_num < 0 or dept_num >= len(depts): await update.message.reply_text("❌ Ошибка."); return
+            await update.message.reply_text(f"❌ /asetdept @user номер\n\n{deps}")
+            return
+        target_id = extract_user_id(update, context, context.args[0])
+        dept_num = int(context.args[1]) - 1
+    
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id or dept_num is None or dept_num < 0 or dept_num >= len(depts):
+        await update.message.reply_text("❌ Ошибка.")
+        return
+    
     if update_user_department(target_id, depts[dept_num]):
-        target_data = get_user_data(target_id); issuer_name = get_admin_nick(update.effective_user.id)
+        target_data = get_user_data(target_id)
+        issuer_name = get_admin_nick(user_id)
         await update.message.reply_text(f"✅ {target_data['callsign']} → {depts[dept_num]}")
-        await notify_user(context, target_id, f"📢 Ваш отдел изменён!\n📁 Новый отдел: {depts[dept_num]}\n👮 Изменил: {issuer_name}")
+        await notify_user(context, target_id,
+                         f"📢 Ваш отдел изменён!\n📁 Новый отдел: {depts[dept_num]}\n👮 Изменил: {issuer_name}")
 
 async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'ban'): await update.message.reply_text("❌ С 5 ранга."); return
+    """Разбан"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'ban'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if await unban_user_in_chat(update, context, target_id): await update.message.reply_text("✅ Разбанен.")
-    else: await update.message.reply_text("❌ Ошибка.")
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if await unban_user_in_chat(update, context, target_id):
+        await update.message.reply_text("✅ Разбанен.")
+    else:
+        await update.message.reply_text("❌ Ошибка.")
 
 async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_special_access(update.effective_user.id): await update.message.reply_text("❌ Недоступно."); return
+    """Снятие глобального бана"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id):
+        await update.message.reply_text("❌ Недоступно.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if remove_gban(target_id): await update.message.reply_text("✅ Снят ЧС")
-    else: await update.message.reply_text("❌ Не в ЧС")
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if remove_gban(target_id):
+        await update.message.reply_text("✅ Снят ЧС")
+    else:
+        await update.message.reply_text("❌ Не в ЧС")
 
 async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_special_access(update.effective_user.id): await update.message.reply_text("❌ Недоступно."); return
+    """Список ЧС"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id):
+        await update.message.reply_text("❌ Недоступно.")
+        return
+    
     bans = get_gban_list()
     if bans:
         text = "🚫 ЧЁРНЫЙ СПИСОК:\n\n"
-        for b in bans[:20]: text += f"🆔 {b[0]} | {b[1]}\n📝 {b[2]}\n📅 {b[3]}\n\n"
+        for b in bans[:20]:
+            text += f"🆔 {b[0]} | {b[1]}\n📝 {b[2]}\n📅 {b[3]}\n\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text("✅ ЧС пуст.")
+    else:
+        await update.message.reply_text("✅ ЧС пуст.")
 
 async def aadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список администрации"""
     admins = get_admins()
     if admins:
         text = "👥 АДМИНИСТРАЦИЯ:\n\n"
-        for a in admins: text += f"👤 {a[2]} | {a[1]}\n⭐ {RANKS[a[4]]['name']}\n📁 {a[5]}\n🆔 {a[0]}\n\n"
+        for a in admins:
+            text += f"👤 {a[2]} | {a[1]}\n⭐ {RANKS[a[4]]['name']}\n📁 {a[5]}\n🆔 {a[0]}\n\n"
         await update.message.reply_text(text)
 
 async def asetadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_main_admin(update.effective_user.id): await update.message.reply_text("❌ Только кто-то."); return
+    """Назначение администратора"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if target_id in ADMIN_IDS: await update.message.reply_text("❌ Уже админ."); return
-    ADMIN_IDS.append(target_id); update_user_rank(target_id, 6)
-    await update.message.reply_text(f"✅ Генерал")
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if target_id in ADMIN_IDS:
+        await update.message.reply_text("❌ Уже админ.")
+        return
+    
+    ADMIN_IDS.append(target_id)
+    update_user_rank(target_id, 6)
+    await update.message.reply_text("✅ Генерал")
 
 async def aunsetadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Снятие администратора"""
     user_id = update.effective_user.id
-    if not is_main_admin(user_id): await update.message.reply_text("❌ Только кто-то."); return
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только кто-то.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
-    if target_id not in ADMIN_IDS or target_id == user_id: await update.message.reply_text("❌ Нельзя."); return
-    ADMIN_IDS.remove(target_id); update_user_rank(target_id, 4)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
+    if target_id not in ADMIN_IDS or target_id == user_id:
+        await update.message.reply_text("❌ Нельзя.")
+        return
+    
+    ADMIN_IDS.remove(target_id)
+    update_user_rank(target_id, 4)
     await update.message.reply_text("✅ Снят.")
 
 async def abroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_permission(update.effective_user.id, 'warn'): await update.message.reply_text("❌ С 5 ранга."); return
-    if not context.args: await update.message.reply_text("❌ /abroadcast Текст"); return
+    """Рассылка всем"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /abroadcast Текст")
+        return
+    
     message = ' '.join(context.args)
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('SELECT user_id, game_nick FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"'); users = cursor.fetchall(); conn.close()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id, game_nick FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    users = c.fetchall()
+    conn.close()
+    
     await update.message.reply_text(f"📤 Рассылка на {len(users)} чел...")
-    sent = 0; failed = []
+    
+    sent = 0
+    failed = []
+    
     for u in users:
-        try: await context.bot.send_message(chat_id=u[0], text=f"📢 {message}"); sent += 1
-        except: failed.append(f"{u[1]} (ID: {u[0]})")
+        try:
+            await context.bot.send_message(chat_id=u[0], text=f"📢 {message}")
+            sent += 1
+        except:
+            failed.append(f"{u[1]} (ID: {u[0]})")
+    
     text = f"✅ Отправлено: {sent}\n❌ Ошибок: {len(failed)}"
     if failed:
         text += "\n\n❌ Не доставлено:\n" + "\n".join(failed[:10])
-        if len(failed) > 10: text += f"\n... и еще {len(failed) - 10}"
+        if len(failed) > 10:
+            text += f"\n... и еще {len(failed) - 10}"
+    
     await update.message.reply_text(text)
 
 # ============ ЖАЛОБЫ ============
 
 async def areport_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not get_user_data(update.effective_user.id): await update.message.reply_text("❌ Вы не зарегистрированы."); return ConversationHandler.END
-    await update.message.reply_text("📝 ПОДАЧА ЖАЛОБЫ\n\nШаг 1/5 — Введите ник нарушителя:"); return REPORT_VIOLATOR
+    """Начало подачи жалобы"""
+    user_data = get_user_data(update.effective_user.id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return ConversationHandler.END
+    
+    await update.message.reply_text("📝 ПОДАЧА ЖАЛОБЫ\n\nШаг 1/5 — Введите ник нарушителя:")
+    return REPORT_VIOLATOR
 
-async def report_violator(update, context): context.user_data['report_violator'] = update.message.text; await update.message.reply_text("Шаг 2/5 — Фракция(МО/МВД/ФСИН):"); return REPORT_FACTION
-async def report_faction(update, context): context.user_data['report_faction'] = update.message.text; await update.message.reply_text("Шаг 3/5 — Нарушение:"); return REPORT_VIOLATION
-async def report_violation(update, context): context.user_data['report_violation'] = update.message.text; await update.message.reply_text("Шаг 4/5 — Доказательства:"); return REPORT_EVIDENCE
-async def report_evidence(update, context): context.user_data['report_evidence'] = update.message.text; await update.message.reply_text("Шаг 5/5 — Команда:"); return REPORT_COMMAND
+async def report_violator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['report_violator'] = update.message.text
+    await update.message.reply_text("Шаг 2/5 — Фракция(МО/МВД/ФСИН):")
+    return REPORT_FACTION
+
+async def report_faction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['report_faction'] = update.message.text
+    await update.message.reply_text("Шаг 3/5 — Нарушение:")
+    return REPORT_VIOLATION
+
+async def report_violation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['report_violation'] = update.message.text
+    await update.message.reply_text("Шаг 4/5 — Доказательства:")
+    return REPORT_EVIDENCE
+
+async def report_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['report_evidence'] = update.message.text
+    await update.message.reply_text("Шаг 5/5 — Команда (или 'Нет'):")
+    return REPORT_COMMAND
 
 async def report_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id; user_data = get_user_data(user_id)
-    report_id = save_report(user_id, user_data['callsign'], context.user_data['report_violator'], context.user_data['report_faction'], context.user_data['report_violation'], context.user_data['report_evidence'], update.message.text)
-    keyboard = [[InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{report_id}"), InlineKeyboardButton("❌ Отказать", callback_data=f"reject_{report_id}")]]
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users WHERE rank >= 4'); mods = cursor.fetchall(); conn.close()
+    """Завершение подачи жалобы"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    report_id = save_report(
+        user_id,
+        user_data['callsign'],
+        context.user_data['report_violator'],
+        context.user_data['report_faction'],
+        context.user_data['report_violation'],
+        context.user_data['report_evidence'],
+        update.message.text
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{report_id}"),
+            InlineKeyboardButton("❌ Отказать", callback_data=f"reject_{report_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE rank >= 4')
+    mods = c.fetchall()
+    conn.close()
+    
     for m in mods:
-        try: await context.bot.send_message(chat_id=m[0], text=f"📩 ЖАЛОБА #{report_id}\n👤 Подал: {user_data['callsign']}\n🎮 Нарушитель: {context.user_data['report_violator']}\n⚠️ {context.user_data['report_violation']}\n📎 Доказательства: {context.user_data['report_evidence']}\n💻 Команда: {update.message.text}", reply_markup=InlineKeyboardMarkup(keyboard))
-        except: pass
-    await update.message.reply_text(f"✅ Жалоба #{report_id} отправлена!"); return ConversationHandler.END
+        try:
+            await context.bot.send_message(
+                chat_id=m[0],
+                text=f"📩 ЖАЛОБА #{report_id}\n👤 Подал: {user_data['callsign']}\n"
+                     f"🎮 Нарушитель: {context.user_data['report_violator']}\n"
+                     f"⚠️ {context.user_data['report_violation']}\n"
+                     f"📎 Доказательства: {context.user_data['report_evidence']}\n"
+                     f"💻 Команда: {update.message.text}",
+                reply_markup=reply_markup
+            )
+        except:
+            pass
+    
+    await update.message.reply_text(f"✅ Жалоба #{report_id} отправлена!")
+    return ConversationHandler.END
 
 async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    if not has_permission(query.from_user.id, 'search'): await query.edit_message_text("❌ Только с 4 ранга."); return
-    action, report_id = query.data.split('_'); report_id = int(report_id)
+    """Обработка кнопок модерации"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if not has_permission(user_id, 'search'):
+        await query.edit_message_text("❌ Только с 4 ранга.")
+        return
+    
+    action, report_id = query.data.split('_')
+    report_id = int(report_id)
+    
     report = get_report(report_id)
-    if not report: await query.edit_message_text("❌ Жалоба не найдена."); return
-    if report['status'] != 'pending': await query.edit_message_text(f"{query.message.text}\n\n❌ Жалоба уже обработана!\n📊 Статус: {report['verdict']}\n💬 {report['moderator_comment']}"); return
-    update_report(report_id, 'review', query.from_user.id, 'На рассмотрении...')
+    if not report:
+        await query.edit_message_text("❌ Жалоба не найдена.")
+        return
+    
+    if report['status'] != 'pending':
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            f"❌ Жалоба уже обработана!\n"
+            f"📊 Статус: {report['verdict']}\n"
+            f"💬 {report['moderator_comment']}"
+        )
+        return
+    
+    update_report(report_id, 'review', user_id, 'На рассмотрении...')
+    
     if action == 'approve':
-        context.user_data['pending_report'] = report_id; context.user_data['pending_action'] = 'approve'
-        await query.edit_message_text(f"{query.message.text}\n\n✅ ОДОБРЕНО (на рассмотрении)\n👮 Модератор: {get_admin_nick(query.from_user.id)}\nВведите комментарий (или '-' без комментария):")
+        context.user_data['pending_report'] = report_id
+        context.user_data['pending_action'] = 'approve'
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            f"✅ ОДОБРЕНО (на рассмотрении)\n"
+            f"👮 Модератор: {get_admin_nick(user_id)}\n"
+            f"Введите комментарий (или '-' без комментария):"
+        )
     elif action == 'reject':
-        context.user_data['pending_report'] = report_id; context.user_data['pending_action'] = 'reject'
-        await query.edit_message_text(f"{query.message.text}\n\n❌ ОТКАЗАНО (на рассмотрении)\n👮 Модератор: {get_admin_nick(query.from_user.id)}\nВведите причину отказа:")
+        context.user_data['pending_report'] = report_id
+        context.user_data['pending_action'] = 'reject'
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            f"❌ ОТКАЗАНО (на рассмотрении)\n"
+            f"👮 Модератор: {get_admin_nick(user_id)}\n"
+            f"Введите причину отказа:"
+        )
 
-async def handle_moderator_comment(update, context):
-    if 'pending_report' not in context.user_data: return
-    rid = context.user_data['pending_report']; action = context.user_data['pending_action']; comment = update.message.text
+async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка комментария модератора"""
+    if 'pending_report' not in context.user_data:
+        return
+    
+    report_id = context.user_data['pending_report']
+    action = context.user_data['pending_action']
+    comment = update.message.text
+    
     verdict = "ОДОБРЕНО" if action == 'approve' else "ОТКАЗАНО"
-    update_report(rid, action, update.effective_user.id, verdict, comment)
-    report = get_report(rid)
-    try: await context.bot.send_message(chat_id=report['reporter_id'], text=f"📋 ВЕРДИКТ #{rid}\nСтатус: {verdict}\n💬 {comment}")
-    except: pass
-    try: await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=f"📋 ВЕРДИКТ #{rid}\n👤 Подал: {report['reporter_nick']}\n🎮 Нарушитель: {report['violator_nick']}\n⚠️ {report['violation']}\n📊 {verdict}\n💬 {comment}", message_thread_id=VERDICT_TOPIC_ID)
-    except: pass
+    update_report(report_id, action, update.effective_user.id, verdict, comment)
+    
+    report = get_report(report_id)
+    
+    try:
+        await context.bot.send_message(
+            chat_id=report['reporter_id'],
+            text=f"📋 ВЕРДИКТ #{report_id}\nСтатус: {verdict}\n💬 {comment}"
+        )
+    except:
+        pass
+    
+    try:
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text=f"📋 ВЕРДИКТ #{report_id}\n👤 Подал: {report['reporter_nick']}\n"
+                 f"🎮 Нарушитель: {report['violator_nick']}\n"
+                 f"⚠️ {report['violation']}\n📊 {verdict}\n💬 {comment}",
+            message_thread_id=VERDICT_TOPIC_ID
+        )
+    except:
+        pass
+    
     await update.message.reply_text("✅ Вердикт отправлен!")
-    del context.user_data['pending_report'], context.user_data['pending_action']
+    del context.user_data['pending_report']
+    del context.user_data['pending_action']
 
-async def areports(update, context):
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('SELECT id, reporter_nick, violator_nick, status, created_at FROM reports ORDER BY id DESC LIMIT 20'); reports = cursor.fetchall(); conn.close()
+async def areports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список жалоб"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, reporter_nick, violator_nick, status, created_at FROM reports ORDER BY id DESC LIMIT 20')
+    reports = c.fetchall()
+    conn.close()
+    
     if reports:
         text = "📋 ЖАЛОБЫ:\n\n"
         for r in reports:
-            e = "⏳" if r[3]=='pending' else ("✅" if r[3]=='approve' else "❌")
+            if r[3] == 'pending':
+                e = "⏳"
+            elif r[3] == 'approve':
+                e = "✅"
+            else:
+                e = "❌"
             text += f"{e} #{r[0]} | {r[1]} → {r[2]} | {r[4]}\n"
         await update.message.reply_text(text)
-    else: await update.message.reply_text("Жалоб нет.")
+    else:
+        await update.message.reply_text("Жалоб нет.")
 
 async def acallsign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id; target_id = extract_user_id(update, context)
+    """Смена позывного"""
+    user_id = update.effective_user.id
+    target_id = extract_user_id(update, context)
+    
     if target_id:
-        if not has_permission(user_id, 'search'): await update.message.reply_text("❌ С 4 ранга для смены чужого позывного."); return
-        if isinstance(target_id, str):
+        if not has_permission(user_id, 'search'):
+            await update.message.reply_text("❌ С 4 ранга для смены чужого позывного.")
+            return
+        if isinstance(target_id, str) and target_id.startswith('@'):
             target_id = await get_target_id(update, context, target_id)
-            if not target_id: await update.message.reply_text("❌ Не найден."); return
-        if not context.args: await update.message.reply_text("❌ /acallsign @user НовыйПозывной"); return
+            if not target_id:
+                await update.message.reply_text("❌ Не найден.")
+                return
+        if not context.args:
+            await update.message.reply_text("❌ /acallsign @user НовыйПозывной")
+            return
         new_callsign = ' '.join(context.args)
     else:
         target_id = user_id
-        if not context.args: await update.message.reply_text("❌ /acallsign НовыйПозывной"); return
+        if not context.args:
+            await update.message.reply_text("❌ /acallsign НовыйПозывной")
+            return
         new_callsign = ' '.join(context.args)
+    
     target_data = get_user_data(target_id)
-    if not target_data: await update.message.reply_text("❌ Пользователь не найден."); return
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
     old_callsign = target_data['callsign']
-    conn = sqlite3.connect(DB_FILE); cursor = conn.cursor()
-    cursor.execute('UPDATE users SET callsign = ? WHERE user_id = ?', (new_callsign, target_id)); conn.commit(); conn.close()
-    if target_id != user_id: await notify_user(context, target_id, f"📢 Ваш позывной изменён!\n📻 Было: {old_callsign}\n📻 Стало: {new_callsign}\n👮 Изменил: {get_admin_nick(user_id)}")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET callsign = ? WHERE user_id = ?', (new_callsign, target_id))
+    conn.commit()
+    conn.close()
+    
+    if target_id != user_id:
+        await notify_user(context, target_id,
+                         f"📢 Ваш позывной изменён!\n📻 Было: {old_callsign}\n📻 Стало: {new_callsign}\n👮 Изменил: {get_admin_nick(user_id)}")
+    
     await update.message.reply_text(f"✅ Позывной изменён!\n📻 Было: {old_callsign}\n📻 Стало: {new_callsign}")
 
 # ============ СПЕЦДОПУСК ============
 
-async def aspecial(update, context):
-    user_id = update.effective_user.id; user_data = get_user_data(user_id)
-    if not user_data or user_data['rank'] < 7: await update.message.reply_text("❌ Только с 7 ранга."); return
+async def aspecial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выдача/отзыв спецдопуска"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data or user_data['rank'] < 7:
+        await update.message.reply_text("❌ Только с 7 ранга.")
+        return
+    
     target_id = extract_user_id(update, context)
-    if not target_id and context.args: target_id = extract_user_id(update, context, context.args[0])
-    if isinstance(target_id, str): target_id = await get_target_id(update, context, target_id)
-    if not target_id: await update.message.reply_text("❌ Не найден."); return
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    
+    if not target_id:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
     target_data = get_user_data(target_id)
-    if has_special_access(target_id): revoke_special_access(target_id); status = "отозван ❌"
-    else: grant_special_access(target_id); status = "выдан ✅"
+    if has_special_access(target_id):
+        revoke_special_access(target_id)
+        status = "отозван ❌"
+    else:
+        grant_special_access(target_id)
+        status = "выдан ✅"
+    
     await notify_user(context, target_id, f"🔐 Спецдопуск {status}!\n👮 Выдал: {user_data['nick']}")
     await update.message.reply_text(f"🔐 Спецдопуск {status}\n👤 {target_data['callsign']}")
 
-async def awhois(update, context):
-    if not has_special_access(update.effective_user.id) and not has_permission(update.effective_user.id, 'gban'): await update.message.reply_text("❌ Только со спецдопуском."); return
-    if not context.args: await update.message.reply_text("❌ /awhois ID"); return
-    target_id = int(context.args[0]); user_data = get_user_data(target_id)
-    if not user_data: await update.message.reply_text("❌ Не найден."); return
+async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полная информация по ID"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id) and not has_permission(user_id, 'gban'):
+        await update.message.reply_text("❌ Только со спецдопуском.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ /awhois ID")
+        return
+    
+    target_id = int(context.args[0])
+    user_data = get_user_data(target_id)
+    if not user_data:
+        await update.message.reply_text("❌ Не найден.")
+        return
+    
     gban = check_gban(target_id)
-    await update.message.reply_text(f"🔍 ПОЛНАЯ ИНФОРМАЦИЯ\n\n🎮 {user_data['nick']}\n📻 {user_data['callsign']}\n🎫 {user_data['token']}\n⭐ {RANKS[user_data['rank']]['name']}\n📁 {user_data['department']}\n⚠️ {user_data['warns']}\n🔐 Спецдопуск: {'Да' if has_special_access(target_id) else 'Нет'}\n🚫 ЧС: {'Да' if gban['is_banned'] else 'Нет'}\n🆔 {user_data['user_id']}")
+    await update.message.reply_text(
+        f"🔍 ПОЛНАЯ ИНФОРМАЦИЯ\n\n"
+        f"🎮 {user_data['nick']}\n📻 {user_data['callsign']}\n🎫 {user_data['token']}\n"
+        f"⭐ {RANKS[user_data['rank']]['name']}\n📁 {user_data['department']}\n"
+        f"⚠️ {user_data['warns']}\n"
+        f"🔐 Спецдопуск: {'Да' if has_special_access(target_id) else 'Нет'}\n"
+        f"🚫 ЧС: {'Да' if gban['is_banned'] else 'Нет'}\n🆔 {user_data['user_id']}"
+    )
 
 # ============ РЕГИСТРАЦИЯ ============
 
-async def start_registration(update, context):
-    if get_user_data(update.effective_user.id): await update.message.reply_text("❌ Уже зарегистрированы!"); return ConversationHandler.END
-    await update.message.reply_text("📝 Шаг 1/2 — Игровой ник:"); return GAME_NICK
+async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало регистрации"""
+    if get_user_data(update.effective_user.id):
+        await update.message.reply_text("❌ Уже зарегистрированы!")
+        return ConversationHandler.END
+    await update.message.reply_text("📝 Шаг 1/2 — Игровой ник:")
+    return GAME_NICK
 
-async def get_game_nick(update, context): context.user_data['game_nick'] = update.message.text; await update.message.reply_text("Шаг 2/2 — Позывной:"); return CALLSIGN
+async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['game_nick'] = update.message.text
+    await update.message.reply_text("Шаг 2/2 — Позывной:")
+    return CALLSIGN
 
-async def complete_registration(update, context):
-    callsign = update.message.text; user_id = update.effective_user.id
+async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершение регистрации"""
+    callsign = update.message.text
+    user_id = update.effective_user.id
     token = add_user(user_id, context.user_data['game_nick'], callsign)
-    await update.message.reply_text(f"✅ Готово!\n\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}")
-    await start(update, context); return ConversationHandler.END
+    await update.message.reply_text(
+        f"✅ Готово!\n\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}"
+    )
+    await start(update, context)
+    return ConversationHandler.END
 
-async def cancel(update, context): await update.message.reply_text("❌ Отменено."); return ConversationHandler.END
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено.")
+    return ConversationHandler.END
 
-async def atest(update, context): await update.message.reply_text(f"Chat ID: {update.effective_chat.id}\nChat type: {update.effective_chat.type}")
+async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Chat ID: {update.effective_chat.id}\nChat type: {update.effective_chat.type}")
 
 # ============ ОБРАБОТЧИК КНОПОК ============
 
-async def handle_message(update, context):
-    text = update.message.text; user_id = update.effective_user.id
-    if check_gban(user_id)['is_banned']: await update.message.reply_text("🚫 Вы в ЧС!"); return
-    handlers = {"📝 Регистрация": start_registration, "👤 Информация": ainfo, "🔍 Проверить ЧС": check_gban_command, "ℹ️ Помощь": ahelp, "📋 Список участников": auserlist, "📝 Подать жалобу": areport_start}
-    if text in handlers: return await handlers[text](update, context)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    
+    if check_gban(user_id)['is_banned']:
+        await update.message.reply_text("🚫 Вы в ЧС!")
+        return
+    
+    handlers = {
+        "📝 Регистрация": start_registration,
+        "👤 Информация": ainfo,
+        "🔍 Проверить ЧС": check_gban_command,
+        "ℹ️ Помощь": ahelp,
+        "📋 Список участников": auserlist,
+        "📝 Подать жалобу": areport_start
+    }
+    
+    if text in handlers:
+        return await handlers[text](update, context)
 
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбор сообщений для анализа настроения"""
     if update.effective_chat.id == CONFERENCE_CHAT_ID and update.message and update.message.text:
         chat_messages.append(update.message.text)
-        if len(chat_messages) > 100: chat_messages.pop(0)
+        if len(chat_messages) > 100:
+            chat_messages.pop(0)
 
 # ============ ЗАПУСК ============
 
 def main():
     init_database()
     application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(ConversationHandler(entry_points=[MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration)], states={GAME_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_game_nick)], CALLSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_registration)]}, fallbacks=[CommandHandler('cancel', cancel)]))
-    for cmd, func in {'start':start,'ainfo':ainfo,'ahelp':ahelp,'aprofile':aprofile,'astats':astats,'aawards':aawards,'anick':anick,'asearch':asearch,'akick':akick,'aban':aban,'aunban':aunban,'awarn':awarn,'awarns':awarns,'awarnlist':awarns,'aunwarn':aunwarn,'aunwarnall':aunwarnall,'asetrank':asetrank,'asetdept':asetdept,'asettoken':asettoken,'aadmins':aadmins,'auserlist':auserlist,'awho':awhoprofile,'areports':areports,'achangelog':achangelog,'acallsign':acallsign,'ablock':ablock,'aunblock':aunblock,'amood':amood,'aspecial':aspecial,'awhois':awhois,'abroadcast':abroadcast,'abackup':abackup,'aregister':aregister,'aforcereg':aforcereg,'aadminlist':aadminlist,'areset_user':areset_user,'adelete_user':adelete_user,'asetnick':asetnick,'aglobal_unban':aglobal_unban,'asetallrank':asetallrank,'areport_info':areport_info,'aspeciallist':aspeciallist,'adepartment':adepartment,'asetalldept':asetalldept,'atest':atest,'find':find}.items():
+    
+    # Регистрация
+    reg_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration)],
+        states={
+            GAME_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_game_nick)],
+            CALLSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_registration)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    application.add_handler(reg_handler)
+    
+    # Все команды с префиксом "a"
+    commands = {
+        'start': start, 'ainfo': ainfo, 'ahelp': ahelp, 'aprofile': aprofile,
+        'astats': astats, 'aawards': aawards, 'anick': anick, 'asearch': asearch,
+        'akick': akick, 'aban': aban, 'aunban': aunban, 'awarn': awarn,
+        'awarns': awarns, 'awarnlist': awarns, 'aunwarn': aunwarn, 'aunwarnall': aunwarnall,
+        'asetrank': asetrank, 'asetdept': asetdept, 'asettoken': asettoken,
+        'aadmins': aadmins, 'auserlist': auserlist, 'awho': awhoprofile,
+        'areports': areports, 'achangelog': achangelog, 'acallsign': acallsign,
+        'ablock': ablock, 'aunblock': aunblock, 'amood': amood,
+        'aspecial': aspecial, 'awhois': awhois, 'abroadcast': abroadcast,
+        'abackup': abackup, 'aregister': aregister, 'aforcereg': aforcereg,
+        'aadminlist': aadminlist, 'areset_user': areset_user, 'adelete_user': adelete_user,
+        'asetnick': asetnick, 'aglobal_unban': aglobal_unban, 'asetallrank': asetallrank,
+        'areport_info': areport_info, 'aspeciallist': aspeciallist,
+        'adepartment': adepartment, 'asetalldept': asetalldept,
+        'atest': atest, 'find': find
+    }
+    for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
-    for cmd, func in {'gban':gban_command,'ungban':ungban_command,'check_gban':check_gban_command,'gban_list':gban_list_command,'areport':areport_start}.items():
+    
+    # Команды БЕЗ префикса (gban, ungban, check_gban, gban_list)
+    no_prefix = {
+        'gban': gban_command, 'ungban': ungban_command,
+        'check_gban': check_gban_command, 'gban_list': gban_list_command,
+        'areport': areport_start
+    }
+    for cmd, func in no_prefix.items():
         application.add_handler(CommandHandler(cmd, func))
-    application.add_handler(ConversationHandler(entry_points=[CommandHandler('areport', areport_start), MessageHandler(filters.Regex('^📝 Подать жалобу$'), areport_start)], states={REPORT_VIOLATOR:[MessageHandler(filters.TEXT & ~filters.COMMAND, report_violator)], REPORT_FACTION:[MessageHandler(filters.TEXT & ~filters.COMMAND, report_faction)], REPORT_VIOLATION:[MessageHandler(filters.TEXT & ~filters.COMMAND, report_violation)], REPORT_EVIDENCE:[MessageHandler(filters.TEXT & ~filters.COMMAND, report_evidence)], REPORT_COMMAND:[MessageHandler(filters.TEXT & ~filters.COMMAND, report_complete)]}, fallbacks=[CommandHandler('cancel', cancel)]))
+    
+    # Жалобы
+    report_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('areport', areport_start),
+            MessageHandler(filters.Regex('^📝 Подать жалобу$'), areport_start)
+        ],
+        states={
+            REPORT_VIOLATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_violator)],
+            REPORT_FACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_faction)],
+            REPORT_VIOLATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_violation)],
+            REPORT_EVIDENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_evidence)],
+            REPORT_COMMAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_complete)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    application.add_handler(report_handler)
+    
     application.add_handler(ChatMemberHandler(welcome_new_member))
     application.add_handler(CallbackQueryHandler(handle_report_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
+    
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
-    # Еженедельно в воскресенье в 11:00 МСК (8:00 UTC)
     application.job_queue.run_daily(weekly_rank_check, time=time(hour=8, minute=0), days=(6,))
     application.add_handler(CommandHandler('atestwelcome', atestwelcome))
+    
     print("🤖 Бот запущен!")
     application.run_polling()
 
