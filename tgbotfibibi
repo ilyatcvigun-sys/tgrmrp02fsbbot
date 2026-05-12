@@ -2827,7 +2827,7 @@ def get_poll_votes(poll_id: int) -> list:
     return votes
 
 # ============ КОМАНДЫ ГОЛОСОВАНИЙ ============
-
+POLL_TOPIC_ID = 10677
 async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Создание голосования (спецдопуск или 7 ранг)"""
     user_id = update.effective_user.id
@@ -2866,7 +2866,7 @@ async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=poll_text, message_thread_id=VERDICT_TOPIC_ID)
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=poll_text, message_thread_id=POLL_TOPIC_ID)
     except:
         await update.effective_chat.send_message(poll_text)
     
@@ -2940,7 +2940,7 @@ async def avote(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=CONFERENCE_CHAT_ID,
                 text=f"🗳 {user_data['nick']} проголосовал: {vote.upper()} #{poll_id}\n"
                      f"📊 Да: {poll['yes_count']} | Нет: {poll['no_count']} | Воздерж: {poll['abstain_count']}",
-                message_thread_id=VERDICT_TOPIC_ID
+                message_thread_id=POLL_TOPIC_ID
             )
         except:
             pass
@@ -2974,7 +2974,7 @@ async def aadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=CONFERENCE_CHAT_ID,
             text=f"📝 Дополнение к #{poll_id}\n👤 {user_data['nick']}: {addition}",
-            message_thread_id=VERDICT_TOPIC_ID
+            message_thread_id=POLL_TOPIC_ID
         )
     except:
         pass
@@ -3057,7 +3057,7 @@ async def apoll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=result_text, message_thread_id=VERDICT_TOPIC_ID)
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=result_text, message_thread_id=POLL_TOPIC_ID)
     except:
         await update.effective_chat.send_message(result_text)
     
