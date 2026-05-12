@@ -2679,6 +2679,406 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Chat ID: {update.effective_chat.id}\nChat type: {update.effective_chat.type}")
+# ============= ГОЛОСОВАНИЕ ТЕСТ ТЕСТ ==============
+
+# ============ СИСТЕМА ГОЛОСОВАНИЙ ============
+
+# Добавьте в init_database():
+def init_database():
+    # ... все существующие таблицы ...
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_nick TEXT NOT NULL,
+            description TEXT NOT NULL,
+            additions TEXT DEFAULT '',
+            creator_id INTEGER NOT NULL,
+            creator_nick TEXT,
+            status TEXT DEFAULT 'active',
+            yes_count INTEGER DEFAULT 0,
+            no_count INTEGER DEFAULT 0,
+            abstain_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT '',
+            closed_at TEXT DEFAULT ''
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS poll_votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poll_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            vote TEXT NOT NULL,
+            reason TEXT DEFAULT '',
+            voted_at TEXT DEFAULT '',
+            UNIQUE(poll_id, user_id)
+        )
+    ''')
+
+# ============ ФУНКЦИИ ДЛЯ ГОЛОСОВАНИЙ ============
+
+def create_poll(candidate_nick: str, description: str, creator_id: int) -> int:
+    """Создание голосования"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    creator_data = get_user_data(creator_id)
+    creator_nick = creator_data['nick'] if creator_data else f"User {creator_id}"
+    c.execute('''
+        INSERT INTO polls (candidate_nick, description, creator_id, creator_nick, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (candidate_nick, description, creator_id, creator_nick, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    poll_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return poll_id
+
+def add_poll_addition(poll_id: int, user_id: int, addition: str):
+    """Добавление к описанию голосования"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT additions FROM polls WHERE id = ?', (poll_id,))
+    row = c.fetchone()
+    current_additions = row[0] if row and row[0] else ""
+    user_data = get_user_data(user_id)
+    user_nick = user_data['nick'] if user_data else f"User {user_id}"
+    new_addition = f"\n📝 {user_nick}: {addition}"
+    c.execute('UPDATE polls SET additions = ? WHERE id = ?', (current_additions + new_addition, poll_id))
+    conn.commit()
+    conn.close()
+
+def vote_in_poll(poll_id: int, user_id: int, vote: str, reason: str = "") -> tuple:
+    """Голосование в опросе"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    # Проверка, голосовал ли уже
+    c.execute('SELECT id FROM poll_votes WHERE poll_id = ? AND user_id = ?', (poll_id, user_id))
+    if c.fetchone():
+        conn.close()
+        return False, "Вы уже проголосовали."
+    
+    # Проверка, активен ли опрос
+    c.execute('SELECT status FROM polls WHERE id = ?', (poll_id,))
+    row = c.fetchone()
+    if not row or row[0] != 'active':
+        conn.close()
+        return False, "Голосование неактивно."
+    
+    c.execute('''
+        INSERT INTO poll_votes (poll_id, user_id, vote, reason, voted_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (poll_id, user_id, vote, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    
+    # Обновление счётчиков
+    if vote == 'yes':
+        c.execute('UPDATE polls SET yes_count = yes_count + 1 WHERE id = ?', (poll_id,))
+    elif vote == 'no':
+        c.execute('UPDATE polls SET no_count = no_count + 1 WHERE id = ?', (poll_id,))
+    elif vote == 'abstain':
+        c.execute('UPDATE polls SET abstain_count = abstain_count + 1 WHERE id = ?', (poll_id,))
+    
+    conn.commit()
+    conn.close()
+    return True, f"Голос '{vote}' принят."
+
+def get_active_polls() -> list:
+    """Получение активных голосований"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM polls WHERE status = "active" ORDER BY id DESC')
+    polls = c.fetchall()
+    conn.close()
+    return polls
+
+def get_poll_by_id(poll_id: int) -> dict:
+    """Получение голосования по ID"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM polls WHERE id = ?', (poll_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0], "candidate_nick": row[1], "description": row[2],
+            "additions": row[3], "creator_id": row[4], "creator_nick": row[5],
+            "status": row[6], "yes_count": row[7], "no_count": row[8],
+            "abstain_count": row[9], "created_at": row[10], "closed_at": row[11]
+        }
+    return None
+
+def close_poll(poll_id: int) -> bool:
+    """Закрытие голосования"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE polls SET status = "closed", closed_at = ? WHERE id = ?',
+              (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), poll_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_poll_votes(poll_id: int) -> list:
+    """Получение голосов опроса"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM poll_votes WHERE poll_id = ? ORDER BY id DESC', (poll_id,))
+    votes = c.fetchall()
+    conn.close()
+    return votes
+
+# ============ КОМАНДЫ ГОЛОСОВАНИЙ ============
+
+async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание голосования (спецдопуск или 7 ранг)"""
+    user_id = update.effective_user.id
+    if not has_special_access(user_id) and get_user_data(user_id)['rank'] < 7:
+        await update.message.reply_text("❌ Только со спецдопуском или 7 ранг.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /apoll_create Ник \"Описание кандидата\"")
+        return
+    
+    # Разбираем аргументы: ник и описание в кавычках
+    text = ' '.join(context.args)
+    if '"' in text:
+        parts = text.split('"')
+        if len(parts) >= 3:
+            candidate_nick = parts[0].strip()
+            description = parts[1].strip()
+        else:
+            candidate_nick = context.args[0]
+            description = ' '.join(context.args[1:])
+    else:
+        candidate_nick = context.args[0]
+        description = ' '.join(context.args[1:])
+    
+    poll_id = create_poll(candidate_nick, description, user_id)
+    
+    # Отправка в топик
+    poll_text = (
+        f"📋 НОВОЕ ГОЛОСОВАНИЕ #{poll_id}\n\n"
+        f"👤 Кандидат: {candidate_nick}\n"
+        f"📝 Описание: {description}\n"
+        f"👮 Создал: {get_admin_nick(user_id)}\n\n"
+        f"Голосуйте в ЛС командой: /avote {poll_id} да/нет/воздерж\n"
+        f"Добавить к описанию: /aadd {poll_id} текст"
+    )
+    
+    try:
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=poll_text, message_thread_id=VERDICT_TOPIC_ID)
+    except:
+        await update.effective_chat.send_message(poll_text)
+    
+    # Рассылка всем в ЛС
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    users = c.fetchall()
+    conn.close()
+    
+    for u in users:
+        try:
+            await context.bot.send_message(
+                chat_id=u[0],
+                text=f"📋 ГОЛОСОВАНИЕ #{poll_id}\n\n"
+                     f"👤 Кандидат: {candidate_nick}\n"
+                     f"📝 {description}\n\n"
+                     f"Проголосуйте: /avote {poll_id} да\n"
+                     f"Или: /avote {poll_id} нет Причина\n"
+                     f"Или: /avote {poll_id} воздерж"
+            )
+        except:
+            pass
+    
+    await update.message.reply_text(f"✅ Голосование #{poll_id} создано и отправлено всем!")
+
+
+async def avote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Голосование"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /avote ID да/нет/воздерж [причина]")
+        return
+    
+    try:
+        poll_id = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ Укажите ID голосования.")
+        return
+    
+    vote = context.args[1].lower()
+    if vote not in ['да', 'нет', 'воздерж']:
+        await update.message.reply_text("❌ Голос: да, нет, воздерж.")
+        return
+    
+    reason = ' '.join(context.args[2:]) if len(context.args) > 2 else ""
+    
+    if vote == 'да':
+        vote_en = 'yes'
+    elif vote == 'нет':
+        vote_en = 'no'
+        if not reason:
+            await update.message.reply_text("❌ При голосе 'нет' укажите причину.\n/avote ID нет Причина")
+            return
+    else:
+        vote_en = 'abstain'
+    
+    success, message = vote_in_poll(poll_id, user_id, vote_en, reason)
+    
+    if success:
+        await update.message.reply_text(f"✅ {message}")
+        # Отправка в топик
+        poll = get_poll_by_id(poll_id)
+        try:
+            await context.bot.send_message(
+                chat_id=CONFERENCE_CHAT_ID,
+                text=f"🗳 {user_data['nick']} проголосовал: {vote.upper()} #{poll_id}\n"
+                     f"📊 Да: {poll['yes_count']} | Нет: {poll['no_count']} | Воздерж: {poll['abstain_count']}",
+                message_thread_id=VERDICT_TOPIC_ID
+            )
+        except:
+            pass
+    else:
+        await update.message.reply_text(f"❌ {message}")
+
+
+async def aadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление к описанию голосования"""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ /aadd ID текст_дополнения")
+        return
+    
+    try:
+        poll_id = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ Укажите ID голосования.")
+        return
+    
+    addition = ' '.join(context.args[1:])
+    add_poll_addition(poll_id, user_id, addition)
+    
+    poll = get_poll_by_id(poll_id)
+    try:
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text=f"📝 Дополнение к #{poll_id}\n👤 {user_data['nick']}: {addition}",
+            message_thread_id=VERDICT_TOPIC_ID
+        )
+    except:
+        pass
+    
+    await update.message.reply_text(f"✅ Дополнение добавлено к голосованию #{poll_id}")
+
+
+async def apoll_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Информация о голосовании"""
+    if not context.args:
+        await update.message.reply_text("❌ /apoll_info ID")
+        return
+    
+    try:
+        poll_id = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ Укажите ID.")
+        return
+    
+    poll = get_poll_by_id(poll_id)
+    if not poll:
+        await update.message.reply_text("❌ Голосование не найдено.")
+        return
+    
+    votes = get_poll_votes(poll_id)
+    
+    text = (
+        f"📋 ГОЛОСОВАНИЕ #{poll['id']}\n\n"
+        f"👤 Кандидат: {poll['candidate_nick']}\n"
+        f"📝 Описание: {poll['description']}\n"
+        f"📎 Дополнения:{poll['additions'] or ' нет'}\n\n"
+        f"📊 Да: {poll['yes_count']} | Нет: {poll['no_count']} | Воздерж: {poll['abstain_count']}\n"
+        f"📅 Создано: {poll['created_at']}\n"
+        f"👮 Создал: {poll['creator_nick']}\n"
+        f"Статус: {'🟢 Активно' if poll['status'] == 'active' else '🔴 Закрыто'}\n\n"
+    )
+    
+    if votes:
+        text += "🗳 ГОЛОСА:\n\n"
+        for v in votes:
+            voter_data = get_user_data(v[2])
+            voter_nick = voter_data['nick'] if voter_data else f"User {v[2]}"
+            vote_emoji = "✅" if v[3] == 'yes' else ("❌" if v[3] == 'no' else "⚪")
+            text += f"{vote_emoji} {voter_nick}"
+            if v[4]:
+                text += f" — {v[4]}"
+            text += f"\n📅 {v[5]}\n\n"
+    
+    await update.message.reply_text(text)
+
+
+async def apoll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Закрытие голосования (спецдопуск или создатель)"""
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("❌ /apoll_close ID")
+        return
+    
+    try:
+        poll_id = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ Укажите ID.")
+        return
+    
+    poll = get_poll_by_id(poll_id)
+    if not poll:
+        await update.message.reply_text("❌ Голосование не найдено.")
+        return
+    
+    if poll['creator_id'] != user_id and not has_special_access(user_id):
+        await update.message.reply_text("❌ Только создатель или спецдопуск.")
+        return
+    
+    close_poll(poll_id)
+    
+    result_text = (
+        f"📋 ГОЛОСОВАНИЕ #{poll_id} ЗАКРЫТО\n\n"
+        f"👤 Кандидат: {poll['candidate_nick']}\n"
+        f"📊 Итог: Да: {poll['yes_count']} | Нет: {poll['no_count']} | Воздерж: {poll['abstain_count']}"
+    )
+    
+    try:
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=result_text, message_thread_id=VERDICT_TOPIC_ID)
+    except:
+        await update.effective_chat.send_message(result_text)
+    
+    await update.message.reply_text("✅ Голосование закрыто.")
+
+
+async def apolls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список активных голосований"""
+    polls = get_active_polls()
+    if polls:
+        text = "📋 АКТИВНЫЕ ГОЛОСОВАНИЯ:\n\n"
+        for p in polls:
+            text += f"#{p[0]} | 👤 {p[1]} | ✅{p[7]} ❌{p[8]} ⚪{p[9]} | {p[10]}\n"
+        await update.message.reply_text(text)
+    else:
+        await update.message.reply_text("Нет активных голосований.")
+
+
+
+
+
 
 # ============ ОБРАБОТЧИК КНОПОК ============
 
@@ -2742,7 +3142,8 @@ def main():
         'asetnick': asetnick, 'aglobal_unban': aglobal_unban, 'asetallrank': asetallrank,
         'areport_info': areport_info, 'aspeciallist': aspeciallist,
         'adepartment': adepartment, 'asetalldept': asetalldept,
-        'atest': atest, 'find': find
+        'atest': atest, 'find': find, 
+        'apoll_create': apoll_create, 'avote': avote, 'aadd': aadd, 'apoll_info': apoll_info, 'apoll_close': apoll_close, 'apolls': apolls,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
