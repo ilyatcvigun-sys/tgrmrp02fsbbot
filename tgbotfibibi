@@ -2681,13 +2681,13 @@ async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Chat ID: {update.effective_chat.id}\nChat type: {update.effective_chat.type}")
 # ============= ГОЛОСОВАНИЕ ТЕСТ ТЕСТ ==============
 
-# ============ СИСТЕМА ГОЛОСОВАНИЙ ============
+
 
 # Добавьте в init_database():
 def init_database():
     # ... все существующие таблицы ...
     
-    cursor.execute('''
+    c.execute('''
         CREATE TABLE IF NOT EXISTS polls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             candidate_nick TEXT NOT NULL,
@@ -2704,7 +2704,7 @@ def init_database():
         )
     ''')
     
-    cursor.execute('''
+    c.execute('''
         CREATE TABLE IF NOT EXISTS poll_votes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             poll_id INTEGER NOT NULL,
