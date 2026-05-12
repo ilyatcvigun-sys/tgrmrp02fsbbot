@@ -2710,7 +2710,7 @@ async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Chat ID: {update.effective_chat.id}\nChat type: {update.effective_chat.type}")
 # ============= ГОЛОСОВАНИЕ ТЕСТ ТЕСТ ==============
 
-
+POLL_TOPIC_ID = 10677
 # ============ СИСТЕМА ГОЛОСОВАНИЙ (ПОЛНАЯ) ============
 
 # В init_database() добавьте:
