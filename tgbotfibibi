@@ -286,6 +286,35 @@ def init_database():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL
     )''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_nick TEXT NOT NULL,
+            description TEXT NOT NULL,
+            additions TEXT DEFAULT '',
+            creator_id INTEGER NOT NULL,
+            creator_nick TEXT,
+            status TEXT DEFAULT 'active',
+            yes_count INTEGER DEFAULT 0,
+            no_count INTEGER DEFAULT 0,
+            abstain_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT '',
+            closed_at TEXT DEFAULT ''
+        )
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS poll_votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poll_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            vote TEXT NOT NULL,
+            reason TEXT DEFAULT '',
+            voted_at TEXT DEFAULT '',
+            UNIQUE(poll_id, user_id)
+        )
+    ''')
     
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
@@ -2683,38 +2712,7 @@ async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# Добавьте в init_database():
-def init_database():
-    # ... все существующие таблицы ...
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS polls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            candidate_nick TEXT NOT NULL,
-            description TEXT NOT NULL,
-            additions TEXT DEFAULT '',
-            creator_id INTEGER NOT NULL,
-            creator_nick TEXT,
-            status TEXT DEFAULT 'active',
-            yes_count INTEGER DEFAULT 0,
-            no_count INTEGER DEFAULT 0,
-            abstain_count INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT '',
-            closed_at TEXT DEFAULT ''
-        )
-    ''')
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS poll_votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            poll_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            vote TEXT NOT NULL,
-            reason TEXT DEFAULT '',
-            voted_at TEXT DEFAULT '',
-            UNIQUE(poll_id, user_id)
-        )
-    ''')
+
 
 # ============ ФУНКЦИИ ДЛЯ ГОЛОСОВАНИЙ ============
 
