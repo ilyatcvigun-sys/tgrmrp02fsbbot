@@ -102,61 +102,175 @@ def has_permission(user_id: int, action: str) -> bool:
     }
     return permissions.get(action, False)
 
-async def resolve_tg_username(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str) -> int:
-    """Поиск пользователя по Telegram @username через API"""
-    username = target.replace('@', '').strip()
-    try:
-        chat = await context.bot.get_chat(f"@{username}")
-        return chat.id
-    except Exception as e:
-        logger.error(f"TG resolve error for @{username}: {e}")
-    return None
-
-def find_user_in_db(username: str) -> int:
-    """Поиск в базе по нику или позывному"""
+def find_user_by_tg_username(username: str) -> int:
+    """Поиск по сохранённому в БД tg_username (без @, регистронезависимо)"""
+    username = username.lstrip('@').strip().lower()
+    if not username:
+        return None
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    try:
+        c.execute('SELECT user_id FROM users WHERE LOWER(tg_username) = ?', (username,))
+        r = c.fetchone()
+        return r[0] if r else None
+    except sqlite3.OperationalError:
+        # Колонки нет (старая БД) — игнор, перейдём к другим методам
+        return None
+    finally:
+        conn.close()
+
+def find_user_in_db(username: str) -> int:
+    """Поиск в базе по нику или позывному (точное совпадение, потом частичное)"""
+    username = username.strip()
+    if not username:
+        return None
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # 1) Точное совпадение
     c.execute('SELECT user_id FROM users WHERE game_nick = ? OR callsign = ?', (username, username))
     r = c.fetchone()
     if r:
         conn.close()
         return r[0]
-    c.execute('SELECT user_id FROM users WHERE game_nick LIKE ? OR callsign LIKE ?', (f'{username}%', f'{username}%'))
+    # 2) Частичное совпадение (по началу)
+    c.execute(
+        'SELECT user_id FROM users WHERE game_nick LIKE ? OR callsign LIKE ?',
+        (f'{username}%', f'{username}%')
+    )
     results = c.fetchall()
     conn.close()
     if len(results) == 1:
         return results[0][0]
     elif len(results) > 1:
-        return -1
+        return -1  # неоднозначно
     return None
+
+async def resolve_tg_username_api(context: ContextTypes.DEFAULT_TYPE, username: str) -> int:
+    """Поиск через Telegram API (работает только для публичных юзеров / тех, кто писал боту)"""
+    username = username.lstrip('@').strip()
+    if not username:
+        return None
+    try:
+        chat = await context.bot.get_chat(f"@{username}")
+        return chat.id
+    except Exception as e:
+        logger.info(f"TG API resolve failed for @{username}: {e}")
+    return None
+
+def update_tg_username(user_id: int, tg_username: str):
+    """Сохраняет/обновляет @username в БД (для будущего поиска по @)"""
+    if not tg_username:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute('UPDATE users SET tg_username = ? WHERE user_id = ?', (tg_username, user_id))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
+# ============ ОБРАТНАЯ СОВМЕСТИМОСТЬ ============
+# Старые функции extract_user_id и get_target_id оставлены, но внутри теперь
+# используется улучшенная логика поиска (через tg_username в БД).
 
 def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
-    """Извлечение ID: reply → число → @/ссылка → поиск в БД"""
+    """
+    Извлечение ID. Возвращает:
+      - int (user_id) — если нашли точно
+      - -1 — если найдено несколько кандидатов (нужно уточнить)
+      - "@username" — если строка похожа на @-форму и в БД не нашли (нужно через get_target_id → API)
+      - None — нет цели / пустой ввод
+    
+    Порядок:
+      1) reply → ID
+      2) числовой ID
+      3) @username / t.me/ → tg_username в БД → если нет, возвращаем "@name" (для API-резолва)
+      4) голое имя → tg_username в БД → ник/позывной в БД
+    """
+    # 1) Reply
     if update.message and update.message.reply_to_message:
         return update.message.reply_to_message.from_user.id
-    if text:
-        text = text.strip()
-        if text.isdigit():
-            return int(text)
-        username = text.replace('@', '').strip()
-        if 't.me/' in username:
-            username = username.split('t.me/')[-1].split()[0].strip()
-        if text.startswith('@') or 't.me/' in text:
-            return f"@{username}"
-        if username:
-            db_result = find_user_in_db(username)
-            if db_result is not None:
-                return db_result
-            return f"@{username}"
-    return None
+    
+    if not text:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    
+    # 2) Числовой ID (поддержка отрицательных не нужна для user_id, но не мешает)
+    if text.lstrip('-').isdigit():
+        return int(text)
+    
+    # Извлекаем имя
+    name = text
+    if 't.me/' in name:
+        name = name.split('t.me/')[-1].split('/')[0].split('?')[0].strip()
+    is_at_form = text.startswith('@') or 't.me/' in text
+    name = name.lstrip('@').strip()
+    if not name:
+        return None
+    
+    # 3) @-форма: сначала наша БД (tg_username), потом возвращаем маркер для API
+    if is_at_form:
+        db_id = find_user_by_tg_username(name)
+        if db_id:
+            return db_id
+        # Может быть, после @ написан игровой ник
+        nick_id = find_user_in_db(name)
+        if nick_id is not None and nick_id != -1:
+            return nick_id
+        # Не нашли локально — пусть попробует TG API
+        return f"@{name}"
+    
+    # 4) Голое имя: tg_username → ник/позывной
+    db_id = find_user_by_tg_username(name)
+    if db_id:
+        return db_id
+    return find_user_in_db(name)  # может вернуть int, -1 или None
 
 async def get_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE, target):
-    """Обрабатывает строку @username через TG API"""
+    """
+    Финальный резолв. Принимает:
+      - int → возвращает его же (включая -1 — это маркер "неоднозначно")
+      - "@username" → пытается через TG API
+      - что-то иное → None
+    """
     if isinstance(target, int):
         return target
     if isinstance(target, str) and target.startswith('@'):
-        return await resolve_tg_username(update, context, target)
+        return await resolve_tg_username_api(context, target)
     return None
+
+async def validate_target(update: Update, target_id) -> bool:
+    """
+    Проверяет результат extract_user_id/get_target_id и отвечает пользователю при ошибке.
+    Возвращает True если target_id валиден (можно работать дальше),
+    False если была отправлена ошибка (команда должна выйти).
+    """
+    if target_id is None:
+        await update.message.reply_text(
+            "❌ Пользователь не найден.\n"
+            "Укажите @username, ID, ник или позывной, либо ответьте на сообщение."
+        )
+        return False
+    if target_id == -1:
+        await update.message.reply_text(
+            "❌ Найдено несколько пользователей с похожим именем.\n"
+            "Уточните: используйте полный ник, числовой ID или @username."
+        )
+        return False
+    if isinstance(target_id, str):
+        # Сюда не должны попадать — значит TG API не нашёл и сохранилось @name
+        await update.message.reply_text(
+            "❌ Не удалось найти пользователя по @username.\n"
+            "Возможно, юзер ещё не писал ни боту, ни в группу. "
+            "Попросите его написать /start в личку боту, или ответьте на его сообщение."
+        )
+        return False
+    return True
 
 def find_users_by_nickname(nickname: str) -> list:
     conn = sqlite3.connect(DB_FILE)
@@ -245,7 +359,8 @@ def init_database():
         ban_date TEXT DEFAULT '',
         special_access TEXT DEFAULT 'Нет',
         bot_blocked TEXT DEFAULT 'Нет',
-        created_at TEXT DEFAULT ''
+        created_at TEXT DEFAULT '',
+        tg_username TEXT DEFAULT ''
     )''')
     
     # Таблица глобального бана
@@ -325,14 +440,23 @@ def init_database():
             except:
                 pass
     
-    # Добавляем колонки если их нет
+    # Добавляем колонки если их нет (для миграции старых БД)
     try:
         c.execute('ALTER TABLE users ADD COLUMN special_access TEXT DEFAULT "Нет"')
-    except:
+    except sqlite3.OperationalError:
         pass
     try:
         c.execute('ALTER TABLE users ADD COLUMN bot_blocked TEXT DEFAULT "Нет"')
-    except:
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN tg_username TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
+    # Индекс для быстрого поиска по tg_username
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(LOWER(tg_username))')
+    except sqlite3.OperationalError:
         pass
     
     conn.commit()
@@ -358,22 +482,37 @@ def generate_unique_token() -> str:
             conn.close()
             return token
 
-def add_user(user_id: int, game_nick: str, callsign: str, token: str = None) -> str:
+def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_username: str = "") -> str:
     """Добавление пользователя"""
     if not token:
         token = generate_unique_token()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at) 
-                     VALUES (?, ?, ?, ?, ?)''',
-                  (user_id, game_nick, callsign, token, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, tg_username) 
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (user_id, game_nick, callsign, token,
+                   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                   tg_username or ""))
         conn.commit()
         conn.close()
         return token
     except sqlite3.IntegrityError:
         conn.close()
         return None
+    except sqlite3.OperationalError:
+        # Старая БД без колонки tg_username — пробуем без неё
+        try:
+            c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at) 
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (user_id, game_nick, callsign, token,
+                       datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+            conn.close()
+            return token
+        except sqlite3.IntegrityError:
+            conn.close()
+            return None
 
 def set_user_token(user_id: int, new_token: str) -> tuple:
     """Установка нового жетона"""
@@ -390,29 +529,34 @@ def set_user_token(user_id: int, new_token: str) -> tuple:
     return ok, "Жетон обновлен" if ok else "Пользователь не найден"
 
 def get_user_data(user_id: int) -> dict:
-    """Получение данных пользователя"""
+    """Получение данных пользователя — устойчиво к порядку колонок."""
     conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
     conn.close()
-    if row:
-        return {
-            "user_id": row[1],
-            "nick": row[2],
-            "callsign": row[3],
-            "token": row[4],
-            "rank": row[5],
-            "department": row[6],
-            "warns": row[7],
-            "ban_status": row[8],
-            "ban_reason": row[9],
-            "ban_date": row[10],
-            "special_access": row[12] if len(row) > 12 else 'Нет',
-            "bot_blocked": row[13] if len(row) > 13 else 'Нет',
-            "reg_date": row[14] if len(row) > 14 else row[11]
-        }
-    return None
+    if not row:
+        return None
+    keys = row.keys()
+    def g(name, default=''):
+        return row[name] if name in keys else default
+    return {
+        "user_id": g('user_id'),
+        "nick": g('game_nick'),
+        "callsign": g('callsign'),
+        "token": g('token'),
+        "rank": g('rank', 0) or 0,
+        "department": g('department', 'Не назначен'),
+        "warns": g('warns', '0/0'),
+        "ban_status": g('ban_status', 'Нет'),
+        "ban_reason": g('ban_reason', ''),
+        "ban_date": g('ban_date', ''),
+        "special_access": g('special_access', 'Нет'),
+        "bot_blocked": g('bot_blocked', 'Нет'),
+        "reg_date": g('created_at', ''),
+        "tg_username": g('tg_username', ''),
+    }
 
 def update_user_rank(user_id: int, new_rank: int) -> bool:
     """Обновление ранга"""
@@ -876,15 +1020,17 @@ async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     token = context.args[0]
     conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute('SELECT * FROM users WHERE token = ?', (token,))
     row = c.fetchone()
     conn.close()
     
     if row:
+        rank = row['rank'] if 'rank' in row.keys() else 0
         await update.message.reply_text(
-            f"🎫 {token}\n🎮 {row[2]}\n📻 {row[3]}\n"
-            f"⭐ {RANKS.get(row[5], RANKS[0])['name']}\n📁 {row[6]}"
+            f"🎫 {token}\n🎮 {row['game_nick']}\n📻 {row['callsign']}\n"
+            f"⭐ {RANKS.get(rank, RANKS[0])['name']}\n📁 {row['department']}"
         )
     else:
         await update.message.reply_text("❌ Не найден.")
@@ -934,6 +1080,10 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if old_status in ['left', 'kicked'] and new_status in ['member', 'administrator']:
         user = chat_member_update.new_chat_member.user
         user_id = user.id
+        
+        # Сохраняем @username нового участника (если есть) — пригодится для команд через @
+        if user.username:
+            update_tg_username(user_id, user.username)
         
         # Проверка гбана
         gban = check_gban(user_id)
@@ -1230,8 +1380,8 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if target_id == -1:
-        username = context.args[0].replace('@', '')
-        users = find_users_by_nickname(username)
+        username = (context.args[0] if context.args else '').replace('@', '')
+        users = find_users_by_nickname(username) if username else []
         text = "🔍 Найдено несколько:\n\n"
         for u in users:
             text += f"🆔 {u[0]} | {u[1]} | {u[2]}\n"
@@ -1781,37 +1931,55 @@ async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Ник изменён!\n🎮 {old_nick} → {new_nick}")
 
 async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Регистрация пользователя (6+ ранг)"""
+    """Регистрация пользователя (6+ ранг). 
+    Использование:
+      /aregister @user Ник Позывной
+      reply на сообщение + /aregister Ник Позывной
+    """
     user_id = update.effective_user.id
     if not has_permission(user_id, 'gban'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
-    target_id = extract_user_id(update, context)
-    if not target_id and context.args:
+    # Определяем, есть ли reply
+    is_reply = bool(update.message and update.message.reply_to_message)
+    
+    if is_reply:
+        target_id = update.message.reply_to_message.from_user.id
+        rest_args = list(context.args or [])
+    else:
+        if not context.args or len(context.args) < 3:
+            await update.message.reply_text("❌ /aregister @user Ник Позывной")
+            return
         target_id = extract_user_id(update, context, context.args[0])
-    if not target_id:
-        await update.message.reply_text("❌ /aregister @user Ник Позывной")
-        return
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if not await validate_target(update, target_id):
+            return
+        rest_args = list(context.args[1:])
     
-    if isinstance(target_id, str) and target_id.startswith('@'):
-        target_id = await get_target_id(update, context, target_id)
-    
-    if not target_id:
-        await update.message.reply_text("❌ Не найден.")
+    if len(rest_args) < 2:
+        await update.message.reply_text("❌ Укажите Ник и Позывной.\nПример: /aregister @user Ник Позывной")
         return
     
     if get_user_data(target_id):
         await update.message.reply_text("❌ Уже зарегистрирован.")
         return
     
-    if len(context.args) < 2:
-        await update.message.reply_text("❌ /aregister @user Ник Позывной")
-        return
+    game_nick = rest_args[0]
+    callsign = rest_args[1]
     
-    game_nick = context.args[0] if target_id else context.args[1]
-    callsign = context.args[1] if target_id else context.args[2]
-    token = add_user(target_id, game_nick, callsign)
+    # Подхватываем tg_username, если возможно
+    tg_uname = ""
+    try:
+        if is_reply and update.message.reply_to_message.from_user.username:
+            tg_uname = update.message.reply_to_message.from_user.username
+        elif not is_reply and context.args[0].startswith('@'):
+            tg_uname = context.args[0].lstrip('@')
+    except Exception:
+        pass
+    
+    token = add_user(target_id, game_nick, callsign, tg_username=tg_uname)
     
     if token:
         await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
@@ -1828,26 +1996,38 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     target_id = extract_user_id(update, context)
-    if not target_id and context.args:
+    is_reply = bool(update.message and update.message.reply_to_message)
+    
+    if is_reply:
+        rest_args = list(context.args or [])
+    else:
+        if not context.args:
+            await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+            return
         target_id = extract_user_id(update, context, context.args[0])
-    if not target_id:
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if not await validate_target(update, target_id):
+            return
+        rest_args = list(context.args[1:])
+    
+    if len(rest_args) < 3:
         await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
         return
     
-    if isinstance(target_id, str) and target_id.startswith('@'):
-        target_id = await get_target_id(update, context, target_id)
+    game_nick = rest_args[0]
+    callsign = rest_args[1]
+    token = rest_args[2]
     
-    if not target_id:
-        await update.message.reply_text("❌ Не найден.")
-        return
-    
-    if len(context.args) < 3:
-        await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
-        return
-    
-    game_nick = context.args[0] if target_id else context.args[1]
-    callsign = context.args[1] if target_id else context.args[2]
-    token = context.args[2] if target_id else context.args[3]
+    # Подхватываем tg_username
+    tg_uname = ""
+    try:
+        if is_reply and update.message.reply_to_message.from_user.username:
+            tg_uname = update.message.reply_to_message.from_user.username
+        elif not is_reply and context.args[0].startswith('@'):
+            tg_uname = context.args[0].lstrip('@')
+    except Exception:
+        pass
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -1855,7 +2035,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
-    new_token = add_user(target_id, game_nick, callsign, token)
+    new_token = add_user(target_id, game_nick, callsign, token, tg_username=tg_uname)
     if new_token:
         await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {new_token}")
     else:
@@ -2695,7 +2875,11 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     """Завершение регистрации"""
     callsign = update.message.text
     user_id = update.effective_user.id
-    token = add_user(user_id, context.user_data['game_nick'], callsign)
+    tg_username = update.effective_user.username or ""
+    token = add_user(user_id, context.user_data['game_nick'], callsign, tg_username=tg_username)
+    if not token:
+        await update.message.reply_text("❌ Ошибка регистрации. Попробуйте позже.")
+        return ConversationHandler.END
     await update.message.reply_text(
         f"✅ Готово!\n\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}"
     )
@@ -2711,42 +2895,7 @@ async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============= ГОЛОСОВАНИЕ ТЕСТ ТЕСТ ==============
 
 POLL_TOPIC_ID = 10677
-# ============ СИСТЕМА ГОЛОСОВАНИЙ (ПОЛНАЯ) ============
-
-# В init_database() добавьте:
-def init_database():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # ... все существующие таблицы ...
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS polls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            candidate_nick TEXT NOT NULL,
-            description TEXT NOT NULL,
-            additions TEXT DEFAULT '',
-            creator_id INTEGER NOT NULL,
-            creator_nick TEXT,
-            status TEXT DEFAULT 'active',
-            yes_count INTEGER DEFAULT 0,
-            no_count INTEGER DEFAULT 0,
-            abstain_count INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT '',
-            closed_at TEXT DEFAULT ''
-        )
-    ''')
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS poll_votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            poll_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            vote TEXT NOT NULL,
-            reason TEXT DEFAULT '',
-            voted_at TEXT DEFAULT '',
-            UNIQUE(poll_id, user_id)
-        )
-    ''')
+# ============ СИСТЕМА ГОЛОСОВАНИЙ ============
 
 # ============ ФУНКЦИИ ============
 
@@ -3070,9 +3219,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in handlers:
         return await handlers[text](update, context)
 
+async def track_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тихо сохраняет @username отправителя в БД при ЛЮБОМ апдейте.
+    Это позволяет потом резолвить @username локально, без запросов в Telegram API.
+    Хендлер регистрируется в group=-1 (выполняется первым) и НЕ блокирует обработку:
+    он не возвращает ничего, остальные хендлеры в group=0 и выше всё равно сработают.
+    """
+    try:
+        user = update.effective_user
+        if user and user.username and user.id:
+            update_tg_username(user.id, user.username)
+    except Exception as e:
+        logger.debug(f"track_username error: {e}")
+
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбор сообщений для анализа настроения"""
-    if update.effective_chat.id == CONFERENCE_CHAT_ID and update.message and update.message.text:
+    """Сбор сообщений из конференции для анализа настроения"""
+    if not update.message or not update.message.text:
+        return
+    if update.effective_chat.id == CONFERENCE_CHAT_ID:
         chat_messages.append(update.message.text)
         if len(chat_messages) > 100:
             chat_messages.pop(0)
@@ -3142,10 +3306,18 @@ def main():
     )
     application.add_handler(report_handler)
     
-    application.add_handler(ChatMemberHandler(welcome_new_member))
+    # КРИТИЧНО: сохраняем @username отправителя при ЛЮБОМ сообщении/команде/реплае.
+    # group=-1 → выполняется ПЕРЕД всеми остальными хендлерами и НЕ блокирует их.
+    application.add_handler(MessageHandler(filters.ALL, track_username), group=-1)
+    
+    # ChatMemberHandler.CHAT_MEMBER слушает изменения УЧАСТНИКОВ группы.
+    # По умолчанию (без указания) ловится только MY_CHAT_MEMBER — статус самого бота.
+    # Также нужно включить chat_member в allowed_updates у polling (см. ниже в run_polling).
+    application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(CallbackQueryHandler(handle_report_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
+    # Сбор сообщений для анализа настроения (только в конференции)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
     
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
@@ -3153,7 +3325,9 @@ def main():
     application.add_handler(CommandHandler('atestwelcome', atestwelcome))
     
     print("🤖 Бот запущен!")
-    application.run_polling()
+    # allowed_updates=Update.ALL_TYPES — чтобы получать chat_member события
+    # (по умолчанию Telegram их не присылает)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
