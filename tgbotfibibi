@@ -3,14 +3,39 @@ import logging
 import asyncio
 from datetime import datetime, timedelta, time
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop
 import sqlite3
 import os
 from pathlib import Path
 import openai
 import json
+import re
 
-os.environ['TZ'] = 'Europe/Moscow'
+# === Часовой пояс ===
+# os.environ['TZ'] без time.tzset() не действует, и в Docker системное время — UTC.
+# Поэтому работаем явно через zoneinfo: все datetime.now(MSK).
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    MSK = ZoneInfo("Europe/Moscow")
+except Exception:
+    # Фолбэк на pytz, если zoneinfo недоступен
+    try:
+        import pytz
+        MSK = pytz.timezone("Europe/Moscow")
+    except Exception:
+        # Последний фолбэк: фиксированный UTC+3 (без DST, но Москва и так UTC+3 круглый год)
+        from datetime import timezone
+        MSK = timezone(timedelta(hours=3), name="MSK")
+
+
+def now_msk() -> datetime:
+    """Текущее время в МСК (timezone-aware)."""
+    return datetime.now(MSK)
+
+
+def now_msk_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Текущее время в МСК, отформатированное строкой."""
+    return now_msk().strftime(fmt)
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,6 +59,26 @@ VERDICT_TOPIC_ID = 40224
 CONFERENCE_CHAT_ID = -1003389197905
 
 chat_messages = []
+
+# Множество user_id, отключённых от бота. Заполняется при старте и
+# обновляется командами /ablock и /aunblock. Используется в gate-хэндлере,
+# чтобы не дёргать SQLite на каждое сообщение.
+blocked_users: set = set()
+
+
+def reload_blocked_users():
+    """Перечитать список заблокированных из БД в память."""
+    global blocked_users
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM users WHERE bot_blocked = "Да"')
+        blocked_users = {r[0] for r in c.fetchall()}
+        conn.close()
+        logger.info(f"Loaded {len(blocked_users)} blocked users into memory.")
+    except Exception as e:
+        logger.error(f"reload_blocked_users error: {e}")
+        blocked_users = set()
 
 RANKS = {
     0: {"name": "👤 Гость"},
@@ -317,8 +362,8 @@ async def notify_user(context: ContextTypes.DEFAULT_TYPE, target_id: int, text: 
         return
     try:
         await context.bot.send_message(chat_id=target_id, text=text)
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"notify_user failed for {target_id}: {e}")
 
 # ============ БАЗА ДАННЫХ ============
 
@@ -492,7 +537,7 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
         c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, tg_username) 
                      VALUES (?, ?, ?, ?, ?, ?)''',
                   (user_id, game_nick, callsign, token,
-                   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                   now_msk_str("%Y-%m-%d %H:%M:%S"),
                    tg_username or ""))
         conn.commit()
         conn.close()
@@ -506,7 +551,7 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
             c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at) 
                          VALUES (?, ?, ?, ?, ?)''',
                       (user_id, game_nick, callsign, token,
-                       datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                       now_msk_str("%Y-%m-%d %H:%M:%S")))
             conn.commit()
             conn.close()
             return token
@@ -612,7 +657,7 @@ def add_warning(user_id: int, issuer_id: int, reason: str) -> tuple:
     c.execute('''INSERT INTO warnings (user_id, nick, warn_type, counter, reason, date, issued_by) 
                  VALUES (?, ?, ?, ?, ?, ?, ?)''',
               (user_id, user_nick, warn_type, new_warns, reason,
-               datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issuer_id))
+               now_msk_str("%Y-%m-%d %H:%M:%S"), issuer_id))
     conn.commit()
     conn.close()
     return True, f"Выдано {warn_type.lower()} предупреждение ({new_warns})", kicked
@@ -625,7 +670,7 @@ def add_gban(user_id: int, reason: str, banned_by: int) -> bool:
     nick = ud['nick'] if ud else f"User {user_id}"
     c.execute('''INSERT INTO gban (user_id, nick, reason, date, banned_by) 
                  VALUES (?, ?, ?, ?, ?)''',
-              (user_id, nick, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), banned_by))
+              (user_id, nick, reason, now_msk_str("%Y-%m-%d %H:%M:%S"), banned_by))
     conn.commit()
     conn.close()
     return True
@@ -691,7 +736,7 @@ def add_award(user_id: int, award_name: str, award_type: str, issued_by: int) ->
     c.execute('''INSERT INTO awards (user_id, nick, award_name, award_type, date, issued_by) 
                  VALUES (?, ?, ?, ?, ?, ?)''',
               (user_id, nick, award_name, award_type,
-               datetime.now().strftime("%Y-%m-%d %H:%M:%S"), issued_by))
+               now_msk_str("%Y-%m-%d %H:%M:%S"), issued_by))
     conn.commit()
     conn.close()
     return True
@@ -781,13 +826,18 @@ def has_special_access(user_id: int) -> bool:
     return row and row[0] == 'Да'
 
 def is_user_blocked(user_id: int) -> bool:
-    """Проверка блокировки от бота"""
+    """Проверка блокировки от бота. Сначала смотрим в кэш, потом в БД (на случай рассинхрона)."""
+    if user_id in blocked_users:
+        return True
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('SELECT bot_blocked FROM users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
     conn.close()
-    return row and row[0] == 'Да'
+    if row and row[0] == 'Да':
+        blocked_users.add(user_id)
+        return True
+    return False
 
 # ============ ЖАЛОБЫ ============
 
@@ -800,7 +850,7 @@ def save_report(reporter_id: int, reporter_nick: str, violator_nick: str,
                  violation, evidence, command, created_at) 
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
               (reporter_id, reporter_nick, violator_nick, faction, violation, evidence, command,
-               datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+               now_msk_str("%Y-%m-%d %H:%M:%S")))
     report_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -814,7 +864,7 @@ def update_report(report_id: int, status: str, moderator_id: int, verdict: str, 
                  SET status = ?, moderator_id = ?, verdict = ?, moderator_comment = ?, resolved_at = ? 
                  WHERE id = ?''',
               (status, moderator_id, verdict, comment,
-               datetime.now().strftime("%Y-%m-%d %H:%M:%S"), report_id))
+               now_msk_str("%Y-%m-%d %H:%M:%S"), report_id))
     conn.commit()
     conn.close()
 
@@ -865,31 +915,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([KeyboardButton("📋 Список участников")])
         
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text("🤖 Бот конференции\n\nВыберите действие:", reply_markup=reply_markup)
+        permissions = get_user_permissions(user_id)
+        await update.message.reply_text(
+            "🤖 БОТ КОНФЕРЕНЦИИ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👋 С возвращением, {user_data['callsign']}!\n"
+            f"⭐ {permissions['name']}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Выберите действие на клавиатуре ниже\n"
+            "или используйте /ahelp для списка команд.",
+            reply_markup=reply_markup,
+        )
     else:
         keyboard = [[KeyboardButton("📝 Регистрация")]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text("Добро пожаловать! Пройдите регистрацию:", reply_markup=reply_markup)
+        await update.message.reply_text(
+            "🤖 БОТ КОНФЕРЕНЦИИ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "👋 Добро пожаловать!\n"
+            "Чтобы начать пользоваться ботом — пройдите регистрацию.",
+            reply_markup=reply_markup,
+        )
 
 async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Информация о профиле"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     if not user_data:
-        await update.message.reply_text("❌ Не зарегистрированы.")
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return
     
     permissions = get_user_permissions(user_id)
-    special = "🔐 Спецдопуск: Да\n" if has_special_access(user_id) else ""
-    blocked = "🚫 Отключён от бота\n" if is_user_blocked(user_id) else ""
+    flags = []
+    if has_special_access(user_id):
+        flags.append("🔐 Спецдопуск")
+    if is_user_blocked(user_id):
+        flags.append("🚫 Отключён от бота")
+    flags_line = ("\n" + "\n".join(flags)) if flags else ""
     
     await update.message.reply_text(
-        f"🎮 Бот конференции\n\n"
-        f"👤 {user_data['callsign']}\n"
+        "🎮 БОТ КОНФЕРЕНЦИИ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n"
-        f"⭐️ {permissions['name']}\n"
-        f"📁 Отдел: {user_data['department']}\n"
-        f"{special}{blocked}"
+        f"⭐ Ранг: {permissions['name']}\n"
+        f"📁 Отдел: {user_data['department']}"
+        f"{flags_line}"
     )
 
 async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -897,59 +968,117 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
-    
-    text = "╔══════════════════════╗\n"
-    text += "║  📚 СПРАВКА КОМАНД   ║\n"
-    text += "╚══════════════════════╝\n\n"
-    
-    text += "🔹 ДЛЯ ВСЕХ:\n"
-    text += "├ /start\n├ /ainfo\n├ /ahelp\n├ /aprofile\n├ /astats\n├ /aawards\n"
-    text += "├ /anick\n├ /asearch\n├ /find\n├ /awarns\n├ /areport\n"
-    text += "├ /check_gban\n└ /amood\n\n"
-    
+
+    sections = []
+
+    sections.append(
+        "👥 ДЛЯ ВСЕХ\n"
+        "├ /start — главное меню\n"
+        "├ /ainfo — краткая информация о вас\n"
+        "├ /aprofile — полный профиль\n"
+        "├ /astats — статистика бота\n"
+        "├ /aawards — ваши награды\n"
+        "├ /anick <имя> — поиск по нику\n"
+        "├ /asearch <жетон> — поиск по жетону\n"
+        "├ /find — руководящий состав\n"
+        "├ /awarns — ваши предупреждения\n"
+        "├ /areport — подать жалобу\n"
+        "├ /check_gban — проверить ЧС\n"
+        "└ /amood — настроение конференции"
+    )
+
     if rank >= 4:
-        text += "🔹 ПОДПОЛКОВНИК (4+):\n├ /areports\n├ /areport_info\n└ /acallsign\n\n"
-    
+        sections.append(
+            "🎖 ПОДПОЛКОВНИК (4+)\n"
+            "├ /areports — список жалоб\n"
+            "├ /areport_info <id> — карточка жалобы\n"
+            "└ /acallsign — смена позывного"
+        )
+
     if rank >= 5:
-        text += "🔹 ПОЛКОВНИК (5+):\n├ /akick\n├ /aban\n├ /aunban\n├ /awarn\n"
-        text += "├ /aunwarn\n├ /aunwarnall\n├ /asetrank\n├ /asetdept\n"
-        text += "├ /ablock\n├ /aunblock\n├ /aadmins\n├ /auserlist\n"
-        text += "├ /awho\n├ /abroadcast\n├ /adepartment\n└ /asetalldept\n\n"
-    
+        sections.append(
+            "🛡 ПОЛКОВНИК (5+)\n"
+            "├ /akick <user> [причина]\n"
+            "├ /aban <user> [причина]\n"
+            "├ /aunban <user>\n"
+            "├ /awarn <user> <причина>\n"
+            "├ /aunwarn <user>\n"
+            "├ /aunwarnall <user>\n"
+            "├ /asetrank <user> <0-7>\n"
+            "├ /asetdept <user> <номер>\n"
+            "├ /ablock <user> — отключить от бота\n"
+            "├ /aunblock <user> — подключить к боту\n"
+            "├ /aadmins — список администрации\n"
+            "├ /auserlist — все участники\n"
+            "├ /awho <user> — чужой профиль\n"
+            "├ /abroadcast <текст> — рассылка\n"
+            "├ /adepartment add/remove/rename/list\n"
+            "└ /asetalldept <номер>"
+        )
+
     if rank >= 6:
-        text += "🔹 ГЕНЕРАЛ (6):\n├ /asettoken\n├ /aregister\n├ /aforcereg\n└ /achangelog\n\n"
-    
+        sections.append(
+            "🌟 ГЕНЕРАЛ (6)\n"
+            "├ /asettoken <user> <52****>\n"
+            "├ /aregister <user> <ник> <позывной>\n"
+            "├ /aforcereg <user> <ник> <позывной> <жетон>\n"
+            "└ /achangelog <текст>"
+        )
+
     if rank >= 7:
-        text += "🔹 СЛЕДЯЩИЙ ЗА ФСБ (7):\n├ /aspecial\n└ /aspeciallist\n\n"
-    
+        sections.append(
+            "⚜️ СЛЕДЯЩИЙ ЗА ФСБ (7)\n"
+            "├ /aspecial <user> — переключить спецдопуск\n"
+            "└ /aspeciallist — у кого спецдопуск"
+        )
+
     if has_special_access(user_id):
-        text += "🔐 СПЕЦДОПУСК:\n├ /awhois\n├ /asetnick\n├ /acheckall\n"
-        text += "├ /gban\n├ /ungban\n└ /gban_list\n\n"
-    
+        sections.append(
+            "🔐 СПЕЦДОПУСК\n"
+            "├ /awhois <id>\n"
+            "├ /asetnick <user> <ник>\n"
+            "├ /gban <user> <причина>\n"
+            "├ /ungban <user>\n"
+            "└ /gban_list"
+        )
+
     if is_main_admin(user_id):
-        text += "👑 РАЗРАБ:\n├ /asetadmin\n├ /aunsetadmin\n├ /aadminlist\n"
-        text += "├ /areset_user\n├ /adelete_user\n├ /abackup\n"
-        text += "├ /aglobal_unban\n└ /asetallrank\n"
-    
-    await update.message.reply_text(text)
+        sections.append(
+            "👑 РАЗРАБОТЧИК\n"
+            "├ /asetadmin <user>\n"
+            "├ /aunsetadmin <user>\n"
+            "├ /aadminlist\n"
+            "├ /areset_user <user>\n"
+            "├ /adelete_user <user>\n"
+            "├ /abackup\n"
+            "├ /aglobal_unban\n"
+            "└ /asetallrank <0-7>"
+        )
+
+    header = "📚 СПРАВКА ПО КОМАНДАМ\n━━━━━━━━━━━━━━━━━\n"
+    body = "\n\n".join(sections)
+    footer = "\n━━━━━━━━━━━━━━━━━\n💡 <user> — это @username, ID, ник, позывной или ответ на сообщение."
+    await update.message.reply_text(header + body + footer)
 
 async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подробный профиль"""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     if not user_data:
-        await update.message.reply_text("❌ Не зарегистрированы.")
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return
     
     permissions = get_user_permissions(user_id)
     await update.message.reply_text(
-        f"👤 ПРОФИЛЬ\n\n"
+        "👤 ВАШ ПРОФИЛЬ\n"
+        "━━━━━━━━━━━━━━━━━\n"
         f"🎮 Ник: {user_data['nick']}\n"
         f"📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n"
         f"⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['department']}\n"
         f"⚠️ Предупреждения: {user_data['warns']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
 
@@ -957,8 +1086,9 @@ async def astats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика"""
     stats = get_statistics()
     await update.message.reply_text(
-        f"📊 СТАТИСТИКА\n\n"
-        f"👥 Всего: {stats['total']}\n"
+        "📊 СТАТИСТИКА БОТА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👥 Всего пользователей: {stats['total']}\n"
         f"✅ Активных: {stats['active']}\n"
         f"🚫 Забанено: {stats['banned']}\n"
         f"🌟 Генералов: {stats['generals']}"
@@ -969,53 +1099,73 @@ async def aawards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     awards = get_user_awards(user_id)
     if awards:
-        text = "🏅 НАГРАДЫ:\n\n"
+        text = "🏅 ВАШИ НАГРАДЫ\n━━━━━━━━━━━━━━━━━\n"
         for a in awards:
-            text += f"• {a[0]} ({a[1]}) — {a[2]}\n"
+            text += f"• {a[0]} ({a[1]})\n   📅 {a[2]}\n"
         await update.message.reply_text(text)
     else:
-        await update.message.reply_text("❌ У вас пока нет наград.")
+        await update.message.reply_text(
+            "🏅 НАГРАДЫ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "У вас пока нет наград."
+        )
 
 async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по нику"""
     if not context.args:
-        await update.message.reply_text("❌ /anick имя")
+        await update.message.reply_text("❌ Использование: /anick <имя>")
         return
     
     nickname = ' '.join(context.args)
     users = find_users_by_nickname(nickname)
     
     if users:
-        text = f"🔍 Поиск: {nickname}\n\n"
+        text = f"🔍 ПОИСК: «{nickname}»\n━━━━━━━━━━━━━━━━━\n"
         for u in users[:20]:
-            text += f"🎮 {u[1]} | 📻 {u[2]}\n"
-            text += f"⭐ {RANKS.get(u[4], RANKS[0])['name']} | 📁 {u[5]}\n"
-            text += f"🆔 {u[0]}\n\n"
+            text += (
+                f"🎮 {u[1]} | 📻 {u[2]}\n"
+                f"⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
+                f"📁 {u[5]}\n"
+                f"🆔 {u[0]}\n"
+                "─────────────────\n"
+            )
+        if len(users) > 20:
+            text += f"\n…и ещё {len(users) - 20}. Уточните запрос."
         await update.message.reply_text(text)
     else:
-        await update.message.reply_text("❌ Ничего не найдено.")
+        await update.message.reply_text(
+            f"🔍 ПОИСК: «{nickname}»\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "❌ Ничего не найдено."
+        )
 
 async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список участников (5+)"""
     if not has_permission(update.effective_user.id, 'manage_ranks'):
-        await update.message.reply_text("❌ С 5 ранга.")
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
     users = get_all_users_list()
-    if users:
-        text = "📋 СПИСОК УЧАСТНИКОВ:\n\n"
-        for u in users[:50]:
-            text += f"🎮 {u[1]} | 📻 {u[2]}\n"
-            text += f"🎫 {u[3]} | ⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
-            text += f"🆔 {u[0]} | 📁 {u[5]}\n\n"
-        await update.message.reply_text(text)
-    else:
-        await update.message.reply_text("Список пуст.")
+    if not users:
+        await update.message.reply_text("📋 Список пуст.")
+        return
+    
+    text = f"📋 СПИСОК УЧАСТНИКОВ ({len(users)})\n━━━━━━━━━━━━━━━━━\n"
+    for u in users[:50]:
+        text += (
+            f"🎮 {u[1]} | 📻 {u[2]}\n"
+            f"🎫 {u[3]} | ⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
+            f"🆔 {u[0]} | 📁 {u[5]}\n"
+            "─────────────────\n"
+        )
+    if len(users) > 50:
+        text += f"\n…и ещё {len(users) - 50}."
+    await update.message.reply_text(text)
 
 async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по жетону"""
     if not context.args:
-        await update.message.reply_text("❌ /asearch 52****")
+        await update.message.reply_text("❌ Использование: /asearch 52****")
         return
     
     token = context.args[0]
@@ -1029,11 +1179,15 @@ async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         rank = row['rank'] if 'rank' in row.keys() else 0
         await update.message.reply_text(
-            f"🎫 {token}\n🎮 {row['game_nick']}\n📻 {row['callsign']}\n"
-            f"⭐ {RANKS.get(rank, RANKS[0])['name']}\n📁 {row['department']}"
+            f"🎫 ЖЕТОН {token}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"🎮 Ник: {row['game_nick']}\n"
+            f"📻 Позывной: {row['callsign']}\n"
+            f"⭐ Ранг: {RANKS.get(rank, RANKS[0])['name']}\n"
+            f"📁 Отдел: {row['department']}"
         )
     else:
-        await update.message.reply_text("❌ Не найден.")
+        await update.message.reply_text(f"❌ Жетон {token} не найден.")
 
 async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка ЧС"""
@@ -1049,10 +1203,10 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         target_id = await get_target_id(update, context, target_id)
     
     if not target_id:
-        await update.message.reply_text("❌ Не удалось найти.")
+        await update.message.reply_text("❌ Пользователь не найден.")
         return
     if target_id == -1:
-        await update.message.reply_text("❌ Уточните ID.")
+        await update.message.reply_text("❌ Уточните: несколько совпадений по нику.")
         return
     
     result = check_gban(target_id)
@@ -1060,14 +1214,25 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if has_permission(checker_id, 'warn') or has_special_access(checker_id):
             admin_nick = get_admin_nick(result['banned_by'])
             await update.message.reply_text(
-                f"🚫 В ЧС\n👤 {result['nick']}\n"
-                f"📝 {result['reason']}\n📅 {result['date']}\n"
+                "🚫 НАЙДЕН В ЧС\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {result['nick']}\n"
+                f"📝 Причина: {result['reason']}\n"
+                f"📅 Дата: {result['date']}\n"
                 f"👮 Выдал: {admin_nick}"
             )
         else:
-            await update.message.reply_text(f"🚫 Пользователь в ЧС\n👤 {result['nick']}")
+            await update.message.reply_text(
+                "🚫 НАЙДЕН В ЧС\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {result['nick']}"
+            )
     else:
-        await update.message.reply_text("✅ Не в ЧС.")
+        await update.message.reply_text(
+            "✅ ПРОВЕРКА ЧС\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Пользователь не в чёрном списке."
+        )
 
 # ============ ПРИВЕТСТВИЕ ============
 
@@ -1591,152 +1756,343 @@ async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ БЛОКИРОВКА ОТ БОТА ============
 
-async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отключение от бота"""
-    user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn'):
-        await update.message.reply_text("❌ С 5 ранга.")
-        return
-    
+async def _resolve_target_for_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, usage_hint: str):
+    """
+    Общая логика разрешения цели для админ-команд.
+    Возвращает int (user_id) либо None — в этом случае ответ уже отправлен пользователю.
+    """
     target_id = extract_user_id(update, context)
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
     if not target_id:
-        await update.message.reply_text("❌ /ablock @user")
-        return
-    
+        await update.message.reply_text(f"❌ Использование: {usage_hint}")
+        return None
+    if target_id == -1:
+        await update.message.reply_text(
+            "❌ Найдено несколько пользователей с похожим именем.\n"
+            "Уточните: полный ник, числовой ID или @username."
+        )
+        return None
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
-    
     if not target_id:
-        await update.message.reply_text("❌ Не удалось найти.")
+        await update.message.reply_text(
+            "❌ Пользователь не найден.\n"
+            "Возможно, он ещё не писал боту. Попросите его написать /start в ЛС либо ответьте на его сообщение."
+        )
+        return None
+    return target_id
+
+
+async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отключение пользователя от бота"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
-    
+
+    target_id = await _resolve_target_for_admin(update, context, "/ablock @user")
+    if not target_id:
+        return
+
+    # Защиты
+    if target_id == user_id:
+        await update.message.reply_text("❌ Нельзя отключить от бота самого себя.")
+        return
+    if is_main_admin(target_id):
+        await update.message.reply_text("❌ Главного админа отключить нельзя.")
+        return
+
     target_data = get_user_data(target_id)
     if not target_data:
-        await update.message.reply_text("❌ Пользователь не найден.")
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
         return
-    
+
+    # Не даём блочить тех, кто старше по рангу (кроме main-admin'ов)
+    issuer = get_user_data(user_id)
+    issuer_rank = issuer['rank'] if issuer else 0
+    if not is_main_admin(user_id) and target_data['rank'] >= issuer_rank:
+        await update.message.reply_text("❌ Нельзя отключить пользователя равного или выше ранга.")
+        return
+
+    if is_user_blocked(target_id):
+        await update.message.reply_text(f"ℹ️ {target_data['nick']} уже отключён от бота.")
+        return
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('UPDATE users SET bot_blocked = "Да" WHERE user_id = ?', (target_id,))
     conn.commit()
     conn.close()
-    
+    blocked_users.add(target_id)  # обновляем кэш — теперь gate сразу его отрежет
+
     issuer_name = get_admin_nick(user_id)
-    await update.message.reply_text(f"🚫 {target_data['nick']} отключён от бота!\n👮 Отключил: {issuer_name}")
-    await notify_user(context, target_id, f"🚫 Вы отключены от бота!\n👮 Отключил: {issuer_name}")
+    await update.message.reply_text(
+        "🚫 ОТКЛЮЧЕНИЕ ОТ БОТА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 Пользователь: {target_data['nick']}\n"
+        f"📻 Позывной: {target_data['callsign']}\n"
+        f"🆔 ID: {target_id}\n"
+        f"👮 Отключил: {issuer_name}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Бот больше не будет реагировать на его сообщения в ЛС."
+    )
+    # Пытаемся уведомить юзера ПОСЛЕДНИМ сообщением (после этого он уже отрезан)
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                "🚫 Вы отключены от бота.\n"
+                f"👮 Отключил: {issuer_name}\n\n"
+                "Бот больше не будет отвечать на ваши сообщения. "
+                "По вопросам обращайтесь к руководству."
+            ),
+        )
+    except Exception:
+        pass
+
 
 async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подключение к боту"""
+    """Подключение пользователя к боту"""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'warn'):
-        await update.message.reply_text("❌ С 5 ранга.")
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
-    
-    target_id = extract_user_id(update, context)
-    if not target_id and context.args:
-        target_id = extract_user_id(update, context, context.args[0])
+
+    target_id = await _resolve_target_for_admin(update, context, "/aunblock @user")
     if not target_id:
-        await update.message.reply_text("❌ /aunblock @user")
         return
-    
-    if isinstance(target_id, str) and target_id.startswith('@'):
-        target_id = await get_target_id(update, context, target_id)
-    
-    if not target_id:
-        await update.message.reply_text("❌ Не удалось найти.")
-        return
-    
+
     target_data = get_user_data(target_id)
     if not target_data:
-        await update.message.reply_text("❌ Пользователь не найден.")
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
         return
-    
+
+    if not is_user_blocked(target_id):
+        await update.message.reply_text(f"ℹ️ {target_data['nick']} и так подключён к боту.")
+        return
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('UPDATE users SET bot_blocked = "Нет" WHERE user_id = ?', (target_id,))
     conn.commit()
     conn.close()
-    
-    await update.message.reply_text(f"✅ {target_data['nick']} подключён к боту!")
+    blocked_users.discard(target_id)
+
+    issuer_name = get_admin_nick(user_id)
+    await update.message.reply_text(
+        "✅ ПОДКЛЮЧЕНИЕ К БОТУ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 Пользователь: {target_data['nick']}\n"
+        f"📻 Позывной: {target_data['callsign']}\n"
+        f"🆔 ID: {target_id}\n"
+        f"👮 Подключил: {issuer_name}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"✅ Вы снова подключены к боту.\n👮 Подключил: {issuer_name}",
+        )
+    except Exception:
+        pass
 
 # ============ AI АНАЛИЗ НАСТРОЕНИЯ ============
 
+def _extract_json_block(raw: str) -> dict:
+    """
+    Аккуратно вытаскиваем JSON из ответа модели.
+    Gemma и другие free-модели часто оборачивают JSON в ```json ... ```
+    либо добавляют текст до/после. Берём первую сбалансированную {...}.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    # Снимаем markdown-обёртку, если есть
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+    # Пытаемся распарсить как есть
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # Ищем первый сбалансированный JSON-объект
+    start = s.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(s)):
+        ch = s[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                candidate = s[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    return None
+    return None
+
+
+def _normalize_mood(parsed: dict) -> dict:
+    """Приводим результат от модели к единой схеме."""
+    if not isinstance(parsed, dict):
+        return {"mood_score": 0, "mood_label": "Не определено", "summary": ""}
+    # score
+    score = parsed.get("mood_score", parsed.get("score", 0))
+    try:
+        score = int(float(score))
+    except Exception:
+        score = 0
+    score = max(0, min(100, score))
+    # label
+    label = parsed.get("mood_label") or parsed.get("label") or parsed.get("mood") or "Не определено"
+    label = str(label).strip() or "Не определено"
+    # summary
+    summary = parsed.get("summary") or parsed.get("comment") or parsed.get("mood_text") or ""
+    summary = str(summary).strip()
+    return {"mood_score": score, "mood_label": label, "summary": summary}
+
+
+def _call_openrouter_sync(combined_text: str) -> str:
+    """Синхронный вызов OpenRouter. Запускается из to_thread, чтобы не блокировать loop."""
+    client = openai.OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        timeout=30.0,
+    )
+    completion = client.chat.completions.create(
+        model=OPENROUTER_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты — анализатор настроения русскоязычного чата. "
+                    "Прочитай сообщения и оцени общую атмосферу. "
+                    "Верни СТРОГО один JSON-объект без markdown, без пояснений, без префиксов. "
+                    "Формат: "
+                    '{"mood_score": <целое 0-100>, '
+                    '"mood_label": "Позитивное" | "Нейтральное" | "Негативное" | "Токсичное", '
+                    '"summary": "одно короткое предложение на русском о происходящем"}'
+                ),
+            },
+            {"role": "user", "content": f"Сообщения чата:\n{combined_text}"},
+        ],
+        temperature=0.3,
+        max_tokens=300,
+    )
+    return completion.choices[0].message.content or ""
+
+
 async def analyze_mood_with_ai(messages: list) -> dict:
-    """Анализ настроения через OpenRouter"""
+    """Анализ настроения через OpenRouter. Никогда не бросает, всегда возвращает нормализованный dict."""
     if not messages:
-        return {"mood_text": "Нет данных", "mood_score": 0}
-    
+        return {"mood_score": 0, "mood_label": "Нет данных", "summary": "Сообщений ещё не было."}
+
     combined_text = "\n".join(messages[-100:])
     if len(combined_text) < 10:
-        return {"mood_text": "Недостаточно данных", "mood_score": 0}
-    
+        return {"mood_score": 0, "mood_label": "Недостаточно данных", "summary": "Слишком мало сообщений для анализа."}
+
     try:
-        client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-        completion = client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты анализатор настроения русскоязычного чата. "
-                        "Проанализируй сообщения и верни ТОЛЬКО JSON в формате:\n"
-                        '{"mood_score": число 1-100, "mood_label": "Позитивное/Нейтральное/Негативное", '
-                        '"summary": "краткий вывод 1 предложение на русском"}'
-                    )
-                },
-                {"role": "user", "content": f"Оцени настроение чата:\n{combined_text}"}
-            ],
-            temperature=0.3,
-            max_tokens=150,
-        )
-        result = json.loads(completion.choices[0].message.content)
-        return result
+        # Уносим блокирующий SDK-вызов в тред, чтобы не вешать бота
+        raw = await asyncio.to_thread(_call_openrouter_sync, combined_text)
+        logger.info(f"AI mood raw response (first 200): {raw[:200]!r}")
+        parsed = _extract_json_block(raw)
+        if parsed is None:
+            logger.warning(f"AI mood: cannot parse JSON from response: {raw[:500]!r}")
+            return {"mood_score": 0, "mood_label": "Ошибка разбора", "summary": "Модель вернула ответ в неожиданном формате."}
+        return _normalize_mood(parsed)
     except Exception as e:
-        logger.error(f"AI mood error: {e}")
-        return {"mood_text": "Ошибка анализа", "mood_score": 0}
+        logger.error(f"AI mood error: {e}", exc_info=True)
+        return {"mood_score": 0, "mood_label": "Ошибка анализа", "summary": f"Не удалось обратиться к нейросети ({type(e).__name__})."}
+
+
+def _mood_emoji(score: int) -> str:
+    if score >= 75:
+        return "😄"
+    if score >= 55:
+        return "🙂"
+    if score >= 40:
+        return "😐"
+    if score >= 20:
+        return "😟"
+    return "😡"
+
+
+def _mood_bar(score: int, width: int = 10) -> str:
+    filled = max(0, min(width, round(score / 100 * width)))
+    return "█" * filled + "░" * (width - filled)
+
 
 async def amood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Настроение чата"""
     if not chat_messages:
-        await update.message.reply_text("Недостаточно данных.")
+        await update.message.reply_text(
+            "📊 НАСТРОЕНИЕ ЧАТА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "ℹ️ Пока недостаточно сообщений из конференции для анализа."
+        )
         return
-    
-    await update.message.reply_text("🤖 Анализирую настроение...")
+
+    waiting = await update.message.reply_text("🤖 Анализирую настроение, секунду...")
     analysis = await analyze_mood_with_ai(chat_messages)
-    
-    mood_score = analysis.get('mood_score', 0)
-    mood_label = analysis.get('mood_label', 'Не определено')
-    summary = analysis.get('summary', '')
-    
-    if mood_score > 70:
-        emoji = "😊"
-    elif mood_score > 40:
-        emoji = "😐"
-    else:
-        emoji = "😟"
-    
-    await update.message.reply_text(
-        f"{emoji} Настроение\n\n"
-        f"Основное: {mood_label} ({mood_score}%)\n"
-        f"📨 Сообщений: {len(chat_messages)}\n"
+
+    score = analysis["mood_score"]
+    label = analysis["mood_label"]
+    summary = analysis["summary"] or "—"
+    emoji = _mood_emoji(score)
+    bar = _mood_bar(score)
+
+    text = (
+        "📊 НАСТРОЕНИЕ ЧАТА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} Оценка: {label}\n"
+        f"📈 [{bar}] {score}/100\n"
+        f"💬 Сообщений в выборке: {len(chat_messages)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
         f"📝 {summary}"
     )
+    try:
+        await waiting.edit_text(text)
+    except Exception:
+        await update.message.reply_text(text)
+
 
 async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматический анализ настроения"""
-    if chat_messages and CONFERENCE_CHAT_ID:
-        analysis = await analyze_mood_with_ai(chat_messages)
-        mood_label = analysis.get('mood_label', 'Не определено')
-        mood_score = analysis.get('mood_score', 0)
-        try:
-            await context.bot.send_message(
-                chat_id=CONFERENCE_CHAT_ID,
-                text=f"📊 Настроение: {mood_label} ({mood_score}%)"
-            )
-        except:
-            pass
+    """Автоматический анализ настроения (раз в 6 часов)"""
+    if not chat_messages or not CONFERENCE_CHAT_ID:
+        return
+    if len(chat_messages) < 5:
+        # Не флудим, если в чате почти ничего нет
+        return
+
+    analysis = await analyze_mood_with_ai(chat_messages)
+    score = analysis["mood_score"]
+    label = analysis["mood_label"]
+    summary = analysis["summary"]
+
+    # Если получили ошибку — молча выходим, не шлём шум в конфу
+    if label in ("Ошибка анализа", "Ошибка разбора", "Нет данных", "Недостаточно данных"):
+        logger.info(f"auto_mood: skip broadcast, label={label}")
+        return
+
+    emoji = _mood_emoji(score)
+    bar = _mood_bar(score)
+    text = (
+        "📊 АВТОАНАЛИЗ НАСТРОЕНИЯ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} {label} — {score}/100\n"
+        f"📈 [{bar}]\n"
+        f"💬 По {len(chat_messages)} последним сообщениям"
+    )
+    if summary:
+        text += f"\n━━━━━━━━━━━━━━━━━\n📝 {summary}"
+
+    try:
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
+    except Exception as e:
+        logger.error(f"auto_mood send error: {e}")
 
 # ============ УПРАВЛЕНИЕ ДЕПАРТАМЕНТАМИ ============
 
@@ -1858,7 +2214,7 @@ async def asetalldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ ЕЖЕНЕДЕЛЬНАЯ ПРОВЕРКА РАНГОВ ============
 
 async def weekly_rank_check(context: ContextTypes.DEFAULT_TYPE):
-    """Еженедельная проверка рангов (воскресенье 11:00 МСК)"""
+    """Еженедельная проверка рангов (воскресенье 8:00 МСК)"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT user_id, game_nick, rank FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'")
@@ -2034,6 +2390,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute('DELETE FROM users WHERE user_id = ?', (target_id,))
     conn.commit()
     conn.close()
+    blocked_users.discard(target_id)
     
     new_token = add_user(target_id, game_nick, callsign, token, tg_username=tg_uname)
     if new_token:
@@ -2110,6 +2467,7 @@ async def adelete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute('DELETE FROM awards WHERE user_id = ?', (target_id,))
     conn.commit()
     conn.close()
+    blocked_users.discard(target_id)
     
     await update.message.reply_text(f"✅ {target_data['callsign']} удалён.")
 
@@ -2304,7 +2662,7 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     changes = ' '.join(context.args)
-    changelog_text = f"🔄 ОБНОВЛЕНИЕ БОТА\n\n📝 {changes}\n\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    changelog_text = f"🔄 ОБНОВЛЕНИЕ БОТА\n\n📝 {changes}\n\n📅 {now_msk_str('%Y-%m-%d %H:%M')}"
     
     try:
         await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=changelog_text)
@@ -2461,26 +2819,46 @@ async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список ЧС"""
     user_id = update.effective_user.id
     if not has_special_access(user_id):
-        await update.message.reply_text("❌ Недоступно.")
+        await update.message.reply_text("❌ Команда доступна только со спецдопуском.")
         return
     
     bans = get_gban_list()
-    if bans:
-        text = "🚫 ЧЁРНЫЙ СПИСОК:\n\n"
-        for b in bans[:20]:
-            text += f"🆔 {b[0]} | {b[1]}\n📝 {b[2]}\n📅 {b[3]}\n\n"
-        await update.message.reply_text(text)
-    else:
-        await update.message.reply_text("✅ ЧС пуст.")
+    if not bans:
+        await update.message.reply_text(
+            "🚫 ЧЁРНЫЙ СПИСОК\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "✅ Пусто."
+        )
+        return
+    text = f"🚫 ЧЁРНЫЙ СПИСОК ({len(bans)})\n━━━━━━━━━━━━━━━━━\n"
+    for b in bans[:20]:
+        text += (
+            f"👤 {b[1]}\n"
+            f"🆔 {b[0]}\n"
+            f"📝 {b[2]}\n"
+            f"📅 {b[3]}\n"
+            "─────────────────\n"
+        )
+    if len(bans) > 20:
+        text += f"\n…и ещё {len(bans) - 20}."
+    await update.message.reply_text(text)
 
 async def aadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список администрации"""
     admins = get_admins()
-    if admins:
-        text = "👥 АДМИНИСТРАЦИЯ:\n\n"
-        for a in admins:
-            text += f"👤 {a[2]} | {a[1]}\n⭐ {RANKS[a[4]]['name']}\n📁 {a[5]}\n🆔 {a[0]}\n\n"
-        await update.message.reply_text(text)
+    if not admins:
+        await update.message.reply_text("👥 Администрации пока нет.")
+        return
+    text = f"👥 АДМИНИСТРАЦИЯ ({len(admins)})\n━━━━━━━━━━━━━━━━━\n"
+    for a in admins:
+        text += (
+            f"👤 {a[2]} ({a[1]})\n"
+            f"⭐ {RANKS[a[4]]['name']}\n"
+            f"📁 {a[5]}\n"
+            f"🆔 {a[0]}\n"
+            "─────────────────\n"
+        )
+    await update.message.reply_text(text)
 
 async def asetadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Назначение администратора"""
@@ -2906,7 +3284,7 @@ def create_poll(candidate_nick: str, description: str, creator_id: int) -> int:
     creator_nick = creator_data['nick'] if creator_data else f"User {creator_id}"
     c.execute('''INSERT INTO polls (candidate_nick, description, creator_id, creator_nick, created_at)
                  VALUES (?, ?, ?, ?, ?)''',
-              (candidate_nick, description, creator_id, creator_nick, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+              (candidate_nick, description, creator_id, creator_nick, now_msk_str("%Y-%m-%d %H:%M:%S")))
     poll_id = c.lastrowid
     conn.commit(); conn.close()
     return poll_id
@@ -2933,7 +3311,7 @@ def vote_in_poll(poll_id: int, user_id: int, vote: str, reason: str = "") -> tup
     if not row or row[0] != 'active': conn.close(); return False, "Голосование неактивно."
     c.execute('''INSERT INTO poll_votes (poll_id, user_id, vote, reason, voted_at)
                  VALUES (?, ?, ?, ?, ?)''',
-              (poll_id, user_id, vote, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+              (poll_id, user_id, vote, reason, now_msk_str("%Y-%m-%d %H:%M:%S")))
     if vote == 'yes': c.execute('UPDATE polls SET yes_count = yes_count + 1 WHERE id = ?', (poll_id,))
     elif vote == 'no': c.execute('UPDATE polls SET no_count = no_count + 1 WHERE id = ?', (poll_id,))
     elif vote == 'abstain': c.execute('UPDATE polls SET abstain_count = abstain_count + 1 WHERE id = ?', (poll_id,))
@@ -2958,7 +3336,7 @@ def get_poll_by_id(poll_id: int) -> dict:
 def close_poll(poll_id: int) -> dict:
     conn = sqlite3.connect(DB_FILE); c = conn.cursor()
     c.execute('UPDATE polls SET status = "closed", closed_at = ? WHERE id = ?',
-              (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), poll_id))
+              (now_msk_str("%Y-%m-%d %H:%M:%S"), poll_id))
     c.execute('SELECT * FROM polls WHERE id = ?', (poll_id,)); row = c.fetchone()
     conn.commit(); conn.close()
     if row:
@@ -2999,7 +3377,7 @@ async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 Кандидат: {candidate_nick}\n"
         f"📝 {description}\n\n"
         f"👮 Создал: {creator_nick}\n"
-        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"📅 {now_msk_str('%Y-%m-%d %H:%M')}\n\n"
         f"Голосуйте в ЛС бота!"
     )
     try:
@@ -3219,6 +3597,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in handlers:
         return await handlers[text](update, context)
 
+async def block_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Gate: блокирует ВСЮ обработку апдейтов от юзеров, отключённых от бота (bot_blocked='Да'),
+    но только в личке. В группе мы продолжаем модерировать их штатно — это другая история.
+    Регистрируется в group=-2 (раньше всех остальных). Использует ApplicationHandlerStop,
+    чтобы прервать дальнейший пайплайн.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+    if chat.type != 'private':
+        return
+    if user.id in blocked_users:
+        # Молча игнорируем. Один раз можно отправить напоминание, но мы намеренно не шумим,
+        # чтобы не давать заблокированному способа триггерить ответ.
+        logger.info(f"block_gate: dropping update from blocked user {user.id}")
+        raise ApplicationHandlerStop
+
+
 async def track_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тихо сохраняет @username отправителя в БД при ЛЮБОМ апдейте.
     Это позволяет потом резолвить @username локально, без запросов в Telegram API.
@@ -3236,15 +3634,27 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сбор сообщений из конференции для анализа настроения"""
     if not update.message or not update.message.text:
         return
-    if update.effective_chat.id == CONFERENCE_CHAT_ID:
-        chat_messages.append(update.message.text)
-        if len(chat_messages) > 100:
-            chat_messages.pop(0)
+    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+        return
+    text = update.message.text.strip()
+    # Пропускаем команды бота — они шумят и портят анализ
+    if text.startswith('/'):
+        return
+    # Ограничиваем длину одного сообщения, чтобы один длинный пост не съел всю выборку
+    if len(text) > 500:
+        text = text[:500] + "…"
+    # Дедуп подряд идущих одинаковых
+    if chat_messages and chat_messages[-1] == text:
+        return
+    chat_messages.append(text)
+    if len(chat_messages) > 100:
+        chat_messages.pop(0)
 
 # ============ ЗАПУСК ============
 
 def main():
     init_database()
+    reload_blocked_users()
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Регистрация
@@ -3306,6 +3716,11 @@ def main():
     )
     application.add_handler(report_handler)
     
+    # КРИТИЧНО: gate отрезает заблокированных юзеров в ЛС ДО любой другой обработки.
+    # group=-2 → раньше track_username и всего остального.
+    application.add_handler(MessageHandler(filters.ALL, block_gate), group=-2)
+    application.add_handler(CallbackQueryHandler(block_gate, pattern='.*'), group=-2)
+
     # КРИТИЧНО: сохраняем @username отправителя при ЛЮБОМ сообщении/команде/реплае.
     # group=-1 → выполняется ПЕРЕД всеми остальными хендлерами и НЕ блокирует их.
     application.add_handler(MessageHandler(filters.ALL, track_username), group=-1)
@@ -3321,7 +3736,13 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
     
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
-    application.job_queue.run_daily(weekly_rank_check, time=time(hour=8, minute=0), days=(6,))
+    # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
+    # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
+    application.job_queue.run_daily(
+        weekly_rank_check,
+        time=time(hour=8, minute=0, tzinfo=MSK),
+        days=(6,),
+    )
     application.add_handler(CommandHandler('atestwelcome', atestwelcome))
     
     print("🤖 Бот запущен!")
