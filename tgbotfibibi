@@ -992,6 +992,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎖 ПОДПОЛКОВНИК (4+)\n"
             "├ /areports — список жалоб\n"
             "├ /areport_info <id> — карточка жалобы\n"
+            "├ /atag <user(s)> <текст> — тегнуть людей\n"
+            "├ /atagdept <номер> <текст> — тегнуть отдел\n"
             "└ /acallsign — смена позывного"
         )
 
@@ -2948,6 +2950,303 @@ async def abroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text)
 
+# ============ ТЕГИ И УПОМИНАНИЯ ============
+
+def _html_escape(s: str) -> str:
+    """Минимальный HTML-escape для безопасного использования parse_mode='HTML'."""
+    if not s:
+        return ""
+    return (
+        s.replace('&', '&amp;')
+         .replace('<', '&lt;')
+         .replace('>', '&gt;')
+    )
+
+
+def _looks_like_mention_token(token: str) -> bool:
+    """Похоже ли слово на ссылку на юзера: @x, t.me/x, или числовой ID."""
+    if not token:
+        return False
+    if token.startswith('@'):
+        return True
+    if 't.me/' in token:
+        return True
+    # Чисто числовой ID (положительный)
+    if token.lstrip('-').isdigit():
+        return True
+    return False
+
+
+def _format_mention_html(user_id: int) -> str:
+    """
+    Строит HTML-меншен для упоминания юзера в чате.
+    - Если у юзера в БД есть tg_username → "@username" (даёт реальный пинг)
+    - Иначе → <a href="tg://user?id=ID">callsign</a> (пинг для тех, у кого нет @, кликабелен)
+    """
+    ud = get_user_data(user_id)
+    if ud and ud.get('tg_username'):
+        return f"@{_html_escape(ud['tg_username'])}"
+    if ud:
+        name = ud.get('callsign') or ud.get('nick') or f"User {user_id}"
+    else:
+        name = f"User {user_id}"
+    return f'<a href="tg://user?id={user_id}">{_html_escape(name)}</a>'
+
+
+async def _resolve_mention_token(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str):
+    """
+    Разрешает одно "упоминание" в int user_id.
+    Возвращает (user_id, error_text). Если ok — error_text=None.
+    """
+    tid = extract_user_id(update, context, token)
+    if isinstance(tid, str) and tid.startswith('@'):
+        tid = await get_target_id(update, context, tid)
+    if tid is None:
+        return None, f"«{token}» — пользователь не найден."
+    if tid == -1:
+        return None, f"«{token}» — несколько совпадений по нику. Уточните @username или ID."
+    if not isinstance(tid, int) or tid <= 0:
+        return None, f"«{token}» — некорректная цель."
+    return tid, None
+
+
+async def _send_mention_dms(context: ContextTypes.DEFAULT_TYPE, user_ids, dm_text: str) -> tuple:
+    """Шлёт ЛС-уведомление каждому упомянутому. Уважает bot_blocked. Возвращает (delivered, failed)."""
+    delivered, failed = 0, 0
+    for tid in user_ids:
+        if is_user_blocked(tid):
+            continue
+        try:
+            await context.bot.send_message(chat_id=tid, text=dm_text)
+            delivered += 1
+        except Exception as e:
+            logger.debug(f"DM to {tid} failed: {e}")
+            failed += 1
+        # Лёгкий троттлинг чтобы не упереться в флуд-лимит Telegram
+        await asyncio.sleep(0.05)
+    return delivered, failed
+
+
+async def atag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Тегнуть одного или нескольких пользователей и написать им.
+    
+    Использование:
+      /atag @user1 @user2 ... <текст>
+      /atag 123456 @user2 <текст>
+      (ответом на сообщение) /atag <текст>           — тегается автор реплая
+      (ответом на сообщение) /atag @user2 <текст>    — тегается автор реплая + указанные
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'search'):
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
+        return
+    
+    args = list(context.args or [])
+    targets = []  # сохраняем порядок без дубликатов
+    seen = set()
+    
+    # 1) Цель из reply
+    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
+        rid = update.message.reply_to_message.from_user.id
+        if rid not in seen:
+            targets.append(rid)
+            seen.add(rid)
+    
+    # 2) Лидирующие токены, похожие на упоминания
+    i = 0
+    while i < len(args) and _looks_like_mention_token(args[i]):
+        tid, err = await _resolve_mention_token(update, context, args[i])
+        if err:
+            await update.message.reply_text(f"❌ {err}")
+            return
+        if tid not in seen:
+            targets.append(tid)
+            seen.add(tid)
+        i += 1
+    
+    message_text = ' '.join(args[i:]).strip()
+    
+    if not targets:
+        await update.message.reply_text(
+            "📣 ТЕГ ПОЛЬЗОВАТЕЛЕЙ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Использование:\n"
+            "• /atag @user1 @user2 ... <текст>\n"
+            "• Ответом на сообщение: /atag <текст>\n\n"
+            "Цели можно указать через @username, числовой ID или ответ."
+        )
+        return
+    if not message_text:
+        await update.message.reply_text("❌ Укажите текст сообщения после упоминаний.")
+        return
+    
+    issuer_name = get_admin_nick(user_id)
+    mentions_html = " ".join(_format_mention_html(t) for t in targets)
+    safe_msg = _html_escape(message_text)
+    
+    chat_text = (
+        f"📣 СООБЩЕНИЕ ОТ <b>{_html_escape(issuer_name)}</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👥 {mentions_html}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{safe_msg}"
+    )
+    
+    # Куда публиковать: в группу, откуда вызвали; из ЛС — в конференцию
+    out_chat = update.effective_chat.id
+    going_to_conf = False
+    if update.effective_chat.type == 'private':
+        out_chat = CONFERENCE_CHAT_ID
+        going_to_conf = True
+    
+    try:
+        await context.bot.send_message(
+            chat_id=out_chat,
+            text=chat_text,
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"atag send error: {e}")
+        await update.message.reply_text(f"❌ Не удалось отправить в чат: {e}")
+        return
+    
+    # ЛС каждому упомянутому
+    dm_text = (
+        "📣 Вас упомянули в конференции\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👮 От: {issuer_name}\n"
+        f"💬 {message_text}"
+    )
+    delivered, failed = await _send_mention_dms(context, targets, dm_text)
+    
+    if going_to_conf:
+        await update.message.reply_text(
+            "✅ ТЕГ ОТПРАВЛЕН\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👥 Упомянуто: {len(targets)}\n"
+            f"📤 Сообщение → конференция\n"
+            f"📨 В ЛС доставлено: {delivered}\n"
+            f"⛔ Не доставлено в ЛС: {failed}"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Тегнуто: {len(targets)} | 📨 ЛС: {delivered}/{delivered + failed}"
+        )
+
+
+async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Тегнуть всех участников отдела и написать им.
+    
+    Использование:
+      /atagdept <номер_отдела> <текст>
+      /atagdept                       — покажет список отделов с номерами
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'search'):
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
+        return
+    
+    depts = get_departments()
+    
+    if not context.args:
+        deps_list = "\n".join([f"{i + 1}. {d}" for i, d in enumerate(depts)])
+        await update.message.reply_text(
+            "📣 ТЕГ ОТДЕЛА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Использование: /atagdept <номер> <текст>\n\n"
+            f"📁 ОТДЕЛЫ:\n{deps_list}"
+        )
+        return
+    
+    try:
+        dept_num = int(context.args[0]) - 1
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ Первый аргумент должен быть номером отдела. /atagdept без аргументов покажет список.")
+        return
+    
+    if dept_num < 0 or dept_num >= len(depts):
+        await update.message.reply_text(f"❌ Неверный номер отдела. Допустимо: 1..{len(depts)}.")
+        return
+    
+    dept_name = depts[dept_num]
+    message_text = ' '.join(context.args[1:]).strip()
+    
+    if not message_text:
+        await update.message.reply_text(f"❌ Укажите текст сообщения после номера отдела.\n📁 Выбран отдел: {dept_name}")
+        return
+    
+    # Собираем всех участников отдела (кроме забаненных в группе)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'SELECT user_id FROM users WHERE department = ? AND ban_status = "Нет"',
+        (dept_name,),
+    )
+    members = [r[0] for r in c.fetchall()]
+    conn.close()
+    
+    if not members:
+        await update.message.reply_text(
+            f"📁 ОТДЕЛ «{dept_name}»\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "В отделе нет активных участников — некого тегать."
+        )
+        return
+    
+    issuer_name = get_admin_nick(user_id)
+    mentions_html = " ".join(_format_mention_html(t) for t in members)
+    safe_msg = _html_escape(message_text)
+    safe_dept = _html_escape(dept_name)
+    
+    chat_text = (
+        f"📣 СООБЩЕНИЕ ОТ <b>{_html_escape(issuer_name)}</b>\n"
+        f"📁 Отдел: <b>{safe_dept}</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👥 {mentions_html}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{safe_msg}"
+    )
+    
+    out_chat = update.effective_chat.id
+    going_to_conf = False
+    if update.effective_chat.type == 'private':
+        out_chat = CONFERENCE_CHAT_ID
+        going_to_conf = True
+    
+    try:
+        await context.bot.send_message(
+            chat_id=out_chat,
+            text=chat_text,
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"atagdept send error: {e}")
+        await update.message.reply_text(f"❌ Не удалось отправить в чат: {e}")
+        return
+    
+    dm_text = (
+        f"📣 Сообщение для отдела «{dept_name}»\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👮 От: {issuer_name}\n"
+        f"💬 {message_text}"
+    )
+    delivered, failed = await _send_mention_dms(context, members, dm_text)
+    
+    summary_chat = "конференция" if going_to_conf else "текущий чат"
+    await update.message.reply_text(
+        "✅ ТЕГ ОТДЕЛА ОТПРАВЛЕН\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📁 Отдел: {dept_name}\n"
+        f"👥 Участников: {len(members)}\n"
+        f"📤 Сообщение → {summary_chat}\n"
+        f"📨 В ЛС доставлено: {delivered}\n"
+        f"⛔ Не доставлено в ЛС: {failed}"
+    )
+
 # ============ ЖАЛОБЫ ============
 
 async def areport_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3686,6 +3985,7 @@ def main():
         'adepartment': adepartment, 'asetalldept': asetalldept,
         'atest': atest, 'find': find, 
         'apoll_create': apoll_create, 'avote': avote, 'aadd': aadd, 'apoll_info': apoll_info, 'apoll_close': apoll_close, 'apolls': apolls,
+        'atag': atag, 'atagdept': atagdept,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
