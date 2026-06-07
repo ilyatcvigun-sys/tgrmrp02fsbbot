@@ -126,10 +126,124 @@ def get_admin_nick(user_id: int) -> str:
     ud = get_user_data(user_id)
     return ud['nick'] if ud else str(user_id)
 
-def has_permission(user_id: int, action: str) -> bool:
+# ============ ИНДИВИДУАЛЬНЫЕ ГРАНТЫ НА КОМАНДЫ ============
+# Список команд, на которые в принципе можно выдавать гранты через /agrant.
+# Команды уровня "разработчик" (управление админами, удаление юзеров, бэкап БД,
+# спецдопуск, глобальный ЧС) сюда сознательно НЕ включены — это защита от эскалации прав.
+GRANTABLE_COMMANDS = {
+    # 4 ранг
+    'areport_info', 'acallsign', 'atag', 'atagdept',
+    # 5 ранг
+    'akick', 'aban', 'aunban',
+    'awarn', 'aunwarn', 'aunwarnall', 'awarns',
+    'asetrank', 'asetdept',
+    'ablock', 'aunblock',
+    'auserlist', 'awho', 'abroadcast',
+    'adepartment', 'asetalldept',
+    'atestwelcome',
+    # 6 ранг
+    'asettoken', 'aregister', 'aforcereg', 'achangelog',
+    # Прочее, что бывает полезно делегировать
+    'asetnick', 'aspeciallist',
+}
+
+
+def has_command_access(user_id: int, command_name: str) -> bool:
+    """Есть ли у юзера явный грант на конкретную команду."""
+    if not command_name:
+        return False
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute(
+            'SELECT 1 FROM command_grants WHERE user_id = ? AND command = ? LIMIT 1',
+            (user_id, command_name),
+        )
+        return c.fetchone() is not None
+    except sqlite3.OperationalError:
+        # Таблица ещё не создана (старая БД до миграции) — гранта нет
+        return False
+    finally:
+        conn.close()
+
+
+def grant_command_access(user_id: int, command_name: str, granted_by: int) -> bool:
+    """Выдать юзеру грант на команду. Возвращает True если добавили, False если уже был."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute(
+            'INSERT INTO command_grants (user_id, command, granted_by, granted_at) VALUES (?, ?, ?, ?)',
+            (user_id, command_name, granted_by, now_msk_str()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def revoke_command_access(user_id: int, command_name: str) -> bool:
+    """Отозвать грант. True если что-то реально удалили."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'DELETE FROM command_grants WHERE user_id = ? AND command = ?',
+        (user_id, command_name),
+    )
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def list_user_grants(user_id: int) -> list:
+    """Все команды, на которые есть грант у юзера. Возвращает список (command, granted_by, granted_at)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute(
+            'SELECT command, granted_by, granted_at FROM command_grants WHERE user_id = ? ORDER BY command',
+            (user_id,),
+        )
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return rows
+
+
+def list_command_grantees(command_name: str) -> list:
+    """Все юзеры, у кого есть грант на данную команду. Возвращает (user_id, granted_by, granted_at)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute(
+            'SELECT user_id, granted_by, granted_at FROM command_grants WHERE command = ? ORDER BY granted_at',
+            (command_name,),
+        )
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return rows
+
+
+def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
+    """
+    Проверка доступа. Порядок:
+      1) Главный админ — всегда да.
+      2) Спецдопуск — всегда да.
+      3) Явный грант на конкретную команду (если передан command_name) — да.
+      4) Ранг 7 — всегда да.
+      5) Иначе — проверка action по таблице прав.
+    """
     if is_main_admin(user_id):
         return True
     if has_special_access(user_id):
+        return True
+    if command_name and has_command_access(user_id, command_name):
         return True
     ud = get_user_data(user_id)
     if not ud:
@@ -475,6 +589,22 @@ def init_database():
             UNIQUE(poll_id, user_id)
         )
     ''')
+
+    # Индивидуальные гранты на команды.
+    # Позволяют дать юзеру доступ к конкретной команде в обход проверки ранга.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS command_grants (
+            user_id INTEGER NOT NULL,
+            command TEXT NOT NULL,
+            granted_by INTEGER,
+            granted_at TEXT DEFAULT '',
+            PRIMARY KEY (user_id, command)
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_grants_command ON command_grants(command)')
+    except sqlite3.OperationalError:
+        pass
     
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
@@ -984,6 +1114,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /awarns — ваши предупреждения\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
+        "├ /aperms — ваши индивидуальные доступы\n"
         "└ /amood — настроение конференции"
     )
 
@@ -1041,7 +1172,11 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "├ /asetnick <user> <ник>\n"
             "├ /gban <user> <причина>\n"
             "├ /ungban <user>\n"
-            "└ /gban_list"
+            "├ /gban_list\n"
+            "├ /agrant <user> <cmd> — выдать доступ\n"
+            "├ /arevoke <user> <cmd> — отозвать доступ\n"
+            "├ /agrantlist <cmd> — кому выдан доступ\n"
+            "└ /agrantcmds — список грантуемых команд"
         )
 
     if is_main_admin(user_id):
@@ -1054,7 +1189,11 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "├ /adelete_user <user>\n"
             "├ /abackup\n"
             "├ /aglobal_unban\n"
-            "└ /asetallrank <0-7>"
+            "├ /asetallrank <0-7>\n"
+            "├ /agrant <user> <cmd> [cmd2 ...]\n"
+            "├ /arevoke <user> <cmd> | all\n"
+            "├ /agrantlist <cmd>\n"
+            "└ /agrantcmds"
         )
 
     header = "📚 СПРАВКА ПО КОМАНДАМ\n━━━━━━━━━━━━━━━━━\n"
@@ -1143,7 +1282,7 @@ async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список участников (5+)"""
-    if not has_permission(update.effective_user.id, 'manage_ranks'):
+    if not has_permission(update.effective_user.id, 'manage_ranks', 'auserlist'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -1343,7 +1482,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тест приветствия"""
-    if not has_permission(update.effective_user.id, 'warn'):
+    if not has_permission(update.effective_user.id, 'warn', 'atestwelcome'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -1437,7 +1576,7 @@ async def send_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кик пользователя"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'kick'):
+    if not has_permission(user_id, 'kick', 'akick'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -1477,7 +1616,7 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Бан пользователя"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'ban'):
+    if not has_permission(user_id, 'ban', 'aban'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -1568,7 +1707,7 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача предупреждения"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn'):
+    if not has_permission(user_id, 'warn', 'awarn'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -1626,7 +1765,7 @@ async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось найти.")
         return
     
-    if target_id != user_id and not has_permission(user_id, 'warn'):
+    if target_id != user_id and not has_permission(user_id, 'warn', 'awarns'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -1646,7 +1785,7 @@ async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снятие одного предупреждения"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn'):
+    if not has_permission(user_id, 'warn', 'aunwarn'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -1716,7 +1855,7 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снятие всех предупреждений"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn'):
+    if not has_permission(user_id, 'warn', 'aunwarnall'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -1789,7 +1928,7 @@ async def _resolve_target_for_admin(update: Update, context: ContextTypes.DEFAUL
 async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отключение пользователя от бота"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn'):
+    if not has_permission(user_id, 'warn', 'ablock'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
 
@@ -1857,7 +1996,7 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подключение пользователя к боту"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn'):
+    if not has_permission(user_id, 'warn', 'aunblock'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
 
@@ -2101,7 +2240,7 @@ async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
 async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление отделами: add/remove/rename/list"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks'):
+    if not has_permission(user_id, 'manage_ranks', 'adepartment'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2183,7 +2322,7 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asetalldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Назначить департамент всем"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks'):
+    if not has_permission(user_id, 'manage_ranks', 'asetalldept'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2295,7 +2434,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
       reply на сообщение + /aregister Ник Позывной
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban'):
+    if not has_permission(user_id, 'gban', 'aregister'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -2349,7 +2488,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Принудительная регистрация с жетоном (6+ ранг)"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban'):
+    if not has_permission(user_id, 'gban', 'aforcereg'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -2519,7 +2658,7 @@ async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Информация о жалобе"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search'):
+    if not has_permission(user_id, 'search', 'areport_info'):
         await update.message.reply_text("❌ С 4 ранга.")
         return
     
@@ -2546,7 +2685,7 @@ async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aspeciallist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список со спецдопуском"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban'):
+    if not has_permission(user_id, 'gban', 'aspeciallist'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -2613,7 +2752,7 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Профиль другого пользователя"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks'):
+    if not has_permission(user_id, 'manage_ranks', 'awho'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2655,7 +2794,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправка changelog в конференцию"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban'):
+    if not has_permission(user_id, 'gban', 'achangelog'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -2675,7 +2814,7 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача жетона"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban'):
+    if not has_permission(user_id, 'gban', 'asettoken'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -2708,7 +2847,7 @@ async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Установка ранга"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks'):
+    if not has_permission(user_id, 'manage_ranks', 'asetrank'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2741,7 +2880,7 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Назначение отдела"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks'):
+    if not has_permission(user_id, 'manage_ranks', 'asetdept'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2776,7 +2915,7 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Разбан"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'ban'):
+    if not has_permission(user_id, 'ban', 'aunban'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2915,7 +3054,7 @@ async def aunsetadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def abroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Рассылка всем"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn'):
+    if not has_permission(user_id, 'warn', 'abroadcast'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -3038,7 +3177,7 @@ async def atag(update: Update, context: ContextTypes.DEFAULT_TYPE):
       (ответом на сообщение) /atag @user2 <текст>    — тегается автор реплая + указанные
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search'):
+    if not has_permission(user_id, 'search', 'atag'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
@@ -3145,7 +3284,7 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /atagdept                       — покажет список отделов с номерами
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search'):
+    if not has_permission(user_id, 'search', 'atagdept'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
@@ -3246,6 +3385,312 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📨 В ЛС доставлено: {delivered}\n"
         f"⛔ Не доставлено в ЛС: {failed}"
     )
+
+# ============ ИНДИВИДУАЛЬНЫЕ ГРАНТЫ: КОМАНДЫ УПРАВЛЕНИЯ ============
+
+def _can_manage_grants(user_id: int) -> bool:
+    """Кто может выдавать/отзывать гранты на команды.
+    Намеренно жёстко: только главный админ и юзеры со спецдопуском,
+    чтобы нельзя было через грант поднять чужие права."""
+    return is_main_admin(user_id) or has_special_access(user_id)
+
+
+async def agrant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Выдать пользователю индивидуальный доступ к команде(ам).
+    
+    Использование:
+      /agrant <user> <command> [command2 ...]
+      (ответом на сообщение) /agrant <command> [command2 ...]
+    
+    Примеры:
+      /agrant @ivan atag atagdept
+      /agrant 123456789 awarn
+    """
+    user_id = update.effective_user.id
+    if not _can_manage_grants(user_id):
+        await update.message.reply_text("❌ Управление грантами доступно только главному админу или со спецдопуском.")
+        return
+    
+    args = list(context.args or [])
+    is_reply = bool(update.message and update.message.reply_to_message)
+    
+    if is_reply:
+        target_id = update.message.reply_to_message.from_user.id
+        commands_to_grant = args
+    else:
+        if len(args) < 2:
+            await update.message.reply_text(
+                "📥 ВЫДАЧА ДОСТУПА К КОМАНДЕ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Использование:\n"
+                "• /agrant <user> <command> [command2 ...]\n"
+                "• Ответом на сообщение: /agrant <command> [...]\n\n"
+                "Список доступных для гранта команд — /agrantcmds"
+            )
+            return
+        target_id = extract_user_id(update, context, args[0])
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id is None:
+            await update.message.reply_text("❌ Пользователь не найден.")
+            return
+        if target_id == -1:
+            await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+            return
+        commands_to_grant = args[1:]
+    
+    if not commands_to_grant:
+        await update.message.reply_text("❌ Укажите хотя бы одну команду для выдачи доступа.")
+        return
+    
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+        return
+    
+    granted, already, invalid = [], [], []
+    for cmd in commands_to_grant:
+        cmd = cmd.lstrip('/').strip()
+        if cmd not in GRANTABLE_COMMANDS:
+            invalid.append(cmd)
+            continue
+        if grant_command_access(target_id, cmd, user_id):
+            granted.append(cmd)
+        else:
+            already.append(cmd)
+    
+    issuer_name = get_admin_nick(user_id)
+    parts = [
+        "✅ ВЫДАЧА ДОСТУПА",
+        "━━━━━━━━━━━━━━━━━",
+        f"👤 Кому: {target_data['nick']} (🆔 {target_id})",
+        f"👮 Выдал: {issuer_name}",
+    ]
+    if granted:
+        parts.append("\n📥 Выдано: " + ", ".join(f"/{c}" for c in granted))
+    if already:
+        parts.append("ℹ️ Уже было: " + ", ".join(f"/{c}" for c in already))
+    if invalid:
+        parts.append("❌ Нельзя выдать (нет в списке): " + ", ".join(f"/{c}" for c in invalid))
+    
+    await update.message.reply_text("\n".join(parts))
+    
+    if granted:
+        await notify_user(
+            context, target_id,
+            "🔑 Вам выданы индивидуальные доступы к командам:\n"
+            + "\n".join(f"• /{c}" for c in granted)
+            + f"\n\n👮 Выдал: {issuer_name}",
+        )
+
+
+async def arevoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отозвать у пользователя индивидуальный доступ к команде(ам).
+    
+    Использование:
+      /arevoke <user> <command> [command2 ...]
+      /arevoke <user> all                   — отозвать все гранты
+      (ответом на сообщение) /arevoke <command> | all
+    """
+    user_id = update.effective_user.id
+    if not _can_manage_grants(user_id):
+        await update.message.reply_text("❌ Управление грантами доступно только главному админу или со спецдопуском.")
+        return
+    
+    args = list(context.args or [])
+    is_reply = bool(update.message and update.message.reply_to_message)
+    
+    if is_reply:
+        target_id = update.message.reply_to_message.from_user.id
+        commands_to_revoke = args
+    else:
+        if len(args) < 2:
+            await update.message.reply_text(
+                "📤 ОТЗЫВ ДОСТУПА К КОМАНДЕ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Использование:\n"
+                "• /arevoke <user> <command> [command2 ...]\n"
+                "• /arevoke <user> all — забрать все гранты\n"
+                "• Ответом на сообщение: /arevoke <command>"
+            )
+            return
+        target_id = extract_user_id(update, context, args[0])
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id is None:
+            await update.message.reply_text("❌ Пользователь не найден.")
+            return
+        if target_id == -1:
+            await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+            return
+        commands_to_revoke = args[1:]
+    
+    if not commands_to_revoke:
+        await update.message.reply_text("❌ Укажите команду для отзыва (или 'all').")
+        return
+    
+    target_data = get_user_data(target_id)
+    target_name = target_data['nick'] if target_data else f"User {target_id}"
+    
+    # Обработка 'all'
+    if len(commands_to_revoke) == 1 and commands_to_revoke[0].lower() == 'all':
+        current = list_user_grants(target_id)
+        removed = []
+        for cmd, _, _ in current:
+            if revoke_command_access(target_id, cmd):
+                removed.append(cmd)
+        if not removed:
+            await update.message.reply_text(f"ℹ️ У {target_name} не было индивидуальных грантов.")
+            return
+        await update.message.reply_text(
+            "📤 ОТЗЫВ ВСЕХ ДОСТУПОВ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 У кого: {target_name} (🆔 {target_id})\n"
+            f"👮 Отозвал: {get_admin_nick(user_id)}\n"
+            f"📊 Удалено: {len(removed)}\n"
+            "\n• " + "\n• ".join(f"/{c}" for c in removed)
+        )
+        return
+    
+    revoked, missing = [], []
+    for cmd in commands_to_revoke:
+        cmd = cmd.lstrip('/').strip()
+        if revoke_command_access(target_id, cmd):
+            revoked.append(cmd)
+        else:
+            missing.append(cmd)
+    
+    parts = [
+        "📤 ОТЗЫВ ДОСТУПА",
+        "━━━━━━━━━━━━━━━━━",
+        f"👤 У кого: {target_name} (🆔 {target_id})",
+        f"👮 Отозвал: {get_admin_nick(user_id)}",
+    ]
+    if revoked:
+        parts.append("\n🗑 Отозвано: " + ", ".join(f"/{c}" for c in revoked))
+    if missing:
+        parts.append("ℹ️ Не было: " + ", ".join(f"/{c}" for c in missing))
+    
+    await update.message.reply_text("\n".join(parts))
+
+
+async def aperms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Посмотреть индивидуальные гранты пользователя.
+    
+    Использование:
+      /aperms                — свои гранты
+      /aperms <user>         — гранты указанного юзера (требует право управления грантами)
+      (ответом на сообщение) /aperms
+    """
+    user_id = update.effective_user.id
+    
+    target_id = None
+    if update.message and update.message.reply_to_message:
+        target_id = update.message.reply_to_message.from_user.id
+    elif context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id is None or target_id == -1:
+            await update.message.reply_text("❌ Пользователь не найден или несколько совпадений.")
+            return
+    
+    if target_id is None:
+        target_id = user_id
+    
+    # Чужие гранты — только тем, кто может управлять
+    if target_id != user_id and not _can_manage_grants(user_id):
+        await update.message.reply_text("❌ Чужие гранты могут смотреть только главный админ или со спецдопуском.")
+        return
+    
+    target_data = get_user_data(target_id)
+    target_name = target_data['nick'] if target_data else f"User {target_id}"
+    grants = list_user_grants(target_id)
+    
+    if not grants:
+        await update.message.reply_text(
+            "🔑 ИНДИВИДУАЛЬНЫЕ ДОСТУПЫ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 {target_name}\n"
+            "Индивидуальных грантов нет."
+        )
+        return
+    
+    lines = [
+        "🔑 ИНДИВИДУАЛЬНЫЕ ДОСТУПЫ",
+        "━━━━━━━━━━━━━━━━━",
+        f"👤 {target_name} (🆔 {target_id})",
+        f"📊 Всего: {len(grants)}",
+        "━━━━━━━━━━━━━━━━━",
+    ]
+    for cmd, granted_by, granted_at in grants:
+        by_name = get_admin_nick(granted_by) if granted_by else "—"
+        lines.append(f"• /{cmd}\n   👮 {by_name} | 📅 {granted_at or '—'}")
+    
+    await update.message.reply_text("\n".join(lines))
+
+
+async def agrantlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Посмотреть, кому выдан индивидуальный доступ к данной команде.
+    
+    Использование: /agrantlist <command>
+    """
+    user_id = update.effective_user.id
+    if not _can_manage_grants(user_id):
+        await update.message.reply_text("❌ Доступно только главному админу или со спецдопуском.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /agrantlist <command>")
+        return
+    
+    cmd = context.args[0].lstrip('/').strip()
+    grantees = list_command_grantees(cmd)
+    
+    if not grantees:
+        await update.message.reply_text(
+            f"🔑 ГРАНТЫ НА /{cmd}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Никому индивидуально не выдано."
+        )
+        return
+    
+    lines = [
+        f"🔑 ГРАНТЫ НА /{cmd}",
+        "━━━━━━━━━━━━━━━━━",
+        f"📊 Всего: {len(grantees)}",
+        "━━━━━━━━━━━━━━━━━",
+    ]
+    for uid, granted_by, granted_at in grantees:
+        ud = get_user_data(uid)
+        name = ud['nick'] if ud else f"User {uid}"
+        by_name = get_admin_nick(granted_by) if granted_by else "—"
+        lines.append(f"• {name} (🆔 {uid})\n   👮 от {by_name} | 📅 {granted_at or '—'}")
+    
+    await update.message.reply_text("\n".join(lines))
+
+
+async def agrantcmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список команд, на которые в принципе можно выдавать индивидуальные гранты."""
+    user_id = update.effective_user.id
+    if not _can_manage_grants(user_id):
+        await update.message.reply_text("❌ Доступно только главному админу или со спецдопуском.")
+        return
+    
+    cmds = sorted(GRANTABLE_COMMANDS)
+    text = (
+        "📋 КОМАНДЫ, ДОСТУПНЫЕ ДЛЯ ГРАНТА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(f"• /{c}" for c in cmds)
+        + "\n━━━━━━━━━━━━━━━━━\n"
+        + f"📊 Всего: {len(cmds)}\n\n"
+        + "Используйте: /agrant <user> <command>"
+    )
+    await update.message.reply_text(text)
 
 # ============ ЖАЛОБЫ ============
 
@@ -3438,7 +3883,7 @@ async def acallsign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_id = extract_user_id(update, context)
     
     if target_id:
-        if not has_permission(user_id, 'search'):
+        if not has_permission(user_id, 'search', 'acallsign'):
             await update.message.reply_text("❌ С 4 ранга для смены чужого позывного.")
             return
         if isinstance(target_id, str) and target_id.startswith('@'):
@@ -3986,6 +4431,7 @@ def main():
         'atest': atest, 'find': find, 
         'apoll_create': apoll_create, 'avote': avote, 'aadd': aadd, 'apoll_info': apoll_info, 'apoll_close': apoll_close, 'apolls': apolls,
         'atag': atag, 'atagdept': atagdept,
+        'agrant': agrant, 'arevoke': arevoke, 'aperms': aperms, 'agrantlist': agrantlist, 'agrantcmds': agrantcmds,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
