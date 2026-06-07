@@ -133,6 +133,7 @@ def get_admin_nick(user_id: int) -> str:
 GRANTABLE_COMMANDS = {
     # 4 ранг
     'areport_info', 'acallsign', 'atag', 'atagdept',
+    'arequests', 'arequest_info',
     # 5 ранг
     'akick', 'aban', 'aunban',
     'awarn', 'aunwarn', 'aunwarnall', 'awarns',
@@ -603,6 +604,26 @@ def init_database():
     ''')
     try:
         c.execute('CREATE INDEX IF NOT EXISTS idx_grants_command ON command_grants(command)')
+    except sqlite3.OperationalError:
+        pass
+
+    # Заявки на смену ранга/отдела от пользователей (через еженедельную проверку или иначе).
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS change_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            request_type TEXT NOT NULL,        -- 'rank' | 'dept'
+            current_value TEXT,
+            requested_value TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',     -- 'pending' | 'approved' | 'rejected'
+            reviewer_id INTEGER,
+            reviewer_comment TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            decided_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_change_requests_status ON change_requests(status)')
     except sqlite3.OperationalError:
         pass
     
@@ -1123,6 +1144,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎖 ПОДПОЛКОВНИК (4+)\n"
             "├ /areports — список жалоб\n"
             "├ /areport_info <id> — карточка жалобы\n"
+            "├ /arequests — заявки на смену ранга/отдела\n"
+            "├ /arequest_info <id> — карточка заявки\n"
             "├ /atag <user(s)> <текст> — тегнуть людей\n"
             "├ /atagdept <номер> <текст> — тегнуть отдел\n"
             "└ /acallsign — смена позывного"
@@ -2352,36 +2375,545 @@ async def asetalldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ Отдел '{dept_name}' назначен {count} пользователям.")
 
-# ============ ЕЖЕНЕДЕЛЬНАЯ ПРОВЕРКА РАНГОВ ============
+# ============ ЗАЯВКИ НА СМЕНУ РАНГА/ОТДЕЛА ============
 
-async def weekly_rank_check(context: ContextTypes.DEFAULT_TYPE):
-    """Еженедельная проверка рангов (воскресенье 8:00 МСК)"""
+def create_change_request(user_id: int, req_type: str, current_value: str, requested_value: str) -> int:
+    """Создать заявку. Возвращает id."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT user_id, game_nick, rank FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'")
+    c.execute(
+        '''INSERT INTO change_requests
+           (user_id, request_type, current_value, requested_value, created_at)
+           VALUES (?, ?, ?, ?, ?)''',
+        (user_id, req_type, str(current_value), str(requested_value), now_msk_str()),
+    )
+    req_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return req_id
+
+
+def get_change_request(req_id: int) -> dict:
+    """Получить заявку по id."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM change_requests WHERE id = ?', (req_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "request_type": row["request_type"],
+        "current_value": row["current_value"],
+        "requested_value": row["requested_value"],
+        "status": row["status"],
+        "reviewer_id": row["reviewer_id"],
+        "reviewer_comment": row["reviewer_comment"],
+        "created_at": row["created_at"],
+        "decided_at": row["decided_at"],
+    }
+
+
+def update_change_request_status(req_id: int, status: str, reviewer_id: int, comment: str = "") -> bool:
+    """
+    Атомарно меняет статус заявки с pending на approved/rejected.
+    Возвращает True если изменили (т.е. заявка действительно была в pending), иначе False.
+    Это защищает от race condition двух модераторов.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE change_requests
+           SET status = ?, reviewer_id = ?, reviewer_comment = ?, decided_at = ?
+           WHERE id = ? AND status = 'pending' ''',
+        (status, reviewer_id, comment, now_msk_str(), req_id),
+    )
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def get_pending_change_requests() -> list:
+    """Все pending-заявки. Возвращает список dict."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM change_requests WHERE status = 'pending' ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def _rank_picker_keyboard() -> InlineKeyboardMarkup:
+    """Inline-клавиатура с выбором ранга 0..6. Ранг 7 не доступен через self-service."""
+    rows = []
+    # 2 колонки чтобы не растягивать
+    pair = []
+    for r in range(7):
+        pair.append(InlineKeyboardButton(RANKS[r]['name'], callback_data=f"wkc:rank:{r}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="wkc:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _dept_picker_keyboard() -> InlineKeyboardMarkup:
+    """Inline-клавиатура с выбором отдела. По одному в строке (длинные названия)."""
+    depts = get_departments()
+    rows = []
+    for i, d in enumerate(depts):
+        # Telegram ограничивает текст кнопки 64 символами — обрезаем безопасно
+        label = d if len(d) <= 60 else d[:57] + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=f"wkc:dept:{i}")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="wkc:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _weekly_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Всё верно", callback_data="wkc:ok")],
+        [
+            InlineKeyboardButton("🔄 Изменить ранг", callback_data="wkc:rank"),
+            InlineKeyboardButton("🔄 Изменить отдел", callback_data="wkc:dept"),
+        ],
+    ])
+
+
+def _weekly_main_text(nick: str, rank: int, dept: str) -> str:
+    return (
+        "📋 ЕЖЕНЕДЕЛЬНАЯ ПРОВЕРКА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {nick}\n"
+        f"⭐ Ранг: {RANKS.get(rank, RANKS[0])['name']}\n"
+        f"📁 Отдел: {dept}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Подтвердите данные или запросите изменение.\n"
+        "Заявка уйдёт на одобрение администрации (5+)."
+    )
+
+
+async def weekly_rank_check(context: ContextTypes.DEFAULT_TYPE):
+    """Еженедельная проверка рангов и отделов (воскресенье 8:00 МСК)"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id, game_nick, rank, department "
+        "FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'"
+    )
     users = c.fetchall()
     conn.close()
-    
+
+    sent = 0
     for u in users:
-        user_id, nick, rank = u
-        rank_name = RANKS.get(rank, RANKS[0])['name']
+        user_id, nick, rank, dept = u
+        text = _weekly_main_text(nick, rank or 0, dept or "Не назначен")
+        kb = _weekly_main_keyboard()
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
+            sent += 1
+            await asyncio.sleep(0.3)  # троттлинг чтобы не упереться в флуд-лимит
+        except Exception as e:
+            logger.debug(f"weekly_rank_check send to {user_id} failed: {e}")
+
+    if CONFERENCE_CHAT_ID:
         try:
             await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📋 Еженедельная проверка\n\n"
-                     f"👤 {nick}\n"
-                     f"⭐ Ваш текущий ранг: {rank_name}\n\n"
-                     f"Если ранг изменился — обратитесь к руководству."
+                chat_id=CONFERENCE_CHAT_ID,
+                text=f"📢 Отправлена еженедельная проверка ({sent} получателей).",
             )
-            await asyncio.sleep(0.3)
-        except:
+        except Exception:
             pass
-    
-    if CONFERENCE_CHAT_ID:
-        await context.bot.send_message(
-            chat_id=CONFERENCE_CHAT_ID,
-            text="📢 Всем пользователям отправлена еженедельная проверка рангов."
+
+
+# ----------- Callback-хэндлер для главного меню еженедельной проверки -----------
+
+async def weekly_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает все нажатия с префиксом 'wkc:'."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    user_id = query.from_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        try:
+            await query.edit_message_text("❌ Вы не зарегистрированы в боте.")
+        except Exception:
+            pass
+        return
+
+    # === Главные действия ===
+    if data == "wkc:ok":
+        await query.edit_message_text(
+            "✅ Подтверждено\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Ваш ранг и отдел оставлены без изменений.\n"
+            "Спасибо за подтверждение!"
         )
+        return
+
+    if data == "wkc:back":
+        await query.edit_message_text(
+            _weekly_main_text(user_data['nick'], user_data['rank'] or 0, user_data['department']),
+            reply_markup=_weekly_main_keyboard(),
+        )
+        return
+
+    if data == "wkc:rank":
+        await query.edit_message_text(
+            "🔄 ВЫБЕРИТЕ ЖЕЛАЕМЫЙ РАНГ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"⭐ Сейчас: {RANKS.get(user_data['rank'] or 0, RANKS[0])['name']}\n\n"
+            "После выбора заявка уйдёт администрации (5+).",
+            reply_markup=_rank_picker_keyboard(),
+        )
+        return
+
+    if data == "wkc:dept":
+        await query.edit_message_text(
+            "🔄 ВЫБЕРИТЕ ЖЕЛАЕМЫЙ ОТДЕЛ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📁 Сейчас: {user_data['department']}\n\n"
+            "После выбора заявка уйдёт администрации (5+).",
+            reply_markup=_dept_picker_keyboard(),
+        )
+        return
+
+    # === Выбор конкретного ранга ===
+    if data.startswith("wkc:rank:"):
+        try:
+            new_rank = int(data.split(":")[2])
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Некорректный выбор.")
+            return
+        if new_rank not in RANKS or new_rank >= 7:
+            await query.edit_message_text("❌ Этот ранг недоступен для выбора.")
+            return
+        current_rank = user_data['rank'] or 0
+        if new_rank == current_rank:
+            await query.edit_message_text(
+                f"ℹ️ У вас уже этот ранг: {RANKS[current_rank]['name']}\n"
+                "Заявка не создана."
+            )
+            return
+        req_id = create_change_request(user_id, 'rank', str(current_rank), str(new_rank))
+        await query.edit_message_text(
+            f"✅ ЗАЯВКА #{req_id} ОТПРАВЛЕНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"⭐ Сейчас: {RANKS[current_rank]['name']}\n"
+            f"⭐ Запрошен: {RANKS[new_rank]['name']}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Ожидайте решения 5+."
+        )
+        await _broadcast_request_to_mods(context, req_id)
+        return
+
+    # === Выбор конкретного отдела ===
+    if data.startswith("wkc:dept:"):
+        try:
+            idx = int(data.split(":")[2])
+        except (ValueError, IndexError):
+            await query.edit_message_text("❌ Некорректный выбор.")
+            return
+        depts = get_departments()
+        if idx < 0 or idx >= len(depts):
+            await query.edit_message_text("❌ Этот отдел больше недоступен.")
+            return
+        new_dept = depts[idx]
+        current_dept = user_data['department'] or "Не назначен"
+        if new_dept == current_dept:
+            await query.edit_message_text(
+                f"ℹ️ Вы уже в этом отделе:\n📁 {current_dept}\nЗаявка не создана."
+            )
+            return
+        req_id = create_change_request(user_id, 'dept', current_dept, new_dept)
+        await query.edit_message_text(
+            f"✅ ЗАЯВКА #{req_id} ОТПРАВЛЕНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📁 Сейчас: {current_dept}\n"
+            f"📁 Запрошен: {new_dept}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Ожидайте решения 5+."
+        )
+        await _broadcast_request_to_mods(context, req_id)
+        return
+
+    # Неизвестный wkc-callback
+    await query.edit_message_text("❌ Неизвестное действие.")
+
+
+def _format_request_card(req: dict, user_data: dict) -> str:
+    """Текст карточки заявки, который видит модератор и/или сама заявка."""
+    nick = user_data['nick'] if user_data else f"User {req['user_id']}"
+    callsign = user_data['callsign'] if user_data else "—"
+    if req['request_type'] == 'rank':
+        try:
+            cur = RANKS[int(req['current_value'])]['name']
+        except Exception:
+            cur = req['current_value']
+        try:
+            new = RANKS[int(req['requested_value'])]['name']
+        except Exception:
+            new = req['requested_value']
+        body = (
+            "📥 ЗАЯВКА НА ИЗМЕНЕНИЕ РАНГА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"#{req['id']} | 📅 {req['created_at']}\n"
+            f"👤 {nick} ({callsign})\n"
+            f"🆔 {req['user_id']}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"⭐ Сейчас: {cur}\n"
+            f"⭐ Хочет:  {new}"
+        )
+    else:
+        body = (
+            "📥 ЗАЯВКА НА ИЗМЕНЕНИЕ ОТДЕЛА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"#{req['id']} | 📅 {req['created_at']}\n"
+            f"👤 {nick} ({callsign})\n"
+            f"🆔 {req['user_id']}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📁 Сейчас: {req['current_value']}\n"
+            f"📁 Хочет:  {req['requested_value']}"
+        )
+    return body
+
+
+async def _broadcast_request_to_mods(context: ContextTypes.DEFAULT_TYPE, req_id: int):
+    """Шлёт всем 5+ карточку заявки с кнопками Одобрить/Отказать."""
+    req = get_change_request(req_id)
+    if not req:
+        return
+    user_data = get_user_data(req['user_id'])
+    text = _format_request_card(req, user_data)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Одобрить", callback_data=f"rqst:appr:{req_id}"),
+        InlineKeyboardButton("❌ Отказать", callback_data=f"rqst:rej:{req_id}"),
+    ]])
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE rank >= 5 AND bot_blocked = "Нет"')
+    mods = [r[0] for r in c.fetchall()]
+    conn.close()
+    for mid in mods:
+        # Не шлём самому автору заявки, даже если он 5+ (на всякий случай)
+        if mid == req['user_id']:
+            continue
+        try:
+            await context.bot.send_message(chat_id=mid, text=text, reply_markup=kb)
+        except Exception as e:
+            logger.debug(f"request broadcast to {mid} failed: {e}")
+        await asyncio.sleep(0.05)
+
+
+# ----------- Callback-хэндлер модерации заявки -----------
+
+async def request_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает 'rqst:appr:<id>' и 'rqst:rej:<id>'."""
+    query = update.callback_query
+    await query.answer()
+    reviewer_id = query.from_user.id
+
+    if not has_permission(reviewer_id, 'warn'):
+        try:
+            await query.edit_message_text("❌ Решения по заявкам — только с 5 ранга.")
+        except Exception:
+            pass
+        return
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        return
+    action = parts[1]
+    try:
+        req_id = int(parts[2])
+    except ValueError:
+        return
+
+    req = get_change_request(req_id)
+    if not req:
+        await query.edit_message_text("❌ Заявка не найдена.")
+        return
+
+    # Защита от самообработки
+    if req['user_id'] == reviewer_id:
+        await query.answer("Нельзя обрабатывать свою же заявку.", show_alert=True)
+        return
+
+    # Если статус уже не pending — кто-то опередил
+    if req['status'] != 'pending':
+        existing_reviewer = get_admin_nick(req['reviewer_id']) if req['reviewer_id'] else "—"
+        status_label = "✅ ОДОБРЕНО" if req['status'] == 'approved' else "❌ ОТКАЗАНО"
+        try:
+            await query.edit_message_text(
+                f"{query.message.text}\n\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ Уже обработано: {status_label}\n"
+                f"👮 {existing_reviewer}\n"
+                f"📅 {req['decided_at']}"
+            )
+        except Exception:
+            pass
+        return
+
+    new_status = 'approved' if action == 'appr' else 'rejected'
+    # Атомарный переход pending → final
+    if not update_change_request_status(req_id, new_status, reviewer_id):
+        # Кто-то нас опередил между чтением и UPDATE — перечитаем и покажем актуальный статус
+        req2 = get_change_request(req_id)
+        existing_reviewer = get_admin_nick(req2['reviewer_id']) if req2 and req2['reviewer_id'] else "—"
+        status_label = "✅ ОДОБРЕНО" if req2 and req2['status'] == 'approved' else "❌ ОТКАЗАНО"
+        try:
+            await query.edit_message_text(
+                f"{query.message.text}\n\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ Уже обработано: {status_label}\n"
+                f"👮 {existing_reviewer}"
+            )
+        except Exception:
+            pass
+        return
+
+    target_id = req['user_id']
+    target_data = get_user_data(target_id)
+    target_name = target_data['nick'] if target_data else f"User {target_id}"
+    reviewer_name = get_admin_nick(reviewer_id)
+
+    # Применяем изменение, если approved
+    applied_text = ""
+    if new_status == 'approved':
+        if req['request_type'] == 'rank':
+            try:
+                new_rank_int = int(req['requested_value'])
+                if update_user_rank(target_id, new_rank_int):
+                    applied_text = f"⭐ Новый ранг: {RANKS.get(new_rank_int, RANKS[0])['name']}"
+            except ValueError:
+                applied_text = "⚠️ Не удалось применить ранг (некорректное значение)."
+        elif req['request_type'] == 'dept':
+            if update_user_department(target_id, req['requested_value']):
+                applied_text = f"📁 Новый отдел: {req['requested_value']}"
+
+    # Обновляем сообщение у модератора
+    status_label = "✅ ОДОБРЕНО" if new_status == 'approved' else "❌ ОТКАЗАНО"
+    try:
+        await query.edit_message_text(
+            f"{query.message.text}\n\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"{status_label}\n"
+            f"👮 Модератор: {reviewer_name}\n"
+            f"📅 {now_msk_str()}\n"
+            + (f"{applied_text}" if applied_text else "")
+        )
+    except Exception as e:
+        logger.debug(f"request decision edit failed: {e}")
+
+    # Уведомляем юзера
+    if req['request_type'] == 'rank':
+        try:
+            cur_lbl = RANKS[int(req['current_value'])]['name']
+            new_lbl = RANKS[int(req['requested_value'])]['name']
+        except Exception:
+            cur_lbl, new_lbl = req['current_value'], req['requested_value']
+        what = f"⭐ Ранг: {cur_lbl} → {new_lbl}"
+    else:
+        what = f"📁 Отдел: {req['current_value']} → {req['requested_value']}"
+
+    if new_status == 'approved':
+        user_msg = (
+            f"✅ ЗАЯВКА #{req_id} ОДОБРЕНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"{what}\n"
+            f"👮 Решение: {reviewer_name}"
+        )
+    else:
+        user_msg = (
+            f"❌ ЗАЯВКА #{req_id} ОТКЛОНЕНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"{what}\n"
+            f"👮 Решение: {reviewer_name}"
+        )
+    await notify_user(context, target_id, user_msg)
+
+
+# ----------- Команды просмотра заявок -----------
+
+async def arequests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список ожидающих заявок (для 4+ ранга)."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'search', 'arequests'):
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
+        return
+    pending = get_pending_change_requests()
+    if not pending:
+        await update.message.reply_text(
+            "📥 ЗАЯВКИ НА СМЕНУ РАНГА/ОТДЕЛА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "✅ Ожидающих заявок нет."
+        )
+        return
+    lines = [
+        f"📥 ОЖИДАЮЩИЕ ЗАЯВКИ ({len(pending)})",
+        "━━━━━━━━━━━━━━━━━",
+    ]
+    for r in pending[:30]:
+        ud = get_user_data(r['user_id'])
+        nick = ud['nick'] if ud else f"User {r['user_id']}"
+        if r['request_type'] == 'rank':
+            try:
+                cur = RANKS[int(r['current_value'])]['name']
+                new = RANKS[int(r['requested_value'])]['name']
+            except Exception:
+                cur, new = r['current_value'], r['requested_value']
+            lines.append(f"#{r['id']} | ⭐ {nick}\n   {cur} → {new}\n   📅 {r['created_at']}")
+        else:
+            lines.append(f"#{r['id']} | 📁 {nick}\n   {r['current_value']} → {r['requested_value']}\n   📅 {r['created_at']}")
+    if len(pending) > 30:
+        lines.append(f"\n…и ещё {len(pending) - 30}. Используйте /arequest_info <id>.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def arequest_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Карточка заявки по id с кнопками решения (если pending и юзер ≥ 5)."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'search', 'arequest_info'):
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /arequest_info <id>")
+        return
+    try:
+        req_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ id должен быть числом.")
+        return
+    req = get_change_request(req_id)
+    if not req:
+        await update.message.reply_text(f"❌ Заявка #{req_id} не найдена.")
+        return
+    ud = get_user_data(req['user_id'])
+    text = _format_request_card(req, ud)
+    if req['status'] != 'pending':
+        rev = get_admin_nick(req['reviewer_id']) if req['reviewer_id'] else "—"
+        label = "✅ ОДОБРЕНО" if req['status'] == 'approved' else "❌ ОТКАЗАНО"
+        text += f"\n━━━━━━━━━━━━━━━━━\n{label}\n👮 {rev}\n📅 {req['decided_at']}"
+        await update.message.reply_text(text)
+        return
+
+    # Pending — добавим кнопки только если у юзера ≥ 5 и он не автор
+    if has_permission(user_id, 'warn') and user_id != req['user_id']:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"rqst:appr:{req_id}"),
+            InlineKeyboardButton("❌ Отказать", callback_data=f"rqst:rej:{req_id}"),
+        ]])
+        await update.message.reply_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text + "\n\n⏳ Ожидает решения 5+.")
 
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
 
@@ -4432,6 +4964,7 @@ def main():
         'apoll_create': apoll_create, 'avote': avote, 'aadd': aadd, 'apoll_info': apoll_info, 'apoll_close': apoll_close, 'apolls': apolls,
         'atag': atag, 'atagdept': atagdept,
         'agrant': agrant, 'arevoke': arevoke, 'aperms': aperms, 'agrantlist': agrantlist, 'agrantcmds': agrantcmds,
+        'arequests': arequests, 'arequest_info': arequest_info,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -4475,7 +5008,13 @@ def main():
     # По умолчанию (без указания) ловится только MY_CHAT_MEMBER — статус самого бота.
     # Также нужно включить chat_member в allowed_updates у polling (см. ниже в run_polling).
     application.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
-    application.add_handler(CallbackQueryHandler(handle_report_callback))
+    # CallbackQueryHandlers — каждый ограничен своим префиксом, чтобы не конфликтовать.
+    # Старые жалобы используют 'approve_<id>' / 'reject_<id>'.
+    application.add_handler(CallbackQueryHandler(handle_report_callback, pattern=r'^(approve|reject)_\d+$'))
+    # Еженедельная проверка ранга/отдела
+    application.add_handler(CallbackQueryHandler(weekly_check_callback, pattern=r'^wkc:'))
+    # Решения по заявкам (одобрить/отказать)
+    application.add_handler(CallbackQueryHandler(request_decision_callback, pattern=r'^rqst:'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     # Сбор сообщений для анализа настроения (только в конференции)
