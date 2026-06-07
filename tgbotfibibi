@@ -144,6 +144,8 @@ GRANTABLE_COMMANDS = {
     'atestwelcome',
     # 6 ранг
     'asettoken', 'aregister', 'aforcereg', 'achangelog',
+    # Спецдопуск
+    'acheckall',
     # Прочее, что бывает полезно делегировать
     'asetnick', 'aspeciallist',
 }
@@ -1168,7 +1170,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "├ /auserlist — все участники\n"
             "├ /awho <user> — чужой профиль\n"
             "├ /abroadcast <текст> — рассылка\n"
-            "├ /adepartment add/remove/rename/list\n"
+            "├ /adepartment add/remove/rename/list/find\n"
             "└ /asetalldept <номер>"
         )
 
@@ -1196,6 +1198,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "├ /gban <user> <причина>\n"
             "├ /ungban <user>\n"
             "├ /gban_list\n"
+            "├ /acheckall — запустить проверку ранга/отдела сейчас\n"
             "├ /agrant <user> <cmd> — выдать доступ\n"
             "├ /arevoke <user> <cmd> — отозвать доступ\n"
             "├ /agrantlist <cmd> — кому выдан доступ\n"
@@ -2268,7 +2271,15 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args:
-        await update.message.reply_text("❌ /adepartment add/remove/rename/list")
+        await update.message.reply_text(
+            "📁 УПРАВЛЕНИЕ ОТДЕЛАМИ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "/adepartment list — список отделов\n"
+            "/adepartment find <номер|название> — участники отдела\n"
+            "/adepartment add <название>\n"
+            "/adepartment remove <номер>\n"
+            "/adepartment rename <номер> <новое название>"
+        )
         return
     
     action = context.args[0].lower()
@@ -2332,13 +2343,92 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == 'list':
         depts = get_departments()
-        text = "📁 ОТДЕЛЫ:\n\n"
+        text = "📁 ОТДЕЛЫ:\n━━━━━━━━━━━━━━━━━\n"
         for i, d in enumerate(depts, 1):
             text += f"{i}. {d}\n"
         await update.message.reply_text(text)
     
+    elif action == 'find':
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ Использование: /adepartment find <номер|название>\n"
+                "Пример: /adepartment find 3\n"
+                "Пример: /adepartment find куратор"
+            )
+            conn.close()
+            return
+        
+        arg = ' '.join(context.args[1:]).strip()
+        depts = get_departments()
+        target_dept = None
+        
+        # 1) Пробуем как номер
+        if arg.isdigit():
+            num = int(arg)
+            if 1 <= num <= len(depts):
+                target_dept = depts[num - 1]
+        
+        # 2) Иначе поиск по подстроке (регистронезависимо)
+        if not target_dept:
+            lower = arg.lower()
+            matches = [d for d in depts if lower in d.lower()]
+            if len(matches) == 1:
+                target_dept = matches[0]
+            elif len(matches) > 1:
+                await update.message.reply_text(
+                    f"❌ Найдено несколько отделов по запросу «{arg}»:\n\n"
+                    + "\n".join(f"• {d}" for d in matches)
+                    + "\n\nУточните название или используйте номер."
+                )
+                conn.close()
+                return
+            else:
+                await update.message.reply_text(f"❌ Отдел по запросу «{arg}» не найден.")
+                conn.close()
+                return
+        
+        # Тянем участников: сортируем по рангу убыванию, потом по нику
+        c.execute(
+            '''SELECT user_id, game_nick, callsign, rank, ban_status
+               FROM users WHERE department = ?
+               ORDER BY rank DESC, game_nick''',
+            (target_dept,),
+        )
+        members = c.fetchall()
+        
+        if not members:
+            await update.message.reply_text(
+                "📁 ОТДЕЛ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"📁 {target_dept}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "В отделе никого нет."
+            )
+            conn.close()
+            return
+        
+        active = [m for m in members if (m[4] or 'Нет') == 'Нет']
+        lines = [
+            f"📁 УЧАСТНИКИ ОТДЕЛА",
+            "━━━━━━━━━━━━━━━━━",
+            f"📁 {target_dept}",
+            f"👥 Всего: {len(members)} | ✅ Активных: {len(active)}",
+            "━━━━━━━━━━━━━━━━━",
+        ]
+        for m in members[:50]:
+            uid, nick, callsign, rk, ban_status = m
+            ban_mark = "  🚫" if (ban_status or 'Нет') != 'Нет' else ""
+            lines.append(
+                f"👤 {nick} | 📻 {callsign}{ban_mark}\n"
+                f"   ⭐ {RANKS.get(rk or 0, RANKS[0])['name']}\n"
+                f"   🆔 {uid}"
+            )
+        if len(members) > 50:
+            lines.append(f"\n…и ещё {len(members) - 50}.")
+        await update.message.reply_text("\n".join(lines))
+    
     else:
-        await update.message.reply_text("❌ Действие: add, remove, rename, list")
+        await update.message.reply_text("❌ Действие: add, remove, rename, list, find")
     
     conn.close()
 
@@ -2842,6 +2932,45 @@ async def request_decision_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 # ----------- Команды просмотра заявок -----------
+
+async def acheckall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Запустить еженедельную проверку ранга/отдела вручную, не дожидаясь воскресенья.
+    Полезно после массовых изменений или когда нужно собрать актуальные данные.
+    
+    Доступ: главный админ, спецдопуск, либо индивидуальный грант на /acheckall.
+    """
+    user_id = update.effective_user.id
+    if not (is_main_admin(user_id)
+            or has_special_access(user_id)
+            or has_command_access(user_id, 'acheckall')):
+        await update.message.reply_text("❌ Команда доступна только со спецдопуском.")
+        return
+    
+    # Считаем сколько потенциальных получателей, чтобы юзер видел оценку
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT COUNT(*) FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'"
+    )
+    total = c.fetchone()[0]
+    conn.close()
+    
+    issuer_name = get_admin_nick(user_id)
+    await update.message.reply_text(
+        "📤 ЗАПУСК ПРОВЕРКИ ВРУЧНУЮ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👮 Инициатор: {issuer_name}\n"
+        f"👥 Получателей: {total}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Уведомления уже расходятся. Каждому юзеру придёт сообщение\n"
+        "с кнопками подтверждения ранга и отдела.\n"
+        "Итог придёт в конференцию."
+    )
+    # Запускаем фоном, чтобы не блокировать ответ — рассылка с sleep(0.3) на каждого
+    # может занять десятки секунд при большой базе.
+    asyncio.create_task(weekly_rank_check(context))
+
 
 async def arequests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список ожидающих заявок (для 4+ ранга)."""
@@ -4965,6 +5094,7 @@ def main():
         'atag': atag, 'atagdept': atagdept,
         'agrant': agrant, 'arevoke': arevoke, 'aperms': aperms, 'agrantlist': agrantlist, 'agrantcmds': agrantcmds,
         'arequests': arequests, 'arequest_info': arequest_info,
+        'acheckall': acheckall,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
