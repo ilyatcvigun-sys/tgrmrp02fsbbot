@@ -80,6 +80,29 @@ def reload_blocked_users():
         logger.error(f"reload_blocked_users error: {e}")
         blocked_users = set()
 
+
+# ============ ЖУРНАЛ ДЕЙСТВИЙ АДМИНИСТРАЦИИ ============
+# Сколько дней живёт предупреждение до автоматического истечения.
+WARN_EXPIRES_DAYS = 30
+
+
+def log_action(actor_id, action: str, target_id=None, details: str = ""):
+    """
+    Записать действие в журнал. Никогда не бросает — журнал не должен ломать команды.
+    actor_id может быть None для системных действий (auto-expire, auto-disconnect при выходе).
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO audit_log (actor_id, action, target_id, details, created_at) VALUES (?, ?, ?, ?, ?)',
+            (actor_id, action, target_id, details or "", now_msk_str()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"log_action failed: {e}")
+
 RANKS = {
     0: {"name": "👤 Гость"},
     1: {"name": "⭐ Старший лейтенант"},
@@ -133,12 +156,13 @@ def get_admin_nick(user_id: int) -> str:
 GRANTABLE_COMMANDS = {
     # 4 ранг
     'areport_info', 'acallsign', 'atag', 'atagdept',
-    'arequests', 'arequest_info',
+    'arequests', 'arequest_info', 'ahistory',
     # 5 ранг
     'akick', 'aban', 'aunban',
     'awarn', 'aunwarn', 'aunwarnall', 'awarns',
     'asetrank', 'asetdept',
     'ablock', 'aunblock', 'ablocklist',
+    'aaudit',
     'auserlist', 'awho', 'abroadcast',
     'adepartment', 'asetalldept',
     'atestwelcome',
@@ -628,6 +652,41 @@ def init_database():
         c.execute('CREATE INDEX IF NOT EXISTS idx_change_requests_status ON change_requests(status)')
     except sqlite3.OperationalError:
         pass
+
+    # Журнал действий администрации. Пишется из всех ключевых команд (изменения ранга/отдела,
+    # бан/разбан, варны, блок/разблок, гбан, награды, гранты, решения по заявкам, авто-кики).
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER,
+            action TEXT NOT NULL,
+            target_id INTEGER,
+            details TEXT DEFAULT '',
+            created_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_id, created_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target_id, created_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)')
+    except sqlite3.OperationalError:
+        pass
+
+    # Миграция для авто-сгорания предупреждений: добавляем expires_at в warnings.
+    # Если столбец уже есть — ALTER TABLE упадёт с DuplicateColumn, и мы это глотаем.
+    try:
+        c.execute('ALTER TABLE warnings ADD COLUMN expires_at TEXT')
+        logger.info("Migration: added warnings.expires_at column")
+    except sqlite3.OperationalError:
+        pass  # уже существует
+
+    # Миграция для временных банов: время автоматического разбана.
+    # NULL означает бессрочный бан (старое поведение).
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN banned_until TEXT')
+        logger.info("Migration: added users.banned_until column")
+    except sqlite3.OperationalError:
+        pass
     
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
@@ -807,10 +866,13 @@ def add_warning(user_id: int, issuer_id: int, reason: str) -> tuple:
     
     new_warns = f"{verbal}/{written}"
     c.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, user_id))
-    c.execute('''INSERT INTO warnings (user_id, nick, warn_type, counter, reason, date, issued_by) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+    
+    # Время истечения варна — created_at + WARN_EXPIRES_DAYS дней (МСК).
+    expires_at = (now_msk() + timedelta(days=WARN_EXPIRES_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('''INSERT INTO warnings (user_id, nick, warn_type, counter, reason, date, issued_by, expires_at) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
               (user_id, user_nick, warn_type, new_warns, reason,
-               now_msk_str("%Y-%m-%d %H:%M:%S"), issuer_id))
+               now_msk_str("%Y-%m-%d %H:%M:%S"), issuer_id, expires_at))
     conn.commit()
     conn.close()
     return True, f"Выдано {warn_type.lower()} предупреждение ({new_warns})", kicked
@@ -865,20 +927,184 @@ def get_gban_list() -> list:
     return bans
 
 def get_warn_list(user_id: int = None) -> list:
-    """Список активных предупреждений"""
+    """Список активных предупреждений. Снятые ('0/0') и истёкшие ('EXPIRED') не возвращаются."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     if user_id:
         c.execute('''SELECT * FROM warnings 
-                     WHERE user_id = ? AND counter != "0/0" 
+                     WHERE user_id = ? AND counter != "0/0" AND counter != "EXPIRED"
                      ORDER BY id DESC''', (user_id,))
     else:
         c.execute('''SELECT * FROM warnings 
-                     WHERE counter != "0/0" 
+                     WHERE counter != "0/0" AND counter != "EXPIRED"
                      ORDER BY id DESC LIMIT 50''')
     warns = c.fetchall()
     conn.close()
     return warns
+
+
+# ============ ВРЕМЕННЫЕ БАНЫ ============
+
+def parse_duration(s: str):
+    """
+    Парсит длительность вида '30m', '2h', '7d', '1w'. Возвращает timedelta или None.
+    Регистр игнорируется. Без суффикса — None (юзер не передал длительность).
+    """
+    if not s:
+        return None
+    m = re.match(r'^(\d+)([mhdw])$', s.strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == 'm':
+        return timedelta(minutes=n)
+    if unit == 'h':
+        return timedelta(hours=n)
+    if unit == 'd':
+        return timedelta(days=n)
+    if unit == 'w':
+        return timedelta(weeks=n)
+    return None
+
+
+def format_duration(td: timedelta) -> str:
+    """Человекочитаемое представление длительности: '7 д', '3 ч', '30 мин', '2 нед'."""
+    total = int(td.total_seconds())
+    if total <= 0:
+        return "0 сек"
+    weeks, rem = divmod(total, 604800)
+    days, rem = divmod(rem, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, _ = divmod(rem, 60)
+    parts = []
+    if weeks:
+        parts.append(f"{weeks} нед")
+    if days:
+        parts.append(f"{days} д")
+    if hours:
+        parts.append(f"{hours} ч")
+    if mins and not (weeks or days):
+        parts.append(f"{mins} мин")
+    return " ".join(parts) or "<1 мин"
+
+
+async def auto_unban_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Каждые 5 минут: разбанивает пользователей, у которых истёк banned_until.
+    Снимает ban_status в БД, размбанит в TG, пишет в audit_log, шлёт уведомление.
+    """
+    now_str = now_msk_str("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''SELECT user_id, game_nick FROM users
+           WHERE ban_status = 'Да'
+             AND banned_until IS NOT NULL AND banned_until != ''
+             AND banned_until <= ?''',
+        (now_str,),
+    )
+    rows = c.fetchall()
+    if not rows:
+        conn.close()
+        return
+    logger.info(f"auto_unban_job: unbanning {len(rows)} users")
+    for uid, _nick in rows:
+        c.execute(
+            'UPDATE users SET ban_status = "Нет", ban_reason = "", ban_date = "", banned_until = NULL WHERE user_id = ?',
+            (uid,),
+        )
+    conn.commit()
+    conn.close()
+    
+    # Снимаем бан в Telegram + аудит + уведомление
+    for uid, nick in rows:
+        log_action(None, 'unban', uid, "истёк срок временного бана")
+        if CONFERENCE_CHAT_ID:
+            try:
+                await context.bot.unban_chat_member(CONFERENCE_CHAT_ID, uid, only_if_banned=True)
+            except Exception as e:
+                logger.debug(f"auto-unban in TG failed for {uid}: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="✅ Срок вашего бана истёк — вы можете снова заходить в конференцию.",
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.1)
+    
+    # Системное сообщение в конфу
+    if CONFERENCE_CHAT_ID and rows:
+        names = ", ".join(n or f"id {u}" for u, n in rows[:10])
+        more = f" (и ещё {len(rows) - 10})" if len(rows) > 10 else ""
+        try:
+            await context.bot.send_message(
+                chat_id=CONFERENCE_CHAT_ID,
+                text=f"⏰ Авто-разбан по истечении срока: {names}{more}",
+            )
+        except Exception:
+            pass
+
+
+async def expire_warnings_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Раз в час: находит активные варны, у которых истёк expires_at, и помечает их как EXPIRED.
+    При этом понижает счётчик users.warns на соответствующий тип (verbal/written).
+    Старые варны без expires_at (NULL) — никогда не истекают, остаются как были.
+    """
+    now_str = now_msk_str("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''SELECT id, user_id, warn_type FROM warnings
+           WHERE counter != "0/0" AND counter != "EXPIRED"
+             AND expires_at IS NOT NULL AND expires_at != ''
+             AND expires_at <= ?''',
+        (now_str,),
+    )
+    expired = c.fetchall()
+    if not expired:
+        conn.close()
+        return
+    
+    logger.info(f"expire_warnings_job: expiring {len(expired)} warnings")
+    affected_users = {}  # user_id → (verbal_dec, written_dec)
+    for warn_id, uid, wtype in expired:
+        v_dec, w_dec = affected_users.get(uid, (0, 0))
+        if wtype == "Устное":
+            v_dec += 1
+        elif wtype == "Письменное":
+            w_dec += 1
+        affected_users[uid] = (v_dec, w_dec)
+        c.execute('UPDATE warnings SET counter = "EXPIRED" WHERE id = ?', (warn_id,))
+    
+    # Понижаем счётчик у каждого юзера
+    for uid, (v_dec, w_dec) in affected_users.items():
+        c.execute('SELECT warns FROM users WHERE user_id = ?', (uid,))
+        row = c.fetchone()
+        if not row:
+            continue
+        parts = (row[0] or "0/0").split('/')
+        verbal = max(0, int(parts[0]) - v_dec) if len(parts) == 2 and parts[0].isdigit() else 0
+        written = max(0, int(parts[1]) - w_dec) if len(parts) == 2 and parts[1].isdigit() else 0
+        new_warns = f"{verbal}/{written}"
+        c.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, uid))
+    conn.commit()
+    conn.close()
+    
+    # Запишем в аудит-лог и уведомим юзеров (без давления — короткое сообщение)
+    for warn_id, uid, wtype in expired:
+        log_action(None, 'warn_expired', uid, f"{wtype} (warn_id={warn_id})")
+    for uid in affected_users:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="⏳ Срок одного из ваших предупреждений истёк — счётчик понижен.",
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
 
 def add_award(user_id: int, award_name: str, award_type: str, issued_by: int) -> bool:
     """Добавление награды"""
@@ -1179,6 +1405,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "├ /areport_info <id> — карточка жалобы\n"
             "├ /arequests — заявки на смену ранга/отдела\n"
             "├ /arequest_info <id> — карточка заявки\n"
+            "├ /ahistory <user> — история пользователя\n"
             "├ /atag <user(s)> <текст> — тегнуть людей\n"
             "├ /atagdept <номер> <текст> — тегнуть отдел\n"
             "└ /acallsign — смена позывного"
@@ -1188,7 +1415,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sections.append(
             "🛡 ПОЛКОВНИК (5+)\n"
             "├ /akick <user> [причина]\n"
-            "├ /aban <user> [причина]\n"
+            "├ /aban <user> [длительность] [причина]\n"
+            "│   длительность: 30m | 2h | 7d | 1w (опц.)\n"
             "├ /aunban <user>\n"
             "├ /awarn <user> <причина>\n"
             "├ /aunwarn <user>\n"
@@ -1198,6 +1426,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "├ /ablock <user> — отключить от бота\n"
             "├ /aunblock <user> — подключить к боту\n"
             "├ /ablocklist — список отключённых\n"
+            "├ /aaudit [@user] — журнал действий\n"
             "├ /aadmins — список администрации\n"
             "├ /auserlist — все участники\n"
             "├ /awho <user> — чужой профиль\n"
@@ -1458,6 +1687,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 actor_data = get_user_data(actor.id)
                 actor_name = actor_data['nick'] if actor_data else (actor.full_name or f"id {actor.id}")
             disconnect_user_from_bot(user.id)
+            log_action(actor.id if actor else None, 'auto_disconnect_kick', user.id, 'кикнут из конференции')
             if user_data:
                 try:
                     await context.bot.send_message(
@@ -1703,8 +1933,11 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_action_message(update, context, target_id, "kick", reason)
     
     if await kick_user_from_chat(update, context, target_id):
+        log_action(user_id, 'kick', target_id, reason or '')
         # Автоотключение от бота + снятие ранга/отдела
         disconnected = disconnect_user_from_bot(target_id)
+        if disconnected:
+            log_action(None, 'auto_disconnect_kick', target_id, f"кикнут админом id={user_id}")
         issuer_name = get_admin_nick(user_id)
         await update.message.reply_text(
             "👢 ПОЛЬЗОВАТЕЛЬ КИКНУТ\n"
@@ -1734,44 +1967,105 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось кикнуть.")
 
 async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Бан пользователя"""
+    """
+    Бан пользователя — постоянный или временный.
+    
+    Использование:
+      /aban @user [длительность] [причина...]
+      (ответом на сообщение) /aban [длительность] [причина...]
+    
+    Длительность опциональна: 30m, 2h, 7d, 1w (минуты/часы/дни/недели).
+    Без длительности — бессрочный бан.
+    
+    Примеры:
+      /aban @ivan спам
+      /aban @ivan 7d флуд в чате
+      (ответом) /aban 2h оскорбления
+    """
     user_id = update.effective_user.id
     if not has_permission(user_id, 'ban', 'aban'):
-        await update.message.reply_text("❌ С 5 ранга.")
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
+    args = list(context.args or [])
     target_id = extract_user_id(update, context)
-    reason = "Без причины"
     
     if target_id:
-        reason = ' '.join(context.args) if context.args else "Без причины"
+        # reply есть — все args потенциально (длительность? + причина)
+        pass
     else:
-        if not context.args:
-            await update.message.reply_text("❌ /aban @user причина")
+        if not args:
+            await update.message.reply_text(
+                "❌ Использование: /aban <@user|ID> [длительность] [причина]\n"
+                "Длительность: 30m, 2h, 7d, 1w (опц.)"
+            )
             return
-        target_id = extract_user_id(update, context, context.args[0])
-        reason = ' '.join(context.args[1:]) if len(context.args) > 1 else "Без причины"
-    
-    if not target_id:
-        await update.message.reply_text("❌ Не найден.")
-        return
+        target_id = extract_user_id(update, context, args[0])
+        args = args[1:]
     
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
-    
-    if not target_id:
-        await update.message.reply_text("❌ Не удалось найти.")
+    if target_id is None:
+        await update.message.reply_text("❌ Пользователь не найден.")
         return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+        return
+    
+    # Первый оставшийся аргумент может быть длительностью
+    duration_td = None
+    if args:
+        d = parse_duration(args[0])
+        if d is not None:
+            duration_td = d
+            args = args[1:]
+    reason = ' '.join(args).strip() if args else "Без причины"
+    
+    banned_until_str = None
+    duration_label = "бессрочно"
+    if duration_td is not None:
+        banned_until_dt = now_msk() + duration_td
+        banned_until_str = banned_until_dt.strftime("%Y-%m-%d %H:%M:%S")
+        duration_label = format_duration(duration_td) + f" (до {banned_until_str})"
     
     target_data = get_user_data(target_id)
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    target_nick = target_data['nick'] if target_data else f"User {target_id}"
     
     await send_action_message(update, context, target_id, "ban", reason)
     
     if await ban_user_in_chat(update, context, target_id):
-        await update.message.reply_text(f"🚫 БАН\n👤 {target_name}\n📝 {reason}")
-        await notify_user(context, target_id,
-                         f"🚫 Вы забанены\n📝 {reason}\n👮 Забанил: {get_admin_nick(user_id)}")
+        # Пишем в БД статус и срок
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            '''UPDATE users SET ban_status = "Да", ban_reason = ?, ban_date = ?, banned_until = ?
+               WHERE user_id = ?''',
+            (reason, now_msk_str(), banned_until_str, target_id),
+        )
+        conn.commit()
+        conn.close()
+        
+        log_action(user_id, 'ban', target_id, f"{duration_label} — {reason}")
+        
+        issuer_name = get_admin_nick(user_id)
+        body = (
+            "🚫 БАН\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 {target_nick} ({target_name})\n"
+            f"📝 Причина: {reason}\n"
+            f"⏰ Срок: {duration_label}\n"
+            f"👮 Забанил: {issuer_name}"
+        )
+        await update.message.reply_text(body)
+        
+        await notify_user(
+            context, target_id,
+            f"🚫 Вы забанены\n"
+            f"📝 Причина: {reason}\n"
+            f"⏰ Срок: {duration_label}\n"
+            f"👮 Забанил: {issuer_name}",
+        )
     else:
         await update.message.reply_text("❌ Не удалось забанить.")
 
@@ -1859,6 +2153,7 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
     
     if success:
+        log_action(user_id, 'warn', target_id, reason or '')
         await update.message.reply_text(f"⚠️ {message}\n👤 {target_name}\n📝 {reason}")
         await notify_user(context, target_id,
                          f"⚠️ Вам выдан пред!\n📊 {message}\n📝 {reason}\n👮 Выдал: {get_admin_nick(user_id)}")
@@ -1963,6 +2258,7 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, target_id))
     conn.commit()
     conn.close()
+    log_action(user_id, 'unwarn', target_id, f"{removed_type}, было {current_warns} → стало {new_warns}")
     
     await update.message.reply_text(
         f"✅ Снят {removed_type} пред\n"
@@ -2085,6 +2381,7 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prev_dept = target_data['department']
 
     disconnect_user_from_bot(target_id)
+    log_action(user_id, 'block', target_id, f"снят {RANKS.get(prev_rank, RANKS[0])['name']}, отдел: {prev_dept}")
 
     issuer_name = get_admin_nick(user_id)
     await update.message.reply_text(
@@ -2141,6 +2438,7 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     blocked_users.discard(target_id)
+    log_action(user_id, 'unblock', target_id)
 
     issuer_name = get_admin_nick(user_id)
     await update.message.reply_text(
@@ -2946,8 +3244,102 @@ async def _broadcast_request_to_mods(context: ContextTypes.DEFAULT_TYPE, req_id:
 
 # ----------- Callback-хэндлер модерации заявки -----------
 
+async def _apply_request_decision(context: ContextTypes.DEFAULT_TYPE, query, req_id: int,
+                                   reviewer_id: int, new_status: str, comment: str = ""):
+    """
+    Применяет решение по заявке (общая логика для callback и команды).
+    query — может быть None для системных снятий, иначе редактируем сообщение модератора.
+    """
+    if not update_change_request_status(req_id, new_status, reviewer_id, comment):
+        # Кто-то опередил
+        req2 = get_change_request(req_id)
+        if query:
+            existing_reviewer = get_admin_nick(req2['reviewer_id']) if req2 and req2['reviewer_id'] else "—"
+            status_label = "✅ ОДОБРЕНО" if req2 and req2['status'] == 'approved' else "❌ ОТКАЗАНО"
+            try:
+                await query.edit_message_text(
+                    f"{query.message.text}\n\n"
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ Уже обработано: {status_label}\n"
+                    f"👮 {existing_reviewer}"
+                )
+            except Exception:
+                pass
+        return False
+    
+    req = get_change_request(req_id)
+    target_id = req['user_id']
+    target_data = get_user_data(target_id)
+    reviewer_name = get_admin_nick(reviewer_id)
+    
+    applied_text = ""
+    if new_status == 'approved':
+        if req['request_type'] == 'rank':
+            try:
+                new_rank_int = int(req['requested_value'])
+                if update_user_rank(target_id, new_rank_int):
+                    applied_text = f"⭐ Новый ранг: {RANKS.get(new_rank_int, RANKS[0])['name']}"
+                    log_action(reviewer_id, 'rank_change', target_id, f"{req['current_value']} → {new_rank_int} (заявка #{req_id})")
+            except ValueError:
+                applied_text = "⚠️ Не удалось применить ранг (некорректное значение)."
+        elif req['request_type'] == 'dept':
+            if update_user_department(target_id, req['requested_value']):
+                applied_text = f"📁 Новый отдел: {req['requested_value']}"
+                log_action(reviewer_id, 'dept_change', target_id, f"{req['current_value']} → {req['requested_value']} (заявка #{req_id})")
+    log_action(reviewer_id, 'request_' + new_status, target_id,
+               f"#{req_id} {req['request_type']}" + (f" — {comment}" if comment else ""))
+    
+    # Обновляем сообщение у модератора (если есть query)
+    status_label = "✅ ОДОБРЕНО" if new_status == 'approved' else "❌ ОТКАЗАНО"
+    extra = applied_text or ""
+    if new_status == 'rejected' and comment:
+        extra = (extra + "\n" if extra else "") + f"📝 Причина: {comment}"
+    if query:
+        try:
+            await query.edit_message_text(
+                f"{query.message.text}\n\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"{status_label}\n"
+                f"👮 Модератор: {reviewer_name}\n"
+                f"📅 {now_msk_str()}\n"
+                + extra
+            )
+        except Exception as e:
+            logger.debug(f"request decision edit failed: {e}")
+    
+    # Уведомление юзеру
+    if req['request_type'] == 'rank':
+        try:
+            cur_lbl = RANKS[int(req['current_value'])]['name']
+            new_lbl = RANKS[int(req['requested_value'])]['name']
+        except Exception:
+            cur_lbl, new_lbl = req['current_value'], req['requested_value']
+        what = f"⭐ Ранг: {cur_lbl} → {new_lbl}"
+    else:
+        what = f"📁 Отдел: {req['current_value']} → {req['requested_value']}"
+    
+    if new_status == 'approved':
+        user_msg = (
+            f"✅ ЗАЯВКА #{req_id} ОДОБРЕНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"{what}\n"
+            f"👮 Решение: {reviewer_name}"
+        )
+    else:
+        user_msg = (
+            f"❌ ЗАЯВКА #{req_id} ОТКЛОНЕНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"{what}\n"
+            f"👮 Решение: {reviewer_name}"
+        )
+        if comment:
+            user_msg += f"\n📝 Причина: {comment}"
+    await notify_user(context, target_id, user_msg)
+    return True
+
+
 async def request_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает 'rqst:appr:<id>' и 'rqst:rej:<id>'."""
+    """Обрабатывает 'rqst:appr:<id>' и 'rqst:rej:<id>' — одним кликом."""
     query = update.callback_query
     await query.answer()
     reviewer_id = query.from_user.id
@@ -2973,12 +3365,10 @@ async def request_decision_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("❌ Заявка не найдена.")
         return
 
-    # Защита от самообработки
     if req['user_id'] == reviewer_id:
         await query.answer("Нельзя обрабатывать свою же заявку.", show_alert=True)
         return
 
-    # Если статус уже не pending — кто-то опередил
     if req['status'] != 'pending':
         existing_reviewer = get_admin_nick(req['reviewer_id']) if req['reviewer_id'] else "—"
         status_label = "✅ ОДОБРЕНО" if req['status'] == 'approved' else "❌ ОТКАЗАНО"
@@ -2995,85 +3385,8 @@ async def request_decision_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     new_status = 'approved' if action == 'appr' else 'rejected'
-    # Атомарный переход pending → final
-    if not update_change_request_status(req_id, new_status, reviewer_id):
-        # Кто-то нас опередил между чтением и UPDATE — перечитаем и покажем актуальный статус
-        req2 = get_change_request(req_id)
-        existing_reviewer = get_admin_nick(req2['reviewer_id']) if req2 and req2['reviewer_id'] else "—"
-        status_label = "✅ ОДОБРЕНО" if req2 and req2['status'] == 'approved' else "❌ ОТКАЗАНО"
-        try:
-            await query.edit_message_text(
-                f"{query.message.text}\n\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"⚠️ Уже обработано: {status_label}\n"
-                f"👮 {existing_reviewer}"
-            )
-        except Exception:
-            pass
-        return
+    await _apply_request_decision(context, query, req_id, reviewer_id, new_status, "")
 
-    target_id = req['user_id']
-    target_data = get_user_data(target_id)
-    target_name = target_data['nick'] if target_data else f"User {target_id}"
-    reviewer_name = get_admin_nick(reviewer_id)
-
-    # Применяем изменение, если approved
-    applied_text = ""
-    if new_status == 'approved':
-        if req['request_type'] == 'rank':
-            try:
-                new_rank_int = int(req['requested_value'])
-                if update_user_rank(target_id, new_rank_int):
-                    applied_text = f"⭐ Новый ранг: {RANKS.get(new_rank_int, RANKS[0])['name']}"
-            except ValueError:
-                applied_text = "⚠️ Не удалось применить ранг (некорректное значение)."
-        elif req['request_type'] == 'dept':
-            if update_user_department(target_id, req['requested_value']):
-                applied_text = f"📁 Новый отдел: {req['requested_value']}"
-
-    # Обновляем сообщение у модератора
-    status_label = "✅ ОДОБРЕНО" if new_status == 'approved' else "❌ ОТКАЗАНО"
-    try:
-        await query.edit_message_text(
-            f"{query.message.text}\n\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"{status_label}\n"
-            f"👮 Модератор: {reviewer_name}\n"
-            f"📅 {now_msk_str()}\n"
-            + (f"{applied_text}" if applied_text else "")
-        )
-    except Exception as e:
-        logger.debug(f"request decision edit failed: {e}")
-
-    # Уведомляем юзера
-    if req['request_type'] == 'rank':
-        try:
-            cur_lbl = RANKS[int(req['current_value'])]['name']
-            new_lbl = RANKS[int(req['requested_value'])]['name']
-        except Exception:
-            cur_lbl, new_lbl = req['current_value'], req['requested_value']
-        what = f"⭐ Ранг: {cur_lbl} → {new_lbl}"
-    else:
-        what = f"📁 Отдел: {req['current_value']} → {req['requested_value']}"
-
-    if new_status == 'approved':
-        user_msg = (
-            f"✅ ЗАЯВКА #{req_id} ОДОБРЕНА\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"{what}\n"
-            f"👮 Решение: {reviewer_name}"
-        )
-    else:
-        user_msg = (
-            f"❌ ЗАЯВКА #{req_id} ОТКЛОНЕНА\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"{what}\n"
-            f"👮 Решение: {reviewer_name}"
-        )
-    await notify_user(context, target_id, user_msg)
-
-
-# ----------- Команды просмотра заявок -----------
 
 async def acheckall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -3185,6 +3498,283 @@ async def arequest_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=kb)
     else:
         await update.message.reply_text(text + "\n\n⏳ Ожидает решения 5+.")
+
+
+# ============ ЖУРНАЛ ДЕЙСТВИЙ И ИСТОРИЯ ============
+
+# Человекочитаемые подписи для действий из audit_log.
+_ACTION_LABELS = {
+    'rank_change':            ('⭐', 'Смена ранга'),
+    'dept_change':            ('📁', 'Смена отдела'),
+    'block':                  ('🚫', 'Отключение от бота'),
+    'unblock':                ('✅', 'Подключение к боту'),
+    'kick':                   ('👢', 'Кик'),
+    'warn':                   ('⚠️', 'Предупреждение'),
+    'unwarn':                 ('✅', 'Снятие предупреждения'),
+    'unwarnall':              ('✅', 'Снятие всех предупреждений'),
+    'warn_expired':           ('⏳', 'Предупреждение истекло'),
+    'ban':                    ('🚫', 'Бан'),
+    'unban':                  ('✅', 'Разбан'),
+    'gban':                   ('🚫', 'Глобальный ЧС'),
+    'ungban':                 ('✅', 'Удаление из ЧС'),
+    'auto_disconnect_kick':   ('🚫', 'Авто-отключение при кике'),
+    'grant':                  ('🔑', 'Выдан индивидуальный доступ'),
+    'revoke':                 ('🗑', 'Отозван индивидуальный доступ'),
+    'request_approved':       ('✅', 'Одобрена заявка'),
+    'request_rejected':       ('❌', 'Отклонена заявка'),
+    'award':                  ('🏅', 'Награда'),
+    'special_grant':          ('🔐', 'Выдан спецдопуск'),
+    'special_revoke':         ('🔓', 'Снят спецдопуск'),
+}
+
+
+def _format_audit_row(row: tuple, focus: str = 'all') -> str:
+    """
+    Форматирует строку audit_log для вывода.
+    focus: 'all' (показывать и actor, и target), 'on' (action над target — показываем actor),
+           'by' (action от actor — показываем target).
+    """
+    _id, actor_id, action, target_id, details, created_at = row
+    emoji, label = _ACTION_LABELS.get(action, ('•', action))
+    
+    parts = [f"🕐 {created_at}", f"{emoji} {label}"]
+    if focus in ('all', 'by') and target_id:
+        td = get_user_data(target_id)
+        tn = td['nick'] if td else f"id {target_id}"
+        parts.append(f"→ {tn}")
+    if focus in ('all', 'on') and actor_id:
+        ad = get_user_data(actor_id)
+        an = ad['nick'] if ad else f"id {actor_id}"
+        parts.append(f"от {an}")
+    elif focus in ('all', 'on') and actor_id is None:
+        parts.append("от системы")
+    line = " | ".join(parts)
+    if details:
+        line += f"\n   📝 {details}"
+    return line
+
+
+async def aaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Журнал действий администрации.
+    
+    /aaudit                — последние 30 действий по всем
+    /aaudit @user          — действия НАД юзером и ОТ юзера
+    /aaudit by @user       — только действия ОТ юзера (что он сделал)
+    /aaudit on @user       — только действия НАД юзером (что с ним сделали)
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'aaudit'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    
+    args = list(context.args or [])
+    mode = 'all'  # 'all' | 'by' | 'on'
+    target_arg = None
+    
+    if args:
+        if args[0].lower() in ('by', 'on'):
+            mode = args[0].lower()
+            target_arg = args[1] if len(args) > 1 else None
+        else:
+            target_arg = args[0]
+            mode = 'either'  # покажем по любой стороне
+    
+    target_id = None
+    if target_arg:
+        target_id = extract_user_id(update, context, target_arg)
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id is None or target_id == -1:
+            await update.message.reply_text("❌ Пользователь не найден или несколько совпадений.")
+            return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if target_id is None:
+        c.execute('SELECT id, actor_id, action, target_id, details, created_at FROM audit_log ORDER BY id DESC LIMIT 30')
+    elif mode == 'by':
+        c.execute('SELECT id, actor_id, action, target_id, details, created_at FROM audit_log WHERE actor_id = ? ORDER BY id DESC LIMIT 50', (target_id,))
+    elif mode == 'on':
+        c.execute('SELECT id, actor_id, action, target_id, details, created_at FROM audit_log WHERE target_id = ? ORDER BY id DESC LIMIT 50', (target_id,))
+    else:  # either
+        c.execute(
+            '''SELECT id, actor_id, action, target_id, details, created_at FROM audit_log
+               WHERE actor_id = ? OR target_id = ?
+               ORDER BY id DESC LIMIT 50''',
+            (target_id, target_id),
+        )
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        await update.message.reply_text(
+            "📜 ЖУРНАЛ ДЕЙСТВИЙ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Записей не найдено."
+        )
+        return
+    
+    # Подберём header
+    if target_id is None:
+        header = "📜 ЖУРНАЛ ДЕЙСТВИЙ — последние"
+    else:
+        td = get_user_data(target_id)
+        tn = td['nick'] if td else f"id {target_id}"
+        if mode == 'by':
+            header = f"📜 ДЕЙСТВИЯ ОТ {tn}"
+        elif mode == 'on':
+            header = f"📜 ДЕЙСТВИЯ НАД {tn}"
+        else:
+            header = f"📜 ЖУРНАЛ ПО {tn}"
+    
+    focus = 'all'
+    if mode == 'by':
+        focus = 'by'
+    elif mode == 'on':
+        focus = 'on'
+    
+    lines = [header, "━━━━━━━━━━━━━━━━━"]
+    for row in rows:
+        lines.append(_format_audit_row(row, focus=focus))
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append(f"Записей: {len(rows)}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def ahistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Полная история пользователя: aудит, варны, награды, заявки — единой лентой.
+    
+    /ahistory <user>   или   /ahistory (ответом на сообщение)
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'search', 'ahistory'):
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        await update.message.reply_text("❌ Использование: /ahistory <user> или ответом на сообщение.")
+        return
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id is None or target_id == -1:
+        await update.message.reply_text("❌ Пользователь не найден или несколько совпадений.")
+        return
+    
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+        return
+    
+    events = []  # list of (created_at, line)
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    # 1) audit_log: всё, где он target
+    c.execute(
+        'SELECT id, actor_id, action, target_id, details, created_at FROM audit_log WHERE target_id = ? ORDER BY id DESC',
+        (target_id,),
+    )
+    for row in c.fetchall():
+        events.append((row[5], _format_audit_row(row, focus='on')))
+    
+    # 2) Награды
+    c.execute(
+        "SELECT award_name, award_type, date, issued_by FROM awards WHERE user_id = ? ORDER BY id DESC",
+        (target_id,),
+    )
+    for award_name, award_type, date, issued_by in c.fetchall():
+        by = get_admin_nick(issued_by) if issued_by else "—"
+        events.append((date or "", f"🕐 {date} | 🏅 Награда: {award_name} ({award_type}) | от {by}"))
+    
+    # 3) Варны (включая истёкшие и снятые — для истории полная картина)
+    c.execute(
+        '''SELECT id, warn_type, counter, reason, date, issued_by, expires_at
+           FROM warnings WHERE user_id = ? ORDER BY id DESC''',
+        (target_id,),
+    )
+    for wid, wtype, counter, reason, date, issued_by, expires_at in c.fetchall():
+        by = get_admin_nick(issued_by) if issued_by else "—"
+        if counter == "0/0":
+            tag = "(снят)"
+        elif counter == "EXPIRED":
+            tag = "(истёк)"
+        else:
+            tag = f"({counter})"
+        events.append((date or "", f"🕐 {date} | ⚠️ {wtype} {tag} | {reason} | от {by}"))
+    
+    # 4) Заявки от него самого
+    c.execute(
+        '''SELECT id, request_type, current_value, requested_value, status, decided_at, created_at
+           FROM change_requests WHERE user_id = ? ORDER BY id DESC''',
+        (target_id,),
+    )
+    for rid, rtype, cur, new, status, decided_at, created_at in c.fetchall():
+        tlabel = "ранг" if rtype == 'rank' else "отдел"
+        slabel = {'pending': '⏳ ожидает', 'approved': '✅ одобрена', 'rejected': '❌ отказ'}.get(status, status)
+        events.append((created_at or "", f"🕐 {created_at} | 📥 Заявка #{rid} ({tlabel}): {cur} → {new} — {slabel}"))
+    
+    # 5) Гбан, если есть
+    c.execute('SELECT reason, banned_by, date FROM gban WHERE user_id = ?', (target_id,))
+    row = c.fetchone()
+    if row:
+        events.append((row[2] or "", f"🕐 {row[2]} | 🚫 В чёрном списке (гбан): {row[0]} | от {get_admin_nick(row[1])}"))
+    
+    # 6) Гранты
+    c.execute(
+        'SELECT command, granted_by, granted_at FROM command_grants WHERE user_id = ? ORDER BY granted_at DESC',
+        (target_id,),
+    )
+    for cmd, granted_by, granted_at in c.fetchall():
+        by = get_admin_nick(granted_by) if granted_by else "—"
+        events.append((granted_at or "", f"🕐 {granted_at} | 🔑 Грант на /{cmd} | от {by}"))
+    
+    conn.close()
+    
+    # Сортируем по времени убыванию
+    events.sort(key=lambda x: x[0] or "", reverse=True)
+    
+    header = (
+        "📜 ИСТОРИЯ ПОЛЬЗОВАТЕЛЯ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+        f"🆔 {target_id}\n"
+        f"⭐ Сейчас: {RANKS.get(target_data['rank'], RANKS[0])['name']}\n"
+        f"📁 Сейчас: {target_data['department']}\n"
+        f"📅 Регистрация: {target_data['reg_date']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+    )
+    
+    if not events:
+        await update.message.reply_text(header + "Событий пока нет.")
+        return
+    
+    # Аккуратно обрезаем под лимит Telegram
+    body_parts = []
+    body_len = 0
+    LIMIT = 3800
+    truncated = 0
+    for _, line in events:
+        chunk = line + "\n\n"
+        if body_len + len(chunk) > LIMIT:
+            truncated = len(events) - len(body_parts)
+            break
+        body_parts.append(chunk)
+        body_len += len(chunk)
+    
+    text = header + "".join(body_parts)
+    if truncated:
+        text += f"…и ещё {truncated} событий (свернуто, открыть подробнее: /aaudit on {target_id})"
+    await update.message.reply_text(text)
+
 
 # ============ ОСТАЛЬНЫЕ КОМАНДЫ ============
 
@@ -3735,6 +4325,7 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось обновить ранг (БД).")
         return
     
+    log_action(user_id, 'rank_change', target_id, f"{target_data['rank']} → {new_rank} ({RANKS[new_rank]['name']})")
     issuer_name = get_admin_nick(user_id)
     await update.message.reply_text(
         "⭐ ИЗМЕНЕНИЕ РАНГА\n"
@@ -3813,6 +4404,7 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось обновить отдел (БД).")
         return
     
+    log_action(user_id, 'dept_change', target_id, f"{target_data['department']} → {new_dept}")
     issuer_name = get_admin_nick(user_id)
     await update.message.reply_text(
         "📁 ИЗМЕНЕНИЕ ОТДЕЛА\n"
@@ -3830,7 +4422,7 @@ async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Разбан"""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'ban', 'aunban'):
-        await update.message.reply_text("❌ С 5 ранга.")
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
     target_id = extract_user_id(update, context)
@@ -3840,13 +4432,40 @@ async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = await get_target_id(update, context, target_id)
     
     if not target_id:
-        await update.message.reply_text("❌ Не найден.")
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
         return
     
     if await unban_user_in_chat(update, context, target_id):
-        await update.message.reply_text("✅ Разбанен.")
+        # Чистим БД: статус, причину, дату, banned_until
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            'UPDATE users SET ban_status = "Нет", ban_reason = "", ban_date = "", banned_until = NULL WHERE user_id = ?',
+            (target_id,),
+        )
+        conn.commit()
+        conn.close()
+        
+        log_action(user_id, 'unban', target_id)
+        
+        target_data = get_user_data(target_id)
+        target_name = target_data['callsign'] if target_data else f"User {target_id}"
+        issuer_name = get_admin_nick(user_id)
+        await update.message.reply_text(
+            "✅ РАЗБАН\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 {target_name}\n"
+            f"👮 Разбанил: {issuer_name}"
+        )
+        await notify_user(
+            context, target_id,
+            f"✅ Вы разбанены.\n👮 Разбанил: {issuer_name}",
+        )
     else:
-        await update.message.reply_text("❌ Ошибка.")
+        await update.message.reply_text("❌ Не удалось разбанить.")
 
 async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снятие глобального бана"""
@@ -4371,6 +4990,7 @@ async def agrant(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         if grant_command_access(target_id, cmd, user_id):
             granted.append(cmd)
+            log_action(user_id, 'grant', target_id, f"/{cmd}")
         else:
             already.append(cmd)
     
@@ -4473,6 +5093,7 @@ async def arevoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cmd = cmd.lstrip('/').strip()
         if revoke_command_access(target_id, cmd):
             revoked.append(cmd)
+            log_action(user_id, 'revoke', target_id, f"/{cmd}")
         else:
             missing.append(cmd)
     
@@ -5349,6 +5970,7 @@ def main():
         'arequests': arequests, 'arequest_info': arequest_info,
         'acheckall': acheckall,
         'ablocklist': ablocklist,
+        'aaudit': aaudit, 'ahistory': ahistory,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -5405,6 +6027,10 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
     
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
+    # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
+    application.job_queue.run_repeating(expire_warnings_job, interval=3600, first=30)
+    # Авто-разбан временных банов: проверяем каждые 5 минут.
+    application.job_queue.run_repeating(auto_unban_job, interval=300, first=45)
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
