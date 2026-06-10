@@ -69,6 +69,17 @@ CONFERENCE_CHAT_ID = -1003389197905
 
 chat_messages = []
 
+# === Игровые серверы для команд онлайн-статуса ===
+# Сюда можно добавлять любые SAMP/CRMP/open.mp-серверы — query будет
+# работать единообразно. Порядок важен только для отображения.
+GAME_SERVERS = [
+    {"name": "Radmir CRMP №02 (Hassle Online)", "ip": "185.169.134.140", "port": 7777},
+]
+
+# Сколько секунд держать кэш онлайна перед повторным опросом.
+# 300 — раз в 5 минут это безопасно для сервера и не дребезжит ботом.
+GAME_ONLINE_CACHE_TTL = 300
+
 # Множество user_id, отключённых от бота. Заполняется при старте и
 # обновляется командами /ablock и /aunblock. Используется в gate-хэндлере,
 # чтобы не дёргать SQLite на каждое сообщение.
@@ -1410,6 +1421,9 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /find — руководящий состав\n"
         "├ /awarns — ваши предупреждения\n"
         "├ /aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
+        "├ /aonline — кто из конфы сейчас в игре\n"
+        "├ /agame [@user] — онлайн-статус игрока\n"
+        "├ /aserverinfo — состояние игровых серверов\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -4633,6 +4647,346 @@ def _first_int_in_args(args) -> int:
     return None
 
 
+# ============ SAMP QUERY — ОНЛАЙН ИГРОКОВ НА СЕРВЕРАХ ============
+# Реализуем минимальный SAMP query-клиент через сырые UDP-сокеты, чтобы
+# не тянуть внешние библиотеки (samp-query тянет trio, а у нас asyncio).
+# Все блокирующие сокет-операции уносятся в asyncio.to_thread.
+
+import socket as _socket
+import struct as _struct
+
+# Кэш: { server_id_string: {"fetched_at": datetime, "info": dict, "players": list[(nick, score)]} }
+_samp_cache: dict = {}
+
+
+def _samp_query_sync(ip: str, port: int, opcode: bytes, timeout: float = 3.0):
+    """
+    Один UDP-запрос к SAMP-серверу. Возвращает payload (без 11-байтного эхо-заголовка)
+    либо None при таймауте/ошибке.
+    """
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        ip_resolved = _socket.gethostbyname(ip)
+        ip_bytes = bytes(int(x) for x in ip_resolved.split('.'))
+        port_bytes = _struct.pack('<H', port)
+        req = b'SAMP' + ip_bytes + port_bytes + opcode
+        sock.sendto(req, (ip_resolved, port))
+        data, _addr = sock.recvfrom(8192)
+        if len(data) < 11:
+            return None
+        return data[11:]
+    except Exception as e:
+        logger.debug(f"samp_query {ip}:{port} opcode={opcode!r} error: {e}")
+        return None
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _parse_samp_info(payload: bytes) -> dict:
+    """Распарсить ответ на opcode 'i' (общая инфа сервера)."""
+    if not payload or len(payload) < 11:
+        return None
+    try:
+        o = 0
+        password = payload[o]; o += 1
+        players = _struct.unpack('<H', payload[o:o+2])[0]; o += 2
+        max_p = _struct.unpack('<H', payload[o:o+2])[0]; o += 2
+        hlen = _struct.unpack('<I', payload[o:o+4])[0]; o += 4
+        hostname = payload[o:o+hlen].decode('cp1251', errors='replace'); o += hlen
+        glen = _struct.unpack('<I', payload[o:o+4])[0]; o += 4
+        gamemode = payload[o:o+glen].decode('cp1251', errors='replace'); o += glen
+        llen = _struct.unpack('<I', payload[o:o+4])[0]; o += 4
+        language = payload[o:o+llen].decode('cp1251', errors='replace')
+        return {
+            'password': bool(password),
+            'players': players,
+            'max_players': max_p,
+            'hostname': hostname.strip(),
+            'gamemode': gamemode.strip(),
+            'language': language.strip(),
+        }
+    except Exception as e:
+        logger.debug(f"_parse_samp_info error: {e}")
+        return None
+
+
+def _parse_samp_clients(payload: bytes) -> list:
+    """
+    Распарсить ответ на opcode 'c' — список (nick, score). Лимит протокола: до 100 игроков.
+    При >100 на сервере многие реализации возвращают пустой ответ — это норма для SAMP query,
+    а не баг кода.
+    """
+    if not payload or len(payload) < 2:
+        return []
+    try:
+        count = _struct.unpack('<H', payload[:2])[0]
+        o = 2
+        players = []
+        for _ in range(count):
+            if o >= len(payload):
+                break
+            nlen = payload[o]; o += 1
+            nick = payload[o:o+nlen].decode('cp1251', errors='replace'); o += nlen
+            if o + 4 > len(payload):
+                break
+            score = _struct.unpack('<i', payload[o:o+4])[0]; o += 4
+            players.append((nick, score))
+        return players
+    except Exception as e:
+        logger.debug(f"_parse_samp_clients error: {e}")
+        return []
+
+
+def _samp_fetch_server(ip: str, port: int) -> dict:
+    """
+    Синхронно запрашивает info+clients и возвращает структуру:
+      {"info": {...} or None, "players": [(nick, score), ...], "limited": bool}
+    "limited" = True если онлайн > 100 (SAMP query клиентов не отдал, хотя info прошёл).
+    """
+    info_payload = _samp_query_sync(ip, port, b'i')
+    info = _parse_samp_info(info_payload) if info_payload else None
+    
+    clients_payload = _samp_query_sync(ip, port, b'c')
+    players = _parse_samp_clients(clients_payload)
+    
+    limited = bool(info) and info['players'] > 0 and not players and info['players'] >= 100
+    return {"info": info, "players": players, "limited": limited}
+
+
+async def get_samp_snapshot(ip: str, port: int, force: bool = False) -> dict:
+    """
+    Возвращает свежий или кэшированный снимок сервера. force=True игнорирует кэш.
+    Структура: {"info": ..., "players": [...], "limited": bool, "fetched_at": str, "stale": bool}
+    """
+    key = f"{ip}:{port}"
+    now = now_msk()
+    cached = _samp_cache.get(key)
+    
+    if not force and cached:
+        age = (now - cached["fetched_at"]).total_seconds()
+        if age < GAME_ONLINE_CACHE_TTL:
+            return {**cached["data"], "fetched_at": cached["fetched_at"].strftime("%H:%M:%S"), "stale": False}
+    
+    # Запрашиваем (uncached). Уносим блокирующие UDP в тред.
+    data = await asyncio.to_thread(_samp_fetch_server, ip, port)
+    _samp_cache[key] = {"fetched_at": now, "data": data}
+    return {**data, "fetched_at": now.strftime("%H:%M:%S"), "stale": False}
+
+
+async def aonline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кто из участников конференции сейчас онлайн в игре."""
+    user_id = update.effective_user.id
+    ud = get_user_data(user_id)
+    if not ud:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
+        return
+    
+    if not GAME_SERVERS:
+        await update.message.reply_text("ℹ️ Игровые серверы не настроены.")
+        return
+    
+    waiting = await update.message.reply_text("🎮 Опрашиваю игровые серверы...")
+    
+    # Тянем все ники из БД ОДИН раз и складываем в lower-case → user_data
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT user_id, game_nick, callsign FROM users WHERE bot_blocked = "Нет"')
+    nick_to_user = {}
+    for row in c.fetchall():
+        nick = (row['game_nick'] or '').strip()
+        if nick:
+            nick_to_user[nick.lower()] = {
+                'user_id': row['user_id'],
+                'nick': nick,
+                'callsign': row['callsign'],
+            }
+    conn.close()
+    
+    lines = [
+        "🎮 ОНЛАЙН ИЗ КОНФЕРЕНЦИИ",
+        "━━━━━━━━━━━━━━━━━",
+    ]
+    any_online = False
+    total_matched = 0
+    
+    for srv in GAME_SERVERS:
+        snap = await get_samp_snapshot(srv['ip'], srv['port'])
+        info = snap.get('info')
+        players = snap.get('players') or []
+        
+        if not info and not players:
+            lines.append(f"📡 {srv['name']}")
+            lines.append("   ⚠️ Сервер не ответил (таймаут/недоступен)")
+            lines.append("─────────────────")
+            continue
+        
+        if info:
+            lines.append(f"📡 {srv['name']}")
+            lines.append(f"   🌐 онлайн: {info['players']}/{info['max_players']}")
+        else:
+            lines.append(f"📡 {srv['name']}")
+        
+        # Сопоставляем
+        matched = []
+        for nick, score in players:
+            u = nick_to_user.get(nick.lower())
+            if u:
+                matched.append((u['nick'], u['callsign'], score))
+        matched.sort(key=lambda x: -x[2])  # по убыванию score
+        
+        if matched:
+            total_matched += len(matched)
+            lines.append(f"   👥 наших онлайн: {len(matched)}")
+            for nick, callsign, score in matched:
+                lines.append(f"   • {nick} ({callsign}) — score {score}")
+            any_online = True
+        elif snap.get('limited'):
+            lines.append("   ⚠️ На сервере >100 игроков — SAMP query не отдаёт полный список.")
+        else:
+            lines.append("   — никого из наших не видно")
+        lines.append("─────────────────")
+    
+    lines.append(f"🕐 Данные обновляются раз в {GAME_ONLINE_CACHE_TTL // 60} мин.")
+    if not any_online and total_matched == 0:
+        lines.append("ℹ️ Если игрок только что зашёл — попробуйте через несколько минут.")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    try:
+        await waiting.edit_text(text)
+    except Exception:
+        await update.message.reply_text(text)
+
+
+async def agame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверить онлайн-статус конкретного участника."""
+    user_id = update.effective_user.id
+    ud = get_user_data(user_id)
+    if not ud:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
+        return
+    
+    # Цель: reply, аргумент, или сам юзер
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if not target_id:
+        target_id = user_id
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id is None or target_id == -1:
+        await update.message.reply_text("❌ Пользователь не найден или несколько совпадений.")
+        return
+    
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован.")
+        return
+    if not target_data.get('nick'):
+        await update.message.reply_text("❌ У пользователя не указан игровой ник.")
+        return
+    
+    target_nick_lower = target_data['nick'].strip().lower()
+    waiting = await update.message.reply_text(f"🎮 Ищу {target_data['nick']} на серверах...")
+    
+    found_on = []
+    not_responded = []
+    limited_servers = []
+    
+    for srv in GAME_SERVERS:
+        snap = await get_samp_snapshot(srv['ip'], srv['port'])
+        info = snap.get('info')
+        players = snap.get('players') or []
+        if not info and not players:
+            not_responded.append(srv['name'])
+            continue
+        for nick, score in players:
+            if nick.strip().lower() == target_nick_lower:
+                found_on.append((srv['name'], nick, score, info))
+                break
+        else:
+            if snap.get('limited'):
+                limited_servers.append(srv['name'])
+    
+    lines = [
+        "🎮 ОНЛАЙН-СТАТУС",
+        "━━━━━━━━━━━━━━━━━",
+        f"👤 {target_data['nick']} ({target_data['callsign']})",
+        "━━━━━━━━━━━━━━━━━",
+    ]
+    if found_on:
+        for srv_name, nick, score, info in found_on:
+            lines.append(f"✅ Онлайн: {srv_name}")
+            lines.append(f"   📊 score: {score}")
+            if info:
+                lines.append(f"   🌐 на сервере {info['players']}/{info['max_players']}")
+    else:
+        lines.append("⚪ Не обнаружен на проверенных серверах.")
+    if limited_servers:
+        lines.append("")
+        lines.append("⚠️ На этих серверах >100 игроков — query не отдал список:")
+        for s in limited_servers:
+            lines.append(f"   • {s}")
+    if not_responded:
+        lines.append("")
+        lines.append("📡 Не ответили (таймаут):")
+        for s in not_responded:
+            lines.append(f"   • {s}")
+    
+    text = "\n".join(lines)
+    try:
+        await waiting.edit_text(text)
+    except Exception:
+        await update.message.reply_text(text)
+
+
+async def aserverinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Информация по игровым серверам (для диагностики query-связи).
+    Если эта команда тоже выдаёт таймаут — query-протокол не проходит из вашего окружения.
+    """
+    if not GAME_SERVERS:
+        await update.message.reply_text("ℹ️ Игровые серверы не настроены.")
+        return
+    
+    waiting = await update.message.reply_text("📡 Опрашиваю серверы...")
+    lines = ["📡 СОСТОЯНИЕ ИГРОВЫХ СЕРВЕРОВ", "━━━━━━━━━━━━━━━━━"]
+    for srv in GAME_SERVERS:
+        # force=True — игнорируем кэш для диагностики
+        snap = await get_samp_snapshot(srv['ip'], srv['port'], force=True)
+        info = snap.get('info')
+        players = snap.get('players') or []
+        lines.append(f"🖥 {srv['name']}")
+        lines.append(f"   {srv['ip']}:{srv['port']}")
+        if info:
+            lines.append(f"   🌐 онлайн: {info['players']}/{info['max_players']}")
+            lines.append(f"   🎮 gamemode: {info['gamemode'] or '—'}")
+            lines.append(f"   🌍 язык: {info['language'] or '—'}")
+            lines.append(f"   🔒 пароль: {'да' if info['password'] else 'нет'}")
+            if players:
+                lines.append(f"   📋 query отдал список: {len(players)} ник(ов)")
+            elif info['players'] >= 100:
+                lines.append("   ⚠️ список не отдан (>100 игроков — лимит SAMP query)")
+            else:
+                lines.append("   ℹ️ список пуст")
+        else:
+            lines.append("   ❌ Не ответил (таймаут).")
+            lines.append("   Если ваша среда фильтрует исходящий UDP — query работать не будет.")
+        lines.append("─────────────────")
+    
+    text = "\n".join(lines)
+    try:
+        await waiting.edit_text(text)
+    except Exception:
+        await update.message.reply_text(text)
+
+
 async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Установка ранга. Работает и в ЛС, и в конференции (с reply или с @user)."""
     user_id = update.effective_user.id
@@ -6340,6 +6694,7 @@ def main():
         'aaudit': aaudit, 'ahistory': ahistory,
         'amooddebug': amooddebug,
         'aunwarngame': aunwarngame,
+        'aonline': aonline, 'agame': agame, 'aserverinfo': aserverinfo,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
