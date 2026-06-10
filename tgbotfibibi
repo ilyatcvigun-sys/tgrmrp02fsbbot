@@ -42,6 +42,15 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_API_KEY = "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"
 OPENROUTER_MODEL = "google/gemma-3-27b-it:free"
+# Цепочка fallback-моделей: пробуем по порядку, пока одна не отдаст валидный JSON.
+# Free-tier модели OpenRouter иногда внезапно перестают отвечать или начинают
+# возвращать пустоту — поэтому держим запас.
+OPENROUTER_FALLBACK_MODELS = [
+    "google/gemma-3-27b-it:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+]
 
 GAME_NICK, CALLSIGN = range(2)
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
@@ -685,6 +694,14 @@ def init_database():
     try:
         c.execute('ALTER TABLE users ADD COLUMN banned_until TEXT')
         logger.info("Migration: added users.banned_until column")
+    except sqlite3.OperationalError:
+        pass
+    
+    # Миграция для игры за снятие предупреждения: когда последний раз играл.
+    # Используется для проверки КД (14 дней) на /aunwarngame.
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN last_warn_game_at TEXT')
+        logger.info("Migration: added users.last_warn_game_at column")
     except sqlite3.OperationalError:
         pass
     
@@ -1392,6 +1409,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /asearch <жетон> — поиск по жетону\n"
         "├ /find — руководящий состав\n"
         "├ /awarns — ваши предупреждения\n"
+        "├ /aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -1762,7 +1780,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"├ /ahelp — Команды\n"
             f"├ /find — Руководящий состав\n"
             f"├ /anick имя — Найти по нику\n"
-            f"├ /awarns — Ваши преды\n"
+            f"├ /awarns — Ваши предупреждения\n"
             f"└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
         )
         
@@ -1838,7 +1856,7 @@ async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"▫️ Всего участников: *{total_users}*\n\n"
         f"📋 *ПОЛЕЗНЫЕ КОМАНДЫ:*\n"
         f"├ /ainfo — Ваш профиль\n├ /ahelp — Команды\n├ /find — Руководящий состав\n"
-        f"├ /anick имя — Найти по нику\n├ /awarns — Ваши преды\n"
+        f"├ /anick имя — Найти по нику\n├ /awarns — Ваши предупреждения\n"
         f"└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
     )
     
@@ -2311,6 +2329,265 @@ async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ Было: {old_warns} → Стало: 0/0"
     )
 
+# ============ ИГРА ЗА СНЯТИЕ ПРЕДУПРЕЖДЕНИЯ ============
+# Камень-ножницы-бумага, best-of-3. Победа — снимается одно (самое свежее активное) предупреждение.
+# КД 14 дней независимо от исхода — ставится в момент СТАРТА игры, чтобы нельзя было повторять,
+# пока не повезёт.
+
+WARN_GAME_COOLDOWN_DAYS = 14
+_WG_LABELS = {'R': '✊ Камень', 'P': '✋ Бумага', 'S': '✌ Ножницы'}
+
+
+def _wg_round_result(user_choice: str, bot_choice: str) -> str:
+    """Возвращает 'win' | 'loss' | 'draw'."""
+    if user_choice == bot_choice:
+        return 'draw'
+    beats = {'R': 'S', 'P': 'R', 'S': 'P'}  # ключ бьёт значение
+    return 'win' if beats.get(user_choice) == bot_choice else 'loss'
+
+
+def _wg_picker_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✊", callback_data="wgame:R"),
+        InlineKeyboardButton("✋", callback_data="wgame:P"),
+        InlineKeyboardButton("✌", callback_data="wgame:S"),
+    ]])
+
+
+def _wg_count_active_warns(user_id: int) -> int:
+    """Сколько у юзера активных предупреждений (не снятых и не истёкших)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'SELECT COUNT(*) FROM warnings WHERE user_id = ? AND counter != "0/0" AND counter != "EXPIRED"',
+        (user_id,),
+    )
+    n = c.fetchone()[0]
+    conn.close()
+    return n
+
+
+def _wg_get_cooldown_remaining(user_id: int):
+    """Возвращает timedelta до окончания КД, либо None если КД нет/прошло."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT last_warn_game_at FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        last = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+    except Exception:
+        return None
+    next_avail = last + timedelta(days=WARN_GAME_COOLDOWN_DAYS)
+    now = now_msk()
+    if next_avail <= now:
+        return None
+    return next_avail - now
+
+
+def _wg_set_cooldown(user_id: int):
+    """Ставим КД с момента вызова."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET last_warn_game_at = ? WHERE user_id = ?', (now_msk_str("%Y-%m-%d %H:%M:%S"), user_id))
+    conn.commit()
+    conn.close()
+
+
+def _wg_remove_one_warn(user_id: int) -> str:
+    """
+    Снимаем ОДНО самое свежее активное предупреждение. Возвращает текст с описанием
+    что было снято, либо пустую строку если не нашли.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''SELECT id, warn_type FROM warnings
+           WHERE user_id = ? AND counter != "0/0" AND counter != "EXPIRED"
+           ORDER BY id DESC LIMIT 1''',
+        (user_id,),
+    )
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return ""
+    warn_id, wtype = row
+    c.execute('UPDATE warnings SET counter = "0/0" WHERE id = ?', (warn_id,))
+    
+    # Понижаем счётчик users.warns строго по типу
+    c.execute('SELECT warns FROM users WHERE user_id = ?', (user_id,))
+    parts = (c.fetchone()[0] or "0/0").split('/')
+    verbal = int(parts[0]) if len(parts) == 2 and parts[0].isdigit() else 0
+    written = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 0
+    if wtype == "Устное":
+        verbal = max(0, verbal - 1)
+    elif wtype == "Письменное":
+        written = max(0, written - 1)
+    c.execute('UPDATE users SET warns = ? WHERE user_id = ?', (f"{verbal}/{written}", user_id))
+    conn.commit()
+    conn.close()
+    return f"{wtype} (warn_id={warn_id})"
+
+
+async def aunwarngame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Сыграть с ботом за снятие одного предупреждения.
+    Камень-ножницы-бумага до 2 побед. КД 14 дней независимо от исхода.
+    """
+    if not is_private_chat(update):
+        await update.message.reply_text("❌ Команду нужно выполнять в личных сообщениях бота.")
+        return
+    
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
+        return
+    if is_user_blocked(user_id):
+        return  # gate в любом случае отрежет, но на всякий
+    
+    # Есть ли что снимать?
+    active = _wg_count_active_warns(user_id)
+    if active == 0:
+        await update.message.reply_text(
+            "🎮 ИГРА ЗА СНЯТИЕ ПРЕДУПРЕЖДЕНИЯ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "ℹ️ У вас нет активных предупреждений — снимать нечего."
+        )
+        return
+    
+    # КД
+    remaining = _wg_get_cooldown_remaining(user_id)
+    if remaining is not None:
+        await update.message.reply_text(
+            "🎮 ИГРА ЗА СНЯТИЕ ПРЕДУПРЕЖДЕНИЯ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"⏳ Слишком рано: до следующей попытки {format_duration(remaining)}.\n"
+            f"Откат — {WARN_GAME_COOLDOWN_DAYS} дней с момента последней игры."
+        )
+        return
+    
+    # Ставим КД СРАЗУ при старте, чтобы нельзя было «передумать»
+    _wg_set_cooldown(user_id)
+    log_action(user_id, 'warn_game_start', user_id,
+               f"активных предупреждений: {active}")
+    
+    # Состояние игры — в user_data
+    context.user_data['warngame'] = {'wins': 0, 'losses': 0, 'round': 0, 'log': []}
+    
+    await update.message.reply_text(
+        "🎮 ИГРА ЗА СНЯТИЕ ПРЕДУПРЕЖДЕНИЯ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Правила: камень-ножницы-бумага, до 2 побед.\n"
+        f"⚠️ Активных предупреждений: {active}\n"
+        f"🏆 При победе снимется одно (самое свежее).\n"
+        f"⏳ КД на повторную игру: {WARN_GAME_COOLDOWN_DAYS} дней — уже зафиксирован.\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Раунд 1. Ваш ход:",
+        reply_markup=_wg_picker_keyboard(),
+    )
+
+
+async def warn_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка хода в КНБ-игре. callback_data='wgame:R|P|S'."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    state = context.user_data.get('warngame')
+    if not state:
+        try:
+            await query.edit_message_text(
+                "🎮 Сессия игры истекла.\n"
+                "Если КД ещё активно — повторите позже. Иначе запустите снова: /aunwarngame"
+            )
+        except Exception:
+            pass
+        return
+    
+    data = (query.data or "").split(":")
+    if len(data) != 2 or data[1] not in ('R', 'P', 'S'):
+        return
+    user_choice = data[1]
+    bot_choice = random.choice(['R', 'P', 'S'])
+    result = _wg_round_result(user_choice, bot_choice)
+    
+    state['round'] += 1
+    line = f"Раунд {state['round']}: {_WG_LABELS[user_choice]} vs {_WG_LABELS[bot_choice]} → "
+    if result == 'win':
+        state['wins'] += 1
+        line += "✅ ваша победа"
+    elif result == 'loss':
+        state['losses'] += 1
+        line += "❌ победа бота"
+    else:
+        line += "🤝 ничья"
+    state['log'].append(line)
+    
+    # Проверяем финал: 2 победы или 3 раунда сыграно
+    finished = state['wins'] >= 2 or state['losses'] >= 2 or state['round'] >= 3
+    
+    if not finished:
+        text = (
+            "🎮 КАМЕНЬ-НОЖНИЦЫ-БУМАГА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(state['log'])
+            + f"\n━━━━━━━━━━━━━━━━━\n"
+            f"📊 Счёт: вы {state['wins']} — {state['losses']} бот\n\n"
+            f"Раунд {state['round'] + 1}. Ваш ход:"
+        )
+        try:
+            await query.edit_message_text(text, reply_markup=_wg_picker_keyboard())
+        except Exception:
+            pass
+        return
+    
+    # === Финал ===
+    user_won = state['wins'] > state['losses']
+    context.user_data.pop('warngame', None)  # очищаем сессию
+    
+    if user_won:
+        removed = _wg_remove_one_warn(user_id)
+        if removed:
+            log_action(user_id, 'warn_game_win', user_id, removed)
+            final = (
+                "🎮 РЕЗУЛЬТАТ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                + "\n".join(state['log'])
+                + f"\n━━━━━━━━━━━━━━━━━\n"
+                f"📊 Счёт: вы {state['wins']} — {state['losses']} бот\n"
+                f"🏆 Победа! Снято одно предупреждение.\n"
+                f"⏳ Следующая игра — через {WARN_GAME_COOLDOWN_DAYS} дней."
+            )
+        else:
+            # Маловероятно — пока игра шла, варн истёк/был снят
+            final = (
+                "🎮 РЕЗУЛЬТАТ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                + "\n".join(state['log'])
+                + f"\n━━━━━━━━━━━━━━━━━\n"
+                f"🏆 Победа! Но к моменту окончания игры активных предупреждений не осталось — ничего не снято."
+            )
+    else:
+        log_action(user_id, 'warn_game_loss', user_id, "")
+        final = (
+            "🎮 РЕЗУЛЬТАТ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(state['log'])
+            + f"\n━━━━━━━━━━━━━━━━━\n"
+            f"📊 Счёт: вы {state['wins']} — {state['losses']} бот\n"
+            f"😔 Поражение. Предупреждения остаются.\n"
+            f"⏳ Попробовать снова можно через {WARN_GAME_COOLDOWN_DAYS} дней."
+        )
+    
+    try:
+        await query.edit_message_text(final)
+    except Exception:
+        pass
+
+
 # ============ БЛОКИРОВКА ОТ БОТА ============
 
 async def _resolve_target_for_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, usage_hint: str):
@@ -2562,15 +2839,15 @@ def _normalize_mood(parsed: dict) -> dict:
     return {"mood_score": score, "mood_label": label, "summary": summary}
 
 
-def _call_openrouter_sync(combined_text: str) -> str:
-    """Синхронный вызов OpenRouter. Запускается из to_thread, чтобы не блокировать loop."""
+def _call_openrouter_sync(combined_text: str, model: str) -> str:
+    """Синхронный вызов OpenRouter с конкретной моделью. Возвращает сырой текст ответа."""
     client = openai.OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
         timeout=30.0,
     )
     completion = client.chat.completions.create(
-        model=OPENROUTER_MODEL,
+        model=model,
         messages=[
             {
                 "role": "system",
@@ -2592,27 +2869,65 @@ def _call_openrouter_sync(combined_text: str) -> str:
     return completion.choices[0].message.content or ""
 
 
+# Диагностика — заполняется при каждом запуске анализа, доступна через /amooddebug
+_last_mood_diagnostics = {
+    "ran_at": None,
+    "model_used": None,
+    "raw_response": "",
+    "error": "",
+    "messages_count": 0,
+}
+
+
 async def analyze_mood_with_ai(messages: list) -> dict:
-    """Анализ настроения через OpenRouter. Никогда не бросает, всегда возвращает нормализованный dict."""
+    """
+    Анализ настроения через OpenRouter с fallback-цепочкой моделей.
+    Никогда не бросает; всегда возвращает нормализованный dict.
+    Заполняет _last_mood_diagnostics для отладки.
+    """
+    global _last_mood_diagnostics
+    _last_mood_diagnostics = {
+        "ran_at": now_msk_str(),
+        "model_used": None,
+        "raw_response": "",
+        "error": "",
+        "messages_count": len(messages) if messages else 0,
+    }
+    
     if not messages:
+        _last_mood_diagnostics["error"] = "Сообщений ещё не было."
         return {"mood_score": 0, "mood_label": "Нет данных", "summary": "Сообщений ещё не было."}
 
     combined_text = "\n".join(messages[-100:])
     if len(combined_text) < 10:
+        _last_mood_diagnostics["error"] = "Слишком мало сообщений для анализа."
         return {"mood_score": 0, "mood_label": "Недостаточно данных", "summary": "Слишком мало сообщений для анализа."}
 
-    try:
-        # Уносим блокирующий SDK-вызов в тред, чтобы не вешать бота
-        raw = await asyncio.to_thread(_call_openrouter_sync, combined_text)
-        logger.info(f"AI mood raw response (first 200): {raw[:200]!r}")
-        parsed = _extract_json_block(raw)
-        if parsed is None:
-            logger.warning(f"AI mood: cannot parse JSON from response: {raw[:500]!r}")
-            return {"mood_score": 0, "mood_label": "Ошибка разбора", "summary": "Модель вернула ответ в неожиданном формате."}
-        return _normalize_mood(parsed)
-    except Exception as e:
-        logger.error(f"AI mood error: {e}", exc_info=True)
-        return {"mood_score": 0, "mood_label": "Ошибка анализа", "summary": f"Не удалось обратиться к нейросети ({type(e).__name__})."}
+    last_error = ""
+    for model in OPENROUTER_FALLBACK_MODELS:
+        try:
+            raw = await asyncio.to_thread(_call_openrouter_sync, combined_text, model)
+            _last_mood_diagnostics["model_used"] = model
+            _last_mood_diagnostics["raw_response"] = (raw or "")[:500]
+            logger.info(f"AI mood ({model}): {(raw or '')[:200]!r}")
+            parsed = _extract_json_block(raw)
+            if parsed is None:
+                last_error = f"{model}: модель не вернула валидный JSON"
+                logger.warning(f"AI mood: cannot parse JSON from {model}: {(raw or '')[:300]!r}")
+                continue
+            _last_mood_diagnostics["error"] = ""
+            return _normalize_mood(parsed)
+        except Exception as e:
+            last_error = f"{model}: {type(e).__name__}: {e}"
+            logger.error(f"AI mood error on {model}: {e}", exc_info=False)
+            continue
+    
+    _last_mood_diagnostics["error"] = last_error or "Все модели недоступны"
+    return {
+        "mood_score": 0,
+        "mood_label": "Ошибка анализа",
+        "summary": f"Не удалось получить ответ от моделей. {last_error[:200]}",
+    }
 
 
 def _mood_emoji(score: int) -> str:
@@ -2700,6 +3015,53 @@ async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
     except Exception as e:
         logger.error(f"auto_mood send error: {e}")
+
+
+async def amooddebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика анализа настроения. Видит главный админ или спецдопуск."""
+    user_id = update.effective_user.id
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
+        await update.message.reply_text("❌ Команда доступна главному админу или со спецдопуском.")
+        return
+    
+    d = _last_mood_diagnostics
+    buf_size = len(chat_messages)
+    last_msgs = chat_messages[-3:] if chat_messages else []
+    
+    text = (
+        "🔧 ДИАГНОСТИКА НАСТРОЕНИЯ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📦 Буфер сообщений: {buf_size}/100\n"
+        f"💬 CONFERENCE_CHAT_ID: {CONFERENCE_CHAT_ID}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+    )
+    if last_msgs:
+        text += "📝 Последние сообщения:\n"
+        for m in last_msgs:
+            preview = m[:80] + ("…" if len(m) > 80 else "")
+            text += f"  • {preview}\n"
+        text += "━━━━━━━━━━━━━━━━━\n"
+    else:
+        text += "ℹ️ Буфер пуст — либо бот не видит сообщений из конфы,\nлибо после рестарта ещё ничего не пришло.\n━━━━━━━━━━━━━━━━━\n"
+    
+    if d["ran_at"]:
+        text += (
+            f"🕐 Последний запуск: {d['ran_at']}\n"
+            f"🧠 Модель: {d['model_used'] or '—'}\n"
+            f"📊 Сообщений на момент запуска: {d['messages_count']}\n"
+        )
+        if d["error"]:
+            text += f"❌ Ошибка: {d['error'][:300]}\n"
+        if d["raw_response"]:
+            text += f"━━━━━━━━━━━━━━━━━\n📥 Ответ AI (первые 500 симв):\n{d['raw_response']}\n"
+    else:
+        text += "ℹ️ Анализ ещё не запускался."
+    
+    # Telegram-лимит
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
 
 # ============ УПРАВЛЕНИЕ ДЕПАРТАМЕНТАМИ ============
 
@@ -5914,6 +6276,10 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     if update.effective_chat.id != CONFERENCE_CHAT_ID:
+        # Лог-намёк, если CONFERENCE_CHAT_ID настроен не на ту конфу
+        logger.debug(
+            f"track_message: ignoring chat {update.effective_chat.id} (expected {CONFERENCE_CHAT_ID})"
+        )
         return
     text = update.message.text.strip()
     # Пропускаем команды бота — они шумят и портят анализ
@@ -5928,6 +6294,7 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_messages.append(text)
     if len(chat_messages) > 100:
         chat_messages.pop(0)
+    logger.debug(f"track_message: buffer={len(chat_messages)}/100")
 
 # ============ ЗАПУСК ============
 
@@ -5971,6 +6338,8 @@ def main():
         'acheckall': acheckall,
         'ablocklist': ablocklist,
         'aaudit': aaudit, 'ahistory': ahistory,
+        'amooddebug': amooddebug,
+        'aunwarngame': aunwarngame,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -6021,6 +6390,8 @@ def main():
     application.add_handler(CallbackQueryHandler(weekly_check_callback, pattern=r'^wkc:'))
     # Решения по заявкам (одобрить/отказать)
     application.add_handler(CallbackQueryHandler(request_decision_callback, pattern=r'^rqst:'))
+    # Игра за снятие предупреждения (камень-ножницы-бумага)
+    application.add_handler(CallbackQueryHandler(warn_game_callback, pattern=r'^wgame:'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     # Сбор сообщений для анализа настроения (только в конференции)
