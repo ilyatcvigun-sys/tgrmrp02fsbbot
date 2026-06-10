@@ -716,6 +716,13 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Миграция для прикрепления медиа к жалобам: JSON-список из {type, file_id, caption}.
+    try:
+        c.execute('ALTER TABLE reports ADD COLUMN media_files TEXT')
+        logger.info("Migration: added reports.media_files column")
+    except sqlite3.OperationalError:
+        pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1280,15 +1287,17 @@ def disconnect_user_from_bot(user_id: int) -> bool:
 # ============ ЖАЛОБЫ ============
 
 def save_report(reporter_id: int, reporter_nick: str, violator_nick: str,
-                faction: str, violation: str, evidence: str, command: str) -> int:
-    """Сохранение жалобы"""
+                faction: str, violation: str, evidence: str, command: str,
+                media_files: list = None) -> int:
+    """Сохранение жалобы. media_files — список {type, file_id, caption}."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    media_json = json.dumps(media_files or [], ensure_ascii=False)
     c.execute('''INSERT INTO reports (reporter_id, reporter_nick, violator_nick, faction, 
-                 violation, evidence, command, created_at) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                 violation, evidence, command, media_files, created_at) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
               (reporter_id, reporter_nick, violator_nick, faction, violation, evidence, command,
-               now_msk_str("%Y-%m-%d %H:%M:%S")))
+               media_json, now_msk_str("%Y-%m-%d %H:%M:%S")))
     report_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -1306,6 +1315,42 @@ def update_report(report_id: int, status: str, moderator_id: int, verdict: str, 
     conn.commit()
     conn.close()
 
+def reopen_report(report_id: int) -> dict:
+    """
+    Возвращает жалобу обратно в pending для перепроверки.
+    Возвращает старые данные (status/moderator_id/verdict/comment), чтобы вызывающий
+    мог записать их в audit_log как «предыдущее решение».
+    """
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT status, moderator_id, verdict, moderator_comment, resolved_at FROM reports WHERE id = ?', (report_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+    snapshot = dict(row)
+    c.execute(
+        '''UPDATE reports SET status = 'pending', moderator_id = NULL,
+           verdict = NULL, moderator_comment = NULL, resolved_at = '' WHERE id = ?''',
+        (report_id,),
+    )
+    conn.commit()
+    conn.close()
+    return snapshot
+
+def delete_report(report_id: int) -> dict:
+    """Физически удаляет запись и возвращает её снимок для audit_log."""
+    report = get_report(report_id)
+    if not report:
+        return None
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM reports WHERE id = ?', (report_id,))
+    conn.commit()
+    conn.close()
+    return report
+
 def get_report(report_id: int) -> dict:
     """Получение жалобы"""
     conn = sqlite3.connect(DB_FILE)
@@ -1314,6 +1359,13 @@ def get_report(report_id: int) -> dict:
     row = c.fetchone()
     conn.close()
     if row:
+        # Парсим media_files (если столбец есть и не пустой)
+        media = []
+        if len(row) >= 15 and row[14]:
+            try:
+                media = json.loads(row[14])
+            except Exception:
+                media = []
         return {
             "id": row[0],
             "reporter_id": row[1],
@@ -1328,9 +1380,43 @@ def get_report(report_id: int) -> dict:
             "moderator_comment": row[10],
             "verdict": row[11],
             "created_at": row[12],
-            "resolved_at": row[13]
+            "resolved_at": row[13],
+            "media_files": media,
         }
     return None
+
+
+async def forward_report_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_files: list):
+    """
+    Отправляет прикреплённые к жалобе медиа в указанный чат.
+    Каждый файл отправляется в правильный метод (photo/video/document/voice/etc).
+    """
+    if not media_files:
+        return
+    for m in media_files:
+        kind = m.get('type', '')
+        fid = m.get('file_id', '')
+        cap = m.get('caption') or None
+        if not fid:
+            continue
+        try:
+            if kind == 'photo':
+                await context.bot.send_photo(chat_id, fid, caption=cap)
+            elif kind == 'video':
+                await context.bot.send_video(chat_id, fid, caption=cap)
+            elif kind == 'document':
+                await context.bot.send_document(chat_id, fid, caption=cap)
+            elif kind == 'voice':
+                await context.bot.send_voice(chat_id, fid, caption=cap)
+            elif kind == 'video_note':
+                await context.bot.send_video_note(chat_id, fid)
+            elif kind == 'audio':
+                await context.bot.send_audio(chat_id, fid, caption=cap)
+            elif kind == 'animation':
+                await context.bot.send_animation(chat_id, fid, caption=cap)
+        except Exception as e:
+            logger.debug(f"forward_report_media: {kind} {fid} → chat {chat_id}: {e}")
+        await asyncio.sleep(0.05)
 
 # ============ КОМАНДЫ ============
 
@@ -1421,9 +1507,6 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /find — руководящий состав\n"
         "├ /awarns — ваши предупреждения\n"
         "├ /aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
-        "├ /aonline — кто из конфы сейчас в игре\n"
-        "├ /agame [@user] — онлайн-статус игрока\n"
-        "├ /aserverinfo — состояние игровых серверов\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -4425,31 +4508,36 @@ async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Ранг {RANKS[new_rank]['name']} установлен {count} польз.")
 
 async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Информация о жалобе"""
+    """Карточка жалобы с кнопками действий."""
     user_id = update.effective_user.id
     if not has_permission(user_id, 'search', 'areport_info'):
-        await update.message.reply_text("❌ С 4 ранга.")
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
     if not context.args:
-        await update.message.reply_text("❌ /areport_info номер")
+        await update.message.reply_text("❌ Использование: /areport_info <id>")
         return
     
-    report = get_report(int(context.args[0]))
+    try:
+        report_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ id должен быть числом.")
+        return
+    
+    report = get_report(report_id)
     if not report:
-        await update.message.reply_text("❌ Не найдена.")
+        await update.message.reply_text(f"❌ Жалоба #{report_id} не найдена.")
         return
     
-    mod_name = get_admin_nick(report['moderator_id']) if report['moderator_id'] else "—"
-    text = (
-        f"📋 ЖАЛОБА #{report['id']}\n📊 {report['status']}\n"
-        f"👤 {report['reporter_nick']}\n🎮 {report['violator_nick']}\n"
-        f"⚠️ {report['violation']}\n📎 {report['evidence']}\n💻 {report['command']}\n"
-        f"📅 {report['created_at']}"
-    )
-    if report['status'] != 'pending':
-        text += f"\n📊 {report['verdict']}\n👮 {mod_name}\n💬 {report['moderator_comment']}\n📅 {report['resolved_at']}"
-    await update.message.reply_text(text)
+    is_5plus = has_permission(user_id, 'warn')
+    card = _format_report_card(report)
+    kb = _report_action_keyboard(report_id, report['status'], is_5plus)
+    
+    await update.message.reply_text(card, reply_markup=kb)
+    # Пересылаем прикреплённые медиа после карточки
+    media = report.get('media_files') or []
+    if media:
+        await forward_report_media(context, update.effective_chat.id, media)
 
 async def aspeciallist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список со спецдопуском"""
@@ -5945,90 +6033,295 @@ async def agrantcmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ ЖАЛОБЫ ============
 
+def _report_progress_bar(step: int, total: int = 5) -> str:
+    """Прогресс-бар: ▰▰▱▱▱  2/5"""
+    filled = max(0, min(total, step))
+    return "▰" * filled + "▱" * (total - filled) + f"  {step}/{total}"
+
+
+def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
+    """Единое оформление карточки жалобы для всех мест (DM, /areport_info, /areports)."""
+    nick = report['reporter_nick'] or "—"
+    head = f"📋 ЖАЛОБА #{report['id']}"
+    if report['status'] == 'pending':
+        head += " — ⏳ ожидает"
+    elif report['status'] in ('approve', 'approved'):
+        head += " — ✅ одобрена"
+    elif report['status'] in ('reject', 'rejected'):
+        head += " — ❌ отказ"
+    elif report['status'] == 'review':
+        head += " — 👀 на рассмотрении"
+    
+    body = (
+        f"{head}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 Подал: {nick}\n"
+        f"🎮 Нарушитель: {report['violator_nick']}\n"
+        f"🏢 Фракция: {report['faction'] or '—'}\n"
+        f"⚠️ Нарушение: {report['violation']}\n"
+        f"📎 Доказательства: {report['evidence'] or '—'}\n"
+    )
+    if report.get('media_files'):
+        body += f"📁 Прикреплено медиа: {len(report['media_files'])}\n"
+    body += (
+        f"💻 Команда: {report['command'] or '—'}\n"
+        f"📅 Подана: {report['created_at']}\n"
+    )
+    if report['status'] not in ('pending', 'review'):
+        mod_name = get_admin_nick(report['moderator_id']) if report['moderator_id'] else "—"
+        body += (
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📊 Вердикт: {report['verdict'] or '—'}\n"
+            f"👮 Модератор: {mod_name}\n"
+        )
+        if report['moderator_comment']:
+            body += f"💬 Комментарий: {report['moderator_comment']}\n"
+        if report['resolved_at']:
+            body += f"📅 Решено: {report['resolved_at']}\n"
+    return body.rstrip()
+
+
+def _report_action_keyboard(report_id: int, status: str, is_mod_5plus: bool) -> InlineKeyboardMarkup:
+    """Кнопки под карточкой жалобы.
+    - pending → Одобрить / Отказать (для 4+, обрабатывается handle_report_callback)
+    - решена + 5+ → Перепроверить / Удалить
+    """
+    if status == 'pending':
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{report_id}"),
+            InlineKeyboardButton("❌ Отказать", callback_data=f"reject_{report_id}"),
+        ]])
+    if status != 'pending' and is_mod_5plus:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔄 Перепроверить", callback_data=f"rep:reopen:{report_id}"),
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"rep:del:{report_id}"),
+            ],
+        ])
+    return None
+
+
 async def areport_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало подачи жалобы"""
+    """Начало подачи жалобы — шаг 1/5: ник нарушителя"""
     user_data = get_user_data(update.effective_user.id)
     if not user_data:
-        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return ConversationHandler.END
     
-    await update.message.reply_text("📝 ПОДАЧА ЖАЛОБЫ\n\nШаг 1/5 — Введите ник нарушителя:")
+    # Сбрасываем накопленные данные на случай повторной подачи
+    for k in ('report_violator', 'report_faction', 'report_violation', 'report_evidence', 'report_media'):
+        context.user_data.pop(k, None)
+    
+    await update.message.reply_text(
+        "📝 ПОДАЧА ЖАЛОБЫ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Прогресс: {_report_progress_bar(1)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "🎮 Шаг 1 — ник нарушителя\n\n"
+        "Введите игровой ник того, на кого жалуетесь.\n"
+        "Например: Kota_Glifanov\n\n"
+        "✖️ Для отмены — /cancel"
+    )
     return REPORT_VIOLATOR
 
+
 async def report_violator(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['report_violator'] = update.message.text
-    await update.message.reply_text("Шаг 2/5 — Фракция(МО/МВД/ФСИН):")
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Ник не может быть пустым. Введите ещё раз или /cancel.")
+        return REPORT_VIOLATOR
+    context.user_data['report_violator'] = text
+    await update.message.reply_text(
+        "📝 ПОДАЧА ЖАЛОБЫ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Прогресс: {_report_progress_bar(2)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "🏢 Шаг 2 — фракция нарушителя\n\n"
+        "К какой структуре он относится?\n"
+        "Например: МО / МВД / ФСИН\n\n"
+        "✖️ Для отмены — /cancel"
+    )
     return REPORT_FACTION
 
+
 async def report_faction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['report_faction'] = update.message.text
-    await update.message.reply_text("Шаг 3/5 — !!!ОПИСАНИЕ!!! + Нарушение:")
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Поле не может быть пустым. Введите ещё раз или /cancel.")
+        return REPORT_FACTION
+    context.user_data['report_faction'] = text
+    await update.message.reply_text(
+        "📝 ПОДАЧА ЖАЛОБЫ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Прогресс: {_report_progress_bar(3)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "⚠️ Шаг 3 — описание нарушения\n\n"
+        "Опишите ситуацию/укажите пункт устава.\n"
+        "✖️ Для отмены — /cancel"
+    )
     return REPORT_VIOLATION
 
+
 async def report_violation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['report_violation'] = update.message.text
-    await update.message.reply_text("Шаг 4/5 — Доказательства !!!!!!!!!!! Time-Code при длительности больше 1 минуты !!!!!!!!!!!:")
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Описание не может быть пустым. Введите ещё раз или /cancel.")
+        return REPORT_VIOLATION
+    context.user_data['report_violation'] = text
+    context.user_data.setdefault('report_media', [])
+    await update.message.reply_text(
+        "📝 ПОДАЧА ЖАЛОБЫ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Прогресс: {_report_progress_bar(4)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "📎 Шаг 4 — доказательства\n\n"
+        "Можно прикрепить любое количество:\n"
+        "• 🎥 видео (с тайм-кодом если >1 мин)\n"
+        "• 🖼 скриншоты\n"
+        "• 📄 файлы (демки, логи)\n"
+        "• 🔗 ссылки на YouTube/Imgur/любые ресурсы\n\n"
+        "Когда закончите — отправьте текстовое сообщение со ссылками\n"
+        "или просто слово «готово» / «нет», если медиа уже всё.\n\n"
+        "✖️ Для отмены — /cancel"
+    )
     return REPORT_EVIDENCE
 
-async def report_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['report_evidence'] = update.message.text
-    await update.message.reply_text("Шаг 5/5 — Команда (или 'Нет'):")
+
+async def report_evidence_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Получили медиа на шаге доказательств — добавляем file_id в список и
+    остаёмся в том же state, чтобы юзер мог отправить ещё.
+    """
+    msg = update.message
+    media = context.user_data.setdefault('report_media', [])
+    
+    kind = None
+    file_id = None
+    caption = msg.caption or ""
+    if msg.photo:
+        kind, file_id = 'photo', msg.photo[-1].file_id  # самое крупное превью
+    elif msg.video:
+        kind, file_id = 'video', msg.video.file_id
+    elif msg.document:
+        kind, file_id = 'document', msg.document.file_id
+    elif msg.voice:
+        kind, file_id = 'voice', msg.voice.file_id
+    elif msg.video_note:
+        kind, file_id = 'video_note', msg.video_note.file_id
+    elif msg.audio:
+        kind, file_id = 'audio', msg.audio.file_id
+    elif msg.animation:
+        kind, file_id = 'animation', msg.animation.file_id
+    
+    if not kind:
+        return REPORT_EVIDENCE  # неизвестный медиа-тип — игнорируем
+    
+    media.append({'type': kind, 'file_id': file_id, 'caption': caption})
+    await msg.reply_text(
+        f"✅ Прикреплено ({kind}). Всего вложений: {len(media)}.\n"
+        f"Можете прислать ещё, либо отправьте текстовое сообщение со ссылками\n"
+        f"или слово «готово»/«нет» чтобы перейти к следующему шагу."
+    )
+    return REPORT_EVIDENCE
+
+
+async def report_evidence_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Юзер прислал текст на шаге доказательств — это либо ссылки,
+    либо команда «готово»/«нет». В любом случае — переход на шаг команды.
+    """
+    text = (update.message.text or "").strip()
+    media = context.user_data.get('report_media') or []
+    
+    # «готово»/«нет»/«-» означают что текстовых ссылок нет
+    if text.lower() in ('готово', 'нет', '-', 'next', 'далее', 'all', 'все'):
+        if not media:
+            await update.message.reply_text(
+                "❌ Вы не прикрепили ни ссылок, ни медиа. Пришлите хотя бы что-то либо /cancel."
+            )
+            return REPORT_EVIDENCE
+        context.user_data['report_evidence'] = "Только медиа во вложении"
+    else:
+        context.user_data['report_evidence'] = text
+    
+    await update.message.reply_text(
+        "📝 ПОДАЧА ЖАЛОБЫ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Прогресс: {_report_progress_bar(5)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💻 Шаг 5 — Наказание\n\n"
+        "Например: fwarn Kota_Glifanov 4.1 Устав МВД by Glif\n"
+        "Или просто «нет», если не уверены.\n\n"
+        "✖️ Для отмены — /cancel"
+    )
     return REPORT_COMMAND
 
+
 async def report_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершение подачи жалобы"""
+    """Финал: сохраняем и рассылаем модераторам."""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
+    command_text = (update.message.text or "").strip() or "нет"
     
+    media = context.user_data.get('report_media') or []
     report_id = save_report(
         user_id,
         user_data['callsign'],
-        context.user_data['report_violator'],
-        context.user_data['report_faction'],
-        context.user_data['report_violation'],
-        context.user_data['report_evidence'],
-        update.message.text
+        context.user_data.get('report_violator', '—'),
+        context.user_data.get('report_faction', '—'),
+        context.user_data.get('report_violation', '—'),
+        context.user_data.get('report_evidence', '—'),
+        command_text,
+        media_files=media,
     )
     
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{report_id}"),
-            InlineKeyboardButton("❌ Отказать", callback_data=f"reject_{report_id}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Карточка для модераторов
+    report = get_report(report_id)
+    card = _format_report_card(report)
+    kb = _report_action_keyboard(report_id, 'pending', is_mod_5plus=False)
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT user_id FROM users WHERE rank >= 4')
-    mods = c.fetchall()
+    c.execute('SELECT user_id FROM users WHERE rank >= 4 AND bot_blocked = "Нет"')
+    mods = [r[0] for r in c.fetchall()]
     conn.close()
     
-    for m in mods:
+    delivered = 0
+    for mid in mods:
         try:
-            await context.bot.send_message(
-                chat_id=m[0],
-                text=f"📩 ЖАЛОБА #{report_id}\n👤 Подал: {user_data['callsign']}\n"
-                     f"🎮 Нарушитель: {context.user_data['report_violator']}\n"
-                     f"⚠️ {context.user_data['report_violation']}\n"
-                     f"📎 Доказательства: {context.user_data['report_evidence']}\n"
-                     f"💻 Команда: {update.message.text}",
-                reply_markup=reply_markup
-            )
-        except:
-            pass
+            await context.bot.send_message(chat_id=mid, text=card, reply_markup=kb)
+            # Пересылаем медиа после карточки
+            await forward_report_media(context, mid, media)
+            delivered += 1
+        except Exception as e:
+            logger.debug(f"report broadcast to {mid}: {e}")
+        await asyncio.sleep(0.05)
     
-    await update.message.reply_text(f"✅ Жалоба #{report_id} отправлена!")
+    log_action(user_id, 'report_submitted', None, f"#{report_id}: {report['violator_nick']}")
+    
+    await update.message.reply_text(
+        f"✅ ЖАЛОБА #{report_id} ОТПРАВЛЕНА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📨 Доставлена {delivered} модератор(ам).\n"
+        "Спасибо! Решение придёт сюда же."
+    )
+    # Очищаем состояние
+    for k in ('report_violator', 'report_faction', 'report_violation', 'report_evidence', 'report_media'):
+        context.user_data.pop(k, None)
     return ConversationHandler.END
 
+
 async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок модерации"""
+    """Обработка кнопок модерации жалоб: approve_<id>, reject_<id>."""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
     if not has_permission(user_id, 'search'):
-        await query.edit_message_text("❌ Только с 4 ранга.")
+        try:
+            await query.edit_message_text("❌ Решения по жалобам — только с 4 ранга.")
+        except Exception:
+            pass
         return
     
     action, report_id = query.data.split('_')
@@ -6036,16 +6329,22 @@ async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     report = get_report(report_id)
     if not report:
-        await query.edit_message_text("❌ Жалоба не найдена.")
+        try:
+            await query.edit_message_text("❌ Жалоба не найдена (возможно, удалена).")
+        except Exception:
+            pass
         return
     
     if report['status'] != 'pending':
-        await query.edit_message_text(
-            f"{query.message.text}\n\n"
-            f"❌ Жалоба уже обработана!\n"
-            f"📊 Статус: {report['verdict']}\n"
-            f"💬 {report['moderator_comment']}"
-        )
+        is_5plus = has_permission(user_id, 'warn')
+        kb = _report_action_keyboard(report_id, report['status'], is_5plus)
+        try:
+            await query.edit_message_text(
+                _format_report_card(report) + "\n\n⚠️ Уже обработано.",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
         return
     
     update_report(report_id, 'review', user_id, 'На рассмотрении...')
@@ -6054,20 +6353,124 @@ async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data['pending_report'] = report_id
         context.user_data['pending_action'] = 'approve'
         await query.edit_message_text(
-            f"{query.message.text}\n\n"
-            f"✅ ОДОБРЕНО (на рассмотрении)\n"
+            _format_report_card(report) + "\n\n"
+            f"✅ ОДОБРЕНО (ожидает комментария)\n"
             f"👮 Модератор: {get_admin_nick(user_id)}\n"
-            f"Введите комментарий (или '-' без комментария):"
+            f"Введите комментарий следующим сообщением (или '-' без комментария):"
         )
     elif action == 'reject':
         context.user_data['pending_report'] = report_id
         context.user_data['pending_action'] = 'reject'
         await query.edit_message_text(
-            f"{query.message.text}\n\n"
-            f"❌ ОТКАЗАНО (на рассмотрении)\n"
+            _format_report_card(report) + "\n\n"
+            f"❌ ОТКАЗАНО (ожидает причины)\n"
             f"👮 Модератор: {get_admin_nick(user_id)}\n"
-            f"Введите причину отказа:"
+            f"Введите причину отказа следующим сообщением:"
         )
+
+
+async def report_extra_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка перепроверки/удаления уже закрытых жалоб. pattern='^rep:'."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if not has_permission(user_id, 'warn'):
+        await query.answer("Только с 5 ранга.", show_alert=True)
+        return
+    
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        return
+    action = parts[1]
+    try:
+        report_id = int(parts[2])
+    except ValueError:
+        return
+    
+    report = get_report(report_id)
+    if not report:
+        try:
+            await query.edit_message_text("❌ Жалоба не найдена.")
+        except Exception:
+            pass
+        return
+    
+    if action == 'reopen':
+        if report['status'] == 'pending':
+            try:
+                await query.edit_message_text(_format_report_card(report) + "\n\nℹ️ Уже в статусе ожидания.")
+            except Exception:
+                pass
+            return
+        snapshot = reopen_report(report_id)
+        log_action(
+            user_id, 'report_reopened', report['reporter_id'],
+            f"#{report_id}: было {snapshot.get('verdict','—')} от id={snapshot.get('moderator_id','—')} ({snapshot.get('resolved_at','')})",
+        )
+        fresh = get_report(report_id)
+        kb = _report_action_keyboard(report_id, 'pending', is_mod_5plus=True)
+        try:
+            await query.edit_message_text(
+                _format_report_card(fresh) + f"\n\n🔄 Перепроверка инициирована {get_admin_nick(user_id)}",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+        # Уведомим автора
+        try:
+            await context.bot.send_message(
+                report['reporter_id'],
+                f"🔄 Жалоба #{report_id} отправлена на перепроверку.\n"
+                f"👮 Инициатор: {get_admin_nick(user_id)}",
+            )
+        except Exception:
+            pass
+        return
+    
+    if action == 'del':
+        # Двухстадийное подтверждение
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить окончательно", callback_data=f"rep:delconf:{report_id}")],
+            [InlineKeyboardButton("◀️ Отмена", callback_data=f"rep:delcancel:{report_id}")],
+        ])
+        try:
+            await query.edit_message_text(
+                _format_report_card(report) +
+                "\n\n❗ Подтвердите удаление — действие необратимо.",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+        return
+    
+    if action == 'delconf':
+        snapshot = delete_report(report_id)
+        if snapshot:
+            log_action(
+                user_id, 'report_deleted', snapshot['reporter_id'],
+                f"#{report_id}: violator={snapshot['violator_nick']}, status={snapshot['status']}",
+            )
+        try:
+            await query.edit_message_text(
+                f"🗑 ЖАЛОБА #{report_id} УДАЛЕНА\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👮 Удалил: {get_admin_nick(user_id)}\n"
+                f"Запись запротоколирована в аудит-логе."
+            )
+        except Exception:
+            pass
+        return
+    
+    if action == 'delcancel':
+        is_5plus = has_permission(user_id, 'warn')
+        kb = _report_action_keyboard(report_id, report['status'], is_5plus)
+        try:
+            await query.edit_message_text(_format_report_card(report), reply_markup=kb)
+        except Exception:
+            pass
+        return
+
 
 async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка комментария модератора"""
@@ -6076,35 +6479,48 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
     
     report_id = context.user_data['pending_report']
     action = context.user_data['pending_action']
-    comment = update.message.text
+    comment = (update.message.text or "").strip() or "—"
     
     verdict = "ОДОБРЕНО" if action == 'approve' else "ОТКАЗАНО"
     update_report(report_id, action, update.effective_user.id, verdict, comment)
+    log_action(update.effective_user.id, 'report_' + action, None, f"#{report_id}: {comment[:120]}")
     
     report = get_report(report_id)
     
+    # Уведомление автору жалобы
     try:
         await context.bot.send_message(
             chat_id=report['reporter_id'],
-            text=f"📋 ВЕРДИКТ #{report_id}\nСтатус: {verdict}\n💬 {comment}"
+            text=(
+                f"📋 ВЕРДИКТ ПО ЖАЛОБЕ #{report_id}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"📊 Статус: {verdict}\n"
+                f"💬 {comment}"
+            ),
         )
-    except:
+    except Exception:
         pass
     
+    # Дублирование в топик «Вердикты»
     try:
         await context.bot.send_message(
             chat_id=CONFERENCE_CHAT_ID,
-            text=f"📋 ВЕРДИКТ #{report_id}\n👤 Подал: {report['reporter_nick']}\n"
-                 f"🎮 Нарушитель: {report['violator_nick']}\n"
-                 f"⚠️ {report['violation']}\n📊 {verdict}\n💬 {comment}",
-            message_thread_id=VERDICT_TOPIC_ID
+            text=(
+                f"📋 ВЕРДИКТ #{report_id}\n"
+                f"👤 Подал: {report['reporter_nick']}\n"
+                f"🎮 Нарушитель: {report['violator_nick']}\n"
+                f"⚠️ {report['violation']}\n"
+                f"📊 {verdict}\n"
+                f"💬 {comment}"
+            ),
+            message_thread_id=VERDICT_TOPIC_ID,
         )
-    except:
+    except Exception:
         pass
     
-    await update.message.reply_text("✅ Вердикт отправлен!")
-    del context.user_data['pending_report']
-    del context.user_data['pending_action']
+    await update.message.reply_text(f"✅ Вердикт по жалобе #{report_id} отправлен.")
+    context.user_data.pop('pending_report', None)
+    context.user_data.pop('pending_action', None)
 
 async def areports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список жалоб"""
@@ -6694,7 +7110,6 @@ def main():
         'aaudit': aaudit, 'ahistory': ahistory,
         'amooddebug': amooddebug,
         'aunwarngame': aunwarngame,
-        'aonline': aonline, 'agame': agame, 'aserverinfo': aserverinfo,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -6715,13 +7130,26 @@ def main():
             MessageHandler(filters.Regex('^📝 Подать жалобу$'), areport_start)
         ],
         states={
-            REPORT_VIOLATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_violator)],
-            REPORT_FACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_faction)],
-            REPORT_VIOLATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_violation)],
-            REPORT_EVIDENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_evidence)],
-            REPORT_COMMAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, report_complete)]
+            # Все шаги принимают и текст, и текст со слэшем (filters.TEXT без ~filters.COMMAND),
+            # чтобы пользователь мог ввести, например, /fwarn ник 4.1 как команду шага 5,
+            # или ник, начинающийся с символа /. /cancel в fallbacks по-прежнему работает.
+            REPORT_VIOLATOR: [MessageHandler(filters.TEXT, report_violator)],
+            REPORT_FACTION: [MessageHandler(filters.TEXT, report_faction)],
+            REPORT_VIOLATION: [MessageHandler(filters.TEXT, report_violation)],
+            REPORT_EVIDENCE: [
+                # Медиа: фото/видео/документ/голос/видеосообщение/аудио/анимация —
+                # каждое такое сообщение копится в context.user_data['report_media'].
+                MessageHandler(
+                    filters.PHOTO | filters.VIDEO | filters.Document.ALL |
+                    filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.ANIMATION,
+                    report_evidence_media,
+                ),
+                # Текст — ссылки или команда «готово»/«нет» → переход к шагу 5.
+                MessageHandler(filters.TEXT, report_evidence_text),
+            ],
+            REPORT_COMMAND: [MessageHandler(filters.TEXT, report_complete)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)],
     )
     application.add_handler(report_handler)
     
@@ -6741,6 +7169,8 @@ def main():
     # CallbackQueryHandlers — каждый ограничен своим префиксом, чтобы не конфликтовать.
     # Старые жалобы используют 'approve_<id>' / 'reject_<id>'.
     application.add_handler(CallbackQueryHandler(handle_report_callback, pattern=r'^(approve|reject)_\d+$'))
+    # Перепроверка и удаление жалоб (5+).
+    application.add_handler(CallbackQueryHandler(report_extra_callback, pattern=r'^rep:'))
     # Еженедельная проверка ранга/отдела
     application.add_handler(CallbackQueryHandler(weekly_check_callback, pattern=r'^wkc:'))
     # Решения по заявкам (одобрить/отказать)
