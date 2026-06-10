@@ -712,6 +712,20 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Миграция для отслеживания перепроверок жалоб.
+    # reopened_count — сколько раз жалоба возвращалась в pending модераторами 5+.
+    # previous_verdicts — JSON-список снимков {moderator_id, verdict, comment, resolved_at, reopened_by, reopened_at}.
+    try:
+        c.execute('ALTER TABLE reports ADD COLUMN reopened_count INTEGER DEFAULT 0')
+        logger.info("Migration: added reports.reopened_count column")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute('ALTER TABLE reports ADD COLUMN previous_verdicts TEXT')
+        logger.info("Migration: added reports.previous_verdicts column")
+    except sqlite3.OperationalError:
+        pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1304,25 +1318,58 @@ def update_report(report_id: int, status: str, moderator_id: int, verdict: str, 
     conn.commit()
     conn.close()
 
-def reopen_report(report_id: int) -> dict:
+def reopen_report(report_id: int, reopened_by: int) -> dict:
     """
     Возвращает жалобу обратно в pending для перепроверки.
-    Возвращает старые данные (status/moderator_id/verdict/comment), чтобы вызывающий
-    мог записать их в audit_log как «предыдущее решение».
+    - Сохраняет снимок предыдущего вердикта в reports.previous_verdicts (JSON-список).
+    - Инкрементирует reopened_count.
+    - Возвращает старые данные (для audit_log).
     """
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute('SELECT status, moderator_id, verdict, moderator_comment, resolved_at FROM reports WHERE id = ?', (report_id,))
+    c.execute(
+        '''SELECT status, moderator_id, verdict, moderator_comment, resolved_at,
+                  reopened_count, previous_verdicts
+           FROM reports WHERE id = ?''',
+        (report_id,),
+    )
     row = c.fetchone()
     if not row:
         conn.close()
         return None
-    snapshot = dict(row)
+    snapshot = {
+        'status': row['status'],
+        'moderator_id': row['moderator_id'],
+        'verdict': row['verdict'],
+        'comment': row['moderator_comment'],
+        'resolved_at': row['resolved_at'],
+    }
+    # Достраиваем previous_verdicts: парсим уже хранящийся JSON, дописываем снимок
+    try:
+        history = json.loads(row['previous_verdicts']) if row['previous_verdicts'] else []
+    except Exception:
+        history = []
+    history.append({
+        'moderator_id': snapshot['moderator_id'],
+        'verdict': snapshot['verdict'],
+        'comment': snapshot['comment'],
+        'resolved_at': snapshot['resolved_at'],
+        'reopened_by': reopened_by,
+        'reopened_at': now_msk_str(),
+    })
+    new_count = (row['reopened_count'] or 0) + 1
     c.execute(
-        '''UPDATE reports SET status = 'pending', moderator_id = NULL,
-           verdict = NULL, moderator_comment = NULL, resolved_at = '' WHERE id = ?''',
-        (report_id,),
+        '''UPDATE reports
+           SET status = 'pending',
+               moderator_id = NULL,
+               verdict = NULL,
+               moderator_comment = NULL,
+               resolved_at = '',
+               reopened_count = ?,
+               previous_verdicts = ?
+           WHERE id = ?''',
+        (new_count, json.dumps(history, ensure_ascii=False), report_id),
     )
     conn.commit()
     conn.close()
@@ -1355,6 +1402,14 @@ def get_report(report_id: int) -> dict:
                 media = json.loads(row[14])
             except Exception:
                 media = []
+        # Парсим previous_verdicts
+        prev_verdicts = []
+        if len(row) >= 17 and row[16]:
+            try:
+                prev_verdicts = json.loads(row[16])
+            except Exception:
+                prev_verdicts = []
+        reopened_count = (row[15] if len(row) >= 16 and row[15] is not None else 0)
         return {
             "id": row[0],
             "reporter_id": row[1],
@@ -1371,6 +1426,8 @@ def get_report(report_id: int) -> dict:
             "created_at": row[12],
             "resolved_at": row[13],
             "media_files": media,
+            "reopened_count": reopened_count,
+            "previous_verdicts": prev_verdicts,
         }
     return None
 
@@ -5701,6 +5758,10 @@ def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
     elif report['status'] == 'review':
         head += " — 👀 на рассмотрении"
     
+    reopened_count = report.get('reopened_count') or 0
+    if reopened_count > 0:
+        head += f" 🔄×{reopened_count}"
+    
     body = (
         f"{head}\n"
         "━━━━━━━━━━━━━━━━━\n"
@@ -5720,13 +5781,33 @@ def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
         mod_name = get_admin_nick(report['moderator_id']) if report['moderator_id'] else "—"
         body += (
             "━━━━━━━━━━━━━━━━━\n"
-            f"📊 Вердикт: {report['verdict'] or '—'}\n"
-            f"👮 Модератор: {mod_name}\n"
+            f"📊 Вердикт: {report['verdict'] or '—'}"
         )
+        if reopened_count > 0:
+            body += " (перепроверка)"
+        body += "\n"
+        body += f"👮 Модератор: {mod_name}\n"
         if report['moderator_comment']:
             body += f"💬 Комментарий: {report['moderator_comment']}\n"
         if report['resolved_at']:
             body += f"📅 Решено: {report['resolved_at']}\n"
+    
+    # Если жалоба перепроверялась — добавляем краткую историю прошлых решений
+    prev = report.get('previous_verdicts') or []
+    if prev:
+        body += "━━━━━━━━━━━━━━━━━\n"
+        body += f"🔄 ИСТОРИЯ ПЕРЕПРОВЕРОК ({len(prev)})\n"
+        for i, snap in enumerate(prev, 1):
+            old_mod = get_admin_nick(snap.get('moderator_id')) if snap.get('moderator_id') else "—"
+            reop_by = get_admin_nick(snap.get('reopened_by')) if snap.get('reopened_by') else "—"
+            body += (
+                f"  {i}. {snap.get('verdict') or '—'} от {old_mod}"
+                f" ({snap.get('resolved_at') or '—'})\n"
+            )
+            if snap.get('comment'):
+                comment_preview = snap['comment'][:80] + ("…" if len(snap['comment']) > 80 else "")
+                body += f"     💬 {comment_preview}\n"
+            body += f"     🔄 перепроверку инициировал: {reop_by} ({snap.get('reopened_at') or '—'})\n"
     return body.rstrip()
 
 
@@ -6052,7 +6133,7 @@ async def report_extra_callback(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 pass
             return
-        snapshot = reopen_report(report_id)
+        snapshot = reopen_report(report_id, user_id)
         log_action(
             user_id, 'report_reopened', report['reporter_id'],
             f"#{report_id}: было {snapshot.get('verdict','—')} от id={snapshot.get('moderator_id','—')} ({snapshot.get('resolved_at','')})",
@@ -6135,16 +6216,19 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
     log_action(update.effective_user.id, 'report_' + action, None, f"#{report_id}: {comment[:120]}")
     
     report = get_report(report_id)
+    reopened = (report.get('reopened_count') or 0) > 0
+    reopen_tag = " (перепроверка)" if reopened else ""
     
     # Уведомление автору жалобы
     try:
         await context.bot.send_message(
             chat_id=report['reporter_id'],
             text=(
-                f"📋 ВЕРДИКТ ПО ЖАЛОБЕ #{report_id}\n"
+                f"📋 ВЕРДИКТ ПО ЖАЛОБЕ #{report_id}{reopen_tag}\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 f"📊 Статус: {verdict}\n"
                 f"💬 {comment}"
+                + (f"\n🔄 Жалоба была перепроверена ({report['reopened_count']} раз)." if reopened else "")
             ),
         )
     except Exception:
@@ -6155,19 +6239,20 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
         await context.bot.send_message(
             chat_id=CONFERENCE_CHAT_ID,
             text=(
-                f"📋 ВЕРДИКТ #{report_id}\n"
+                f"📋 ВЕРДИКТ #{report_id}{reopen_tag}\n"
                 f"👤 Подал: {report['reporter_nick']}\n"
                 f"🎮 Нарушитель: {report['violator_nick']}\n"
                 f"⚠️ {report['violation']}\n"
                 f"📊 {verdict}\n"
                 f"💬 {comment}"
+                + (f"\n🔄 Жалоба была перепроверена ({report['reopened_count']} раз)." if reopened else "")
             ),
             message_thread_id=VERDICT_TOPIC_ID,
         )
     except Exception:
         pass
     
-    await update.message.reply_text(f"✅ Вердикт по жалобе #{report_id} отправлен.")
+    await update.message.reply_text(f"✅ Вердикт по жалобе #{report_id}{reopen_tag} отправлен.")
     context.user_data.pop('pending_report', None)
     context.user_data.pop('pending_action', None)
 
