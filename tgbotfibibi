@@ -750,6 +750,35 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Дуэли (Iris-style). Хранится одна запись на каждую дуэль: участники, состояние,
+    # очки, кто ходит сейчас, и кто победил после завершения.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS duels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            p1_id INTEGER NOT NULL,
+            p2_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER,
+            status TEXT DEFAULT 'pending',   -- pending | active | finished | cancelled
+            current_turn INTEGER,
+            p1_hp INTEGER DEFAULT 3,
+            p2_hp INTEGER DEFAULT 3,
+            p1_aim INTEGER DEFAULT 0,
+            p2_aim INTEGER DEFAULT 0,
+            winner_id INTEGER,
+            loser_id INTEGER,
+            end_reason TEXT,                  -- 'shot' | 'surrender' | 'timeout' | 'cancelled' | 'rejected'
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_duels_status ON duels(status)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_duels_winner ON duels(winner_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_duels_loser ON duels(loser_id)')
+    except sqlite3.OperationalError:
+        pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1578,6 +1607,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /awarns — ваши предупреждения\n"
         "├ /aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
         "├ /aukrating [day/week/month/all] — топ преступников\n"
+        "├ /aduel <@user> — вызвать на дуэль 🔫\n"
+        "├ /aduel_stats [@user] — статистика дуэлей\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -7286,6 +7317,608 @@ async def weekly_criminal_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"weekly_criminal_job send error: {e}")
 
 
+# ============ ДУЭЛИ (Iris-style) ============
+# Двое игроков, по 3 HP, ходят по очереди. На каждом ходу: «Выстрел» / «Прицелиться» / «Сдаться».
+# Прицеливание повышает шанс попадания следующего выстрела (+15% за каждое, потолок 90%).
+# Выстрел сбрасывает накопленный прицел. Поражение — снижение HP до 0 либо сдача либо тайм-аут.
+# Никакого автоматического кика/бана — только запись поражения в статистику.
+
+DUEL_BASE_HIT_CHANCE = 50          # шанс попадания без прицела (%)
+DUEL_AIM_BONUS_PER_STEP = 15       # +15% за каждый прицел
+DUEL_AIM_MAX = 3                   # больше 3 прицелов подряд не даёт эффекта (90% потолок)
+DUEL_HP = 3                        # сколько HP у каждого
+DUEL_PENDING_TIMEOUT_MIN = 5       # мин до автоотмены «висящего» вызова
+DUEL_TURN_TIMEOUT_MIN = 5          # мин до тайм-аута неактивного хода
+
+
+def _calc_hit_chance(aim_count: int) -> int:
+    bonus = min(aim_count, DUEL_AIM_MAX) * DUEL_AIM_BONUS_PER_STEP
+    return min(90, DUEL_BASE_HIT_CHANCE + bonus)
+
+
+def _duel_create(p1_id: int, p2_id: int, chat_id: int) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''INSERT INTO duels (p1_id, p2_id, chat_id, status, p1_hp, p2_hp, p1_aim, p2_aim, started_at)
+           VALUES (?, ?, ?, 'pending', ?, ?, 0, 0, ?)''',
+        (p1_id, p2_id, chat_id, DUEL_HP, DUEL_HP, now_msk_str()),
+    )
+    duel_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return duel_id
+
+
+def _duel_get(duel_id: int) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM duels WHERE id = ?', (duel_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _duel_set_message(duel_id: int, message_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE duels SET message_id = ? WHERE id = ?', (message_id, duel_id))
+    conn.commit()
+    conn.close()
+
+
+def _duel_activate(duel_id: int, first_turn: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE duels SET status = 'active', current_turn = ? WHERE id = ? AND status = 'pending'",
+        (first_turn, duel_id),
+    )
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def _duel_finish(duel_id: int, winner_id: int, loser_id: int, reason: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE duels SET status = 'finished', winner_id = ?, loser_id = ?,
+           end_reason = ?, finished_at = ? WHERE id = ?''',
+        (winner_id, loser_id, reason, now_msk_str(), duel_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _duel_cancel_pending(duel_id: int, reason: str = 'cancelled'):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE duels SET status = 'cancelled', end_reason = ?, finished_at = ?
+           WHERE id = ? AND status = 'pending' ''',
+        (reason, now_msk_str(), duel_id),
+    )
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def _duel_apply_shot(duel_id: int, hit: bool, shooter_is_p1: bool):
+    """Применяет результат выстрела к БД. Возвращает обновлённый dict дуэли."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if shooter_is_p1:
+        # Сбрасываем прицел стрелявшему; снимаем HP противнику если попал
+        if hit:
+            c.execute('UPDATE duels SET p1_aim = 0, p2_hp = MAX(0, p2_hp - 1) WHERE id = ?', (duel_id,))
+        else:
+            c.execute('UPDATE duels SET p1_aim = 0 WHERE id = ?', (duel_id,))
+    else:
+        if hit:
+            c.execute('UPDATE duels SET p2_aim = 0, p1_hp = MAX(0, p1_hp - 1) WHERE id = ?', (duel_id,))
+        else:
+            c.execute('UPDATE duels SET p2_aim = 0 WHERE id = ?', (duel_id,))
+    conn.commit()
+    conn.close()
+    return _duel_get(duel_id)
+
+
+def _duel_apply_aim(duel_id: int, shooter_is_p1: bool):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    field = 'p1_aim' if shooter_is_p1 else 'p2_aim'
+    c.execute(f'UPDATE duels SET {field} = {field} + 1 WHERE id = ?', (duel_id,))
+    conn.commit()
+    conn.close()
+    return _duel_get(duel_id)
+
+
+def _duel_switch_turn(duel_id: int, next_turn: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE duels SET current_turn = ? WHERE id = ?', (next_turn, duel_id))
+    conn.commit()
+    conn.close()
+
+
+def _duel_format_state(duel: dict, status_line: str = "") -> str:
+    """Текст с актуальным HP, прицелом и подсказкой чей ход."""
+    p1 = get_user_data(duel['p1_id'])
+    p2 = get_user_data(duel['p2_id'])
+    p1_name = p1['nick'] if p1 else f"id {duel['p1_id']}"
+    p2_name = p2['nick'] if p2 else f"id {duel['p2_id']}"
+    
+    def hp_bar(hp): return "❤️" * hp + "🖤" * (DUEL_HP - hp)
+    
+    lines = [
+        "🔫 ДУЭЛЬ",
+        "━━━━━━━━━━━━━━━━━",
+        f"🧍 {p1_name}: {hp_bar(duel['p1_hp'])}  🎯×{duel['p1_aim']}",
+        f"🧍 {p2_name}: {hp_bar(duel['p2_hp'])}  🎯×{duel['p2_aim']}",
+        "━━━━━━━━━━━━━━━━━",
+    ]
+    if status_line:
+        lines.append(status_line)
+        lines.append("━━━━━━━━━━━━━━━━━")
+    if duel['status'] == 'active':
+        cur = p1_name if duel['current_turn'] == duel['p1_id'] else p2_name
+        aim = duel['p1_aim'] if duel['current_turn'] == duel['p1_id'] else duel['p2_aim']
+        lines.append(f"➡️ Ход: {cur} (шанс попадания {_calc_hit_chance(aim)}%)")
+    return "\n".join(lines)
+
+
+def _duel_kb_pending(duel_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🤝 Принять", callback_data=f"duel:accept:{duel_id}"),
+            InlineKeyboardButton("❌ Отказаться", callback_data=f"duel:reject:{duel_id}"),
+        ],
+        [InlineKeyboardButton("↩️ Отменить вызов", callback_data=f"duel:cancel:{duel_id}")],
+    ])
+
+
+def _duel_kb_active(duel_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔫 Выстрел", callback_data=f"duel:shoot:{duel_id}"),
+            InlineKeyboardButton("🎯 Прицелиться", callback_data=f"duel:aim:{duel_id}"),
+        ],
+        [InlineKeyboardButton("🏃 Сдаться", callback_data=f"duel:surrender:{duel_id}")],
+    ])
+
+
+async def aduel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Вызвать пользователя на дуэль.
+    
+    /aduel @user        — в любом чате
+    (ответом на смс) /aduel  — целью становится автор сообщения
+    """
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
+        return
+    
+    # Кого вызываем
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id is None or target_id == -1:
+        await update.message.reply_text("❌ Использование: /aduel <@user|ID> или ответом на сообщение.")
+        return
+    if target_id == user_id:
+        await update.message.reply_text("❌ С собой стреляться не стоит.")
+        return
+    
+    opp_data = get_user_data(target_id)
+    if not opp_data:
+        await update.message.reply_text("❌ Соперник не зарегистрирован в боте.")
+        return
+    
+    # Уже есть активная дуэль у одного из участников?
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''SELECT id FROM duels
+           WHERE status IN ('pending', 'active')
+             AND (p1_id IN (?, ?) OR p2_id IN (?, ?))
+           LIMIT 1''',
+        (user_id, target_id, user_id, target_id),
+    )
+    existing = c.fetchone()
+    conn.close()
+    if existing:
+        await update.message.reply_text(f"❌ У одного из участников уже идёт дуэль (#{existing[0]}). Дождитесь окончания.")
+        return
+    
+    chat_id = update.effective_chat.id
+    duel_id = _duel_create(user_id, target_id, chat_id)
+    
+    text = (
+        "🔫 ВЫЗОВ НА ДУЭЛЬ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"⚔️ {user_data['nick']} вызывает {opp_data['nick']} на дуэль!\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"❤️ HP каждого: {DUEL_HP}\n"
+        f"🎯 Прицеливание даёт +{DUEL_AIM_BONUS_PER_STEP}% к попаданию следующего выстрела.\n"
+        f"⏱ На принятие — {DUEL_PENDING_TIMEOUT_MIN} минут."
+    )
+    sent = await update.message.reply_text(text, reply_markup=_duel_kb_pending(duel_id))
+    _duel_set_message(duel_id, sent.message_id)
+    
+    # Тайм-аут автоотмены для pending
+    if context.job_queue:
+        context.job_queue.run_once(
+            _duel_pending_timeout_job,
+            when=DUEL_PENDING_TIMEOUT_MIN * 60,
+            data={'duel_id': duel_id},
+            name=f"duel_pending_{duel_id}",
+        )
+
+
+async def _duel_pending_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    """Срабатывает через DUEL_PENDING_TIMEOUT_MIN мин — отменяет дуэль, если не приняли."""
+    data = context.job.data or {}
+    duel_id = data.get('duel_id')
+    if not duel_id:
+        return
+    duel = _duel_get(duel_id)
+    if not duel or duel['status'] != 'pending':
+        return
+    _duel_cancel_pending(duel_id, reason='timeout')
+    p1 = get_user_data(duel['p1_id'])
+    p2 = get_user_data(duel['p2_id'])
+    n1 = p1['nick'] if p1 else f"id {duel['p1_id']}"
+    n2 = p2['nick'] if p2 else f"id {duel['p2_id']}"
+    try:
+        await context.bot.edit_message_text(
+            chat_id=duel['chat_id'],
+            message_id=duel['message_id'],
+            text=(
+                "🔫 ДУЭЛЬ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"⏱ {n2} не ответил вовремя — вызов от {n1} аннулирован."
+            ),
+        )
+    except Exception:
+        pass
+
+
+async def _duel_turn_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    """Срабатывает через DUEL_TURN_TIMEOUT_MIN мин — если активная дуэль с тем же current_turn,
+       значит игрок бездействовал — поражение."""
+    data = context.job.data or {}
+    duel_id = data.get('duel_id')
+    expected_turn = data.get('expected_turn')
+    if not duel_id:
+        return
+    duel = _duel_get(duel_id)
+    if not duel or duel['status'] != 'active' or duel['current_turn'] != expected_turn:
+        return  # уже сделал ход
+    # Бездействовавший проигрывает
+    loser_id = duel['current_turn']
+    winner_id = duel['p2_id'] if loser_id == duel['p1_id'] else duel['p1_id']
+    _duel_finish(duel_id, winner_id, loser_id, 'timeout')
+    winner = get_user_data(winner_id)
+    loser = get_user_data(loser_id)
+    wn = winner['nick'] if winner else f"id {winner_id}"
+    ln = loser['nick'] if loser else f"id {loser_id}"
+    final = _duel_format_state(_duel_get(duel_id),
+                                status_line=f"⏱ {ln} бездействовал слишком долго.\n🏆 Победа: {wn} (тайм-аут).")
+    try:
+        await context.bot.edit_message_text(
+            chat_id=duel['chat_id'],
+            message_id=duel['message_id'],
+            text=final,
+        )
+    except Exception:
+        pass
+    log_action(None, 'duel_finished', loser_id, f"#{duel_id}: win={winner_id} reason=timeout")
+
+
+def _schedule_turn_timeout(context: ContextTypes.DEFAULT_TYPE, duel_id: int, turn_user_id: int):
+    """Запланировать тайм-аут хода. Если в течение DUEL_TURN_TIMEOUT_MIN мин ход не сменится — поражение."""
+    if not context.job_queue:
+        return
+    context.job_queue.run_once(
+        _duel_turn_timeout_job,
+        when=DUEL_TURN_TIMEOUT_MIN * 60,
+        data={'duel_id': duel_id, 'expected_turn': turn_user_id},
+        name=f"duel_turn_{duel_id}_{turn_user_id}_{int(now_msk().timestamp())}",
+    )
+
+
+async def duel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка всех кнопок дуэли. callback_data='duel:<action>:<id>'."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    action = parts[1]
+    try:
+        duel_id = int(parts[2])
+    except ValueError:
+        await query.answer()
+        return
+    
+    duel = _duel_get(duel_id)
+    if not duel:
+        await query.answer("Дуэль не найдена.", show_alert=True)
+        return
+    
+    user_id = query.from_user.id
+    
+    # ===== Принять / отказаться / отменить (pending) =====
+    if action == 'accept':
+        if duel['status'] != 'pending':
+            await query.answer("Уже не актуально.", show_alert=True)
+            return
+        if user_id != duel['p2_id']:
+            await query.answer("Принять может только тот, кого вызвали.", show_alert=True)
+            return
+        # Случайно выбираем кто стреляет первым
+        first = random.choice([duel['p1_id'], duel['p2_id']])
+        if not _duel_activate(duel_id, first):
+            await query.answer("Дуэль уже не в статусе ожидания.", show_alert=True)
+            return
+        duel = _duel_get(duel_id)
+        await query.answer("Принято! Удачи 🔫")
+        first_data = get_user_data(first)
+        first_name = first_data['nick'] if first_data else f"id {first}"
+        try:
+            await query.edit_message_text(
+                _duel_format_state(duel, status_line=f"⚔️ Дуэль началась! Первым стреляет {first_name}."),
+                reply_markup=_duel_kb_active(duel_id),
+            )
+        except Exception:
+            pass
+        _schedule_turn_timeout(context, duel_id, first)
+        return
+    
+    if action == 'reject':
+        if duel['status'] != 'pending':
+            await query.answer("Уже не актуально.", show_alert=True)
+            return
+        if user_id != duel['p2_id']:
+            await query.answer("Отклонить может только тот, кого вызвали.", show_alert=True)
+            return
+        _duel_cancel_pending(duel_id, reason='rejected')
+        p1 = get_user_data(duel['p1_id'])
+        p2 = get_user_data(duel['p2_id'])
+        n1 = p1['nick'] if p1 else f"id {duel['p1_id']}"
+        n2 = p2['nick'] if p2 else f"id {duel['p2_id']}"
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "🔫 ДУЭЛЬ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"❌ {n2} отказался от вызова {n1}."
+            )
+        except Exception:
+            pass
+        return
+    
+    if action == 'cancel':
+        if duel['status'] != 'pending':
+            await query.answer("Уже не актуально.", show_alert=True)
+            return
+        if user_id != duel['p1_id']:
+            await query.answer("Отменить может только вызывающий.", show_alert=True)
+            return
+        _duel_cancel_pending(duel_id, reason='cancelled')
+        p1 = get_user_data(duel['p1_id'])
+        n1 = p1['nick'] if p1 else f"id {duel['p1_id']}"
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "🔫 ДУЭЛЬ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"↩️ {n1} отменил вызов."
+            )
+        except Exception:
+            pass
+        return
+    
+    # ===== Игровые действия (active) =====
+    if duel['status'] != 'active':
+        await query.answer("Дуэль уже завершена.", show_alert=True)
+        return
+    
+    # Проверка что юзер — участник и ход его
+    if user_id not in (duel['p1_id'], duel['p2_id']):
+        await query.answer("Вы не участник этой дуэли.", show_alert=True)
+        return
+    if user_id != duel['current_turn']:
+        await query.answer("Не ваш ход.", show_alert=True)
+        return
+    
+    shooter_is_p1 = (user_id == duel['p1_id'])
+    opponent_id = duel['p2_id'] if shooter_is_p1 else duel['p1_id']
+    aim = duel['p1_aim'] if shooter_is_p1 else duel['p2_aim']
+    
+    if action == 'aim':
+        await query.answer("🎯 Прицелился!")
+        duel = _duel_apply_aim(duel_id, shooter_is_p1)
+        # Ход переходит к сопернику (как в Iris — прицел тратит ход)
+        _duel_switch_turn(duel_id, opponent_id)
+        duel = _duel_get(duel_id)
+        shooter = get_user_data(user_id)
+        sn = shooter['nick'] if shooter else f"id {user_id}"
+        try:
+            await query.edit_message_text(
+                _duel_format_state(duel, status_line=f"🎯 {sn} прицелился (точность следующего выстрела повышена)."),
+                reply_markup=_duel_kb_active(duel_id),
+            )
+        except Exception:
+            pass
+        _schedule_turn_timeout(context, duel_id, opponent_id)
+        return
+    
+    if action == 'surrender':
+        await query.answer("Сдача принята.")
+        winner_id = opponent_id
+        loser_id = user_id
+        _duel_finish(duel_id, winner_id, loser_id, 'surrender')
+        winner = get_user_data(winner_id)
+        loser = get_user_data(loser_id)
+        wn = winner['nick'] if winner else f"id {winner_id}"
+        ln = loser['nick'] if loser else f"id {loser_id}"
+        try:
+            await query.edit_message_text(
+                _duel_format_state(_duel_get(duel_id),
+                                    status_line=f"🏃 {ln} сдался.\n🏆 Победа: {wn}.")
+            )
+        except Exception:
+            pass
+        log_action(None, 'duel_finished', loser_id, f"#{duel_id}: win={winner_id} reason=surrender")
+        return
+    
+    if action == 'shoot':
+        chance = _calc_hit_chance(aim)
+        hit = random.randint(1, 100) <= chance
+        duel = _duel_apply_shot(duel_id, hit, shooter_is_p1)
+        
+        shooter = get_user_data(user_id)
+        opp = get_user_data(opponent_id)
+        sn = shooter['nick'] if shooter else f"id {user_id}"
+        on = opp['nick'] if opp else f"id {opponent_id}"
+        
+        if hit:
+            shot_line = f"💥 {sn} стреляет в {on} — ПОПАДАНИЕ! (-1 HP, был шанс {chance}%)"
+        else:
+            shot_line = f"💨 {sn} стреляет в {on} — промах. (шанс был {chance}%)"
+        
+        # Проверка финала
+        opp_hp = duel['p2_hp'] if shooter_is_p1 else duel['p1_hp']
+        if opp_hp <= 0:
+            winner_id = user_id
+            loser_id = opponent_id
+            _duel_finish(duel_id, winner_id, loser_id, 'shot')
+            await query.answer("🎯 Победа!")
+            try:
+                await query.edit_message_text(
+                    _duel_format_state(_duel_get(duel_id),
+                                        status_line=f"{shot_line}\n🏆 Победа: {sn}!")
+                )
+            except Exception:
+                pass
+            log_action(None, 'duel_finished', loser_id, f"#{duel_id}: win={winner_id} reason=shot")
+            return
+        
+        # Передаём ход сопернику
+        await query.answer()
+        _duel_switch_turn(duel_id, opponent_id)
+        duel = _duel_get(duel_id)
+        try:
+            await query.edit_message_text(
+                _duel_format_state(duel, status_line=shot_line),
+                reply_markup=_duel_kb_active(duel_id),
+            )
+        except Exception:
+            pass
+        _schedule_turn_timeout(context, duel_id, opponent_id)
+        return
+
+
+async def aduel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Статистика дуэлей.
+    
+    /aduel_stats          — топ-10 по победам за всё время
+    /aduel_stats @user    — статистика конкретного юзера
+    """
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    # Конкретный юзер
+    target_id = None
+    if context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id in (None, -1):
+            await update.message.reply_text("❌ Пользователь не найден.")
+            return
+    elif update.message and update.message.reply_to_message:
+        target_id = update.message.reply_to_message.from_user.id
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    if target_id:
+        td = get_user_data(target_id)
+        name = td['nick'] if td else f"id {target_id}"
+        c.execute("SELECT COUNT(*) FROM duels WHERE winner_id = ? AND status = 'finished'", (target_id,))
+        wins = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM duels WHERE loser_id = ? AND status = 'finished'", (target_id,))
+        losses = c.fetchone()[0]
+        c.execute(
+            "SELECT end_reason, COUNT(*) FROM duels WHERE loser_id = ? AND status = 'finished' GROUP BY end_reason",
+            (target_id,),
+        )
+        loss_breakdown = dict(c.fetchall())
+        conn.close()
+        
+        total = wins + losses
+        winrate = f"{round(wins / total * 100)}%" if total else "—"
+        text = (
+            "🔫 СТАТИСТИКА ДУЭЛЕЙ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 {name}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"🏆 Побед: {wins}\n"
+            f"💀 Поражений: {losses}\n"
+            f"📊 Винрейт: {winrate}\n"
+            f"⚔️ Всего дуэлей: {total}"
+        )
+        if loss_breakdown:
+            text += "\n━━━━━━━━━━━━━━━━━\nПричины поражений:"
+            labels = {'shot': '💥 убит', 'surrender': '🏃 сдался',
+                      'timeout': '⏱ тайм-аут', 'rejected': '❌ отказ'}
+            for k, v in loss_breakdown.items():
+                text += f"\n  • {labels.get(k, k)}: {v}"
+        await update.message.reply_text(text)
+        return
+    
+    # Топ
+    c.execute(
+        '''SELECT winner_id, COUNT(*) as wins FROM duels
+           WHERE status = 'finished' AND winner_id IS NOT NULL
+           GROUP BY winner_id ORDER BY wins DESC LIMIT 10'''
+    )
+    top = c.fetchall()
+    conn.close()
+    
+    if not top:
+        await update.message.reply_text(
+            "🔫 СТАТИСТИКА ДУЭЛЕЙ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Завершённых дуэлей ещё нет."
+        )
+        return
+    
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🔫 ТОП-10 ДУЭЛЯНТОВ", "━━━━━━━━━━━━━━━━━"]
+    for i, (uid, w) in enumerate(top):
+        ud = get_user_data(uid)
+        name = ud['nick'] if ud else f"id {uid}"
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{medal} {name} — {w} побед")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("Лично: /aduel_stats @user")
+    await update.message.reply_text("\n".join(lines))
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -7332,6 +7965,7 @@ def main():
         'aunwarngame': aunwarngame,
         'aukrating': aukrating,
         'areloadarticles': areloadarticles,
+        'aduel': aduel, 'aduel_stats': aduel_stats,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -7399,6 +8033,8 @@ def main():
     application.add_handler(CallbackQueryHandler(request_decision_callback, pattern=r'^rqst:'))
     # Игра за снятие предупреждения (камень-ножницы-бумага)
     application.add_handler(CallbackQueryHandler(warn_game_callback, pattern=r'^wgame:'))
+    # Дуэли
+    application.add_handler(CallbackQueryHandler(duel_callback, pattern=r'^duel:'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     # Сбор сообщений для анализа настроения (только в конференции)
