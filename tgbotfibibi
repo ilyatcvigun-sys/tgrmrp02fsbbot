@@ -726,6 +726,30 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Миграция для фишки "моя статья" — когда последний раз получал статью УК РФ.
+    # КД 1 день. NULL = ещё ни разу не получал.
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN last_article_at TEXT')
+        logger.info("Migration: added users.last_article_at column")
+    except sqlite3.OperationalError:
+        pass
+    
+    # Журнал выдач статей УК РФ — нужен для топа «главного преступника дня/недели».
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS article_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            article_num TEXT NOT NULL,
+            article_name TEXT,
+            given_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_article_history_user ON article_history(user_id, given_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_article_history_given_at ON article_history(given_at)')
+    except sqlite3.OperationalError:
+        pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1553,6 +1577,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /find — руководящий состав\n"
         "├ /awarns — ваши предупреждения\n"
         "├ /aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
+        "├ /aukrating [day/week/month/all] — топ преступников\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -5745,6 +5770,45 @@ def _report_progress_bar(step: int, total: int = 5) -> str:
     return "▰" * filled + "▱" * (total - filled) + f"  {step}/{total}"
 
 
+def _format_verdict_history(report: dict, *, include_current: bool = False) -> str:
+    """
+    Возвращает форматированную историю проверок жалобы — кто, какой вердикт, когда,
+    с комментарием. Используется и в карточке, и в финальных уведомлениях, и в сводке.
+    
+    include_current=True — добавить в конец строку про текущий финальный вердикт
+                           (используется в уведомлениях, где сам вердикт идёт отдельно сверху).
+    """
+    prev = report.get('previous_verdicts') or []
+    if not prev and not (include_current and report.get('verdict')):
+        return ""
+    
+    lines = []
+    for i, snap in enumerate(prev, 1):
+        old_mod = get_admin_nick(snap.get('moderator_id')) if snap.get('moderator_id') else "—"
+        reop_by = get_admin_nick(snap.get('reopened_by')) if snap.get('reopened_by') else "—"
+        lines.append(
+            f"  {i}. {snap.get('verdict') or '—'} — {old_mod} "
+            f"({snap.get('resolved_at') or '—'})"
+        )
+        if snap.get('comment'):
+            comment_preview = snap['comment'][:120] + ("…" if len(snap['comment']) > 120 else "")
+            lines.append(f"     💬 {comment_preview}")
+        lines.append(f"     🔄 перепроверку запросил: {reop_by} ({snap.get('reopened_at') or '—'})")
+    
+    if include_current and report.get('verdict') and report['status'] not in ('pending', 'review'):
+        n = len(prev) + 1
+        cur_mod = get_admin_nick(report['moderator_id']) if report.get('moderator_id') else "—"
+        lines.append(
+            f"  {n}. {report['verdict']} — {cur_mod} "
+            f"({report.get('resolved_at') or '—'})  ← текущий"
+        )
+        if report.get('moderator_comment'):
+            comment_preview = report['moderator_comment'][:120] + ("…" if len(report['moderator_comment']) > 120 else "")
+            lines.append(f"     💬 {comment_preview}")
+    
+    return "\n".join(lines)
+
+
 def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
     """Единое оформление карточки жалобы для всех мест (DM, /areport_info, /areports)."""
     nick = report['reporter_nick'] or "—"
@@ -5784,7 +5848,7 @@ def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
             f"📊 Вердикт: {report['verdict'] or '—'}"
         )
         if reopened_count > 0:
-            body += " (перепроверка)"
+            body += " (после перепроверки)"
         body += "\n"
         body += f"👮 Модератор: {mod_name}\n"
         if report['moderator_comment']:
@@ -5792,22 +5856,12 @@ def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
         if report['resolved_at']:
             body += f"📅 Решено: {report['resolved_at']}\n"
     
-    # Если жалоба перепроверялась — добавляем краткую историю прошлых решений
-    prev = report.get('previous_verdicts') or []
-    if prev:
+    # История прошлых проверок (если были перепроверки)
+    history = _format_verdict_history(report)
+    if history:
         body += "━━━━━━━━━━━━━━━━━\n"
-        body += f"🔄 ИСТОРИЯ ПЕРЕПРОВЕРОК ({len(prev)})\n"
-        for i, snap in enumerate(prev, 1):
-            old_mod = get_admin_nick(snap.get('moderator_id')) if snap.get('moderator_id') else "—"
-            reop_by = get_admin_nick(snap.get('reopened_by')) if snap.get('reopened_by') else "—"
-            body += (
-                f"  {i}. {snap.get('verdict') or '—'} от {old_mod}"
-                f" ({snap.get('resolved_at') or '—'})\n"
-            )
-            if snap.get('comment'):
-                comment_preview = snap['comment'][:80] + ("…" if len(snap['comment']) > 80 else "")
-                body += f"     💬 {comment_preview}\n"
-            body += f"     🔄 перепроверку инициировал: {reop_by} ({snap.get('reopened_at') or '—'})\n"
+        body += f"🔄 ИСТОРИЯ ПЕРЕПРОВЕРОК ({reopened_count})\n"
+        body += history + "\n"
     return body.rstrip()
 
 
@@ -6217,7 +6271,22 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
     
     report = get_report(report_id)
     reopened = (report.get('reopened_count') or 0) > 0
-    reopen_tag = " (перепроверка)" if reopened else ""
+    reopen_tag = " (после перепроверки)" if reopened else ""
+    
+    # Если жалоба прошла перепроверку — добавим полный список всех проверявших
+    history_block = ""
+    if reopened:
+        history = _format_verdict_history(report)  # история ДО текущего вердикта
+        if history:
+            history_block = (
+                f"\n━━━━━━━━━━━━━━━━━\n"
+                f"🔄 ВСЕ ПРОВЕРКИ ЖАЛОБЫ ({report['reopened_count'] + 1}):\n"
+                f"{history}\n"
+                f"  {report['reopened_count'] + 1}. {verdict} — "
+                f"{get_admin_nick(update.effective_user.id)} ({now_msk_str()})  ← текущий"
+            )
+            if comment and comment != "—":
+                history_block += f"\n     💬 {comment[:120]}{'…' if len(comment) > 120 else ''}"
     
     # Уведомление автору жалобы
     try:
@@ -6227,8 +6296,9 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
                 f"📋 ВЕРДИКТ ПО ЖАЛОБЕ #{report_id}{reopen_tag}\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 f"📊 Статус: {verdict}\n"
+                f"👮 Модератор: {get_admin_nick(update.effective_user.id)}\n"
                 f"💬 {comment}"
-                + (f"\n🔄 Жалоба была перепроверена ({report['reopened_count']} раз)." if reopened else "")
+                + history_block
             ),
         )
     except Exception:
@@ -6244,8 +6314,9 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
                 f"🎮 Нарушитель: {report['violator_nick']}\n"
                 f"⚠️ {report['violation']}\n"
                 f"📊 {verdict}\n"
+                f"👮 {get_admin_nick(update.effective_user.id)}\n"
                 f"💬 {comment}"
-                + (f"\n🔄 Жалоба была перепроверена ({report['reopened_count']} раз)." if reopened else "")
+                + history_block
             ),
             message_thread_id=VERDICT_TOPIC_ID,
         )
@@ -6800,6 +6871,491 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_messages.pop(0)
     logger.debug(f"track_message: buffer={len(chat_messages)}/100")
 
+
+# ============ «МОЯ СТАТЬЯ» — рандомная статья УК РФ ============
+
+# База статей УК РФ. Только публично известные, без описаний методов.
+# Можно дополнять — просто добавляй новые словари в список.
+UK_ARTICLES = [
+    {"num": "105", "name": "Убийство", "joke": "светят серьёзные сроки 🪦"},
+    {"num": "109", "name": "Причинение смерти по неосторожности", "joke": "не туда нажал, не там толкнул"},
+    {"num": "111", "name": "Умышленное причинение тяжкого вреда здоровью", "joke": "руки чешутся?"},
+    {"num": "112", "name": "Умышленное причинение средней тяжести вреда здоровью", "joke": "не подрался — а зря"},
+    {"num": "113", "name": "Причинение тяжкого или средней тяжести вреда здоровью в состоянии аффекта", "joke": "сорвался в очереди в Пятёрочке"},
+    {"num": "115", "name": "Умышленное причинение лёгкого вреда здоровью", "joke": "помял кому-то нос"},
+    {"num": "116", "name": "Побои", "joke": "за хлёсткий подзатыльник"},
+    {"num": "116.1", "name": "Нанесение побоев лицом, подвергнутым адм. наказанию", "joke": "не учится на ошибках"},
+    {"num": "117", "name": "Истязание", "joke": "буллинг по-крупному"},
+    {"num": "118", "name": "Причинение тяжкого вреда здоровью по неосторожности", "joke": "случайно, но всё равно отвечать"},
+    {"num": "119", "name": "Угроза убийством", "joke": "«я тебя найду» — было сказано слишком серьёзно"},
+    {"num": "121", "name": "Заражение венерической болезнью", "joke": "плохо думал перед знакомством"},
+    {"num": "122", "name": "Заражение ВИЧ-инфекцией", "joke": "очень серьёзная статья"},
+    {"num": "124", "name": "Неоказание помощи больному", "joke": "прошёл мимо лежащего на улице"},
+    {"num": "125", "name": "Оставление в опасности", "joke": "ушёл и забыл, что напарник без сознания"},
+    {"num": "126", "name": "Похищение человека", "joke": "позвал друга и забыл вернуть"},
+    {"num": "127", "name": "Незаконное лишение свободы", "joke": "запер кота в ванной слишком надолго"},
+    {"num": "128.1", "name": "Клевета", "joke": "сказал лишнего в чате"},
+    {"num": "131", "name": "Изнасилование", "joke": "очень тяжкое преступление"},
+    {"num": "137", "name": "Нарушение неприкосновенности частной жизни", "joke": "выложил чужие переписки"},
+    {"num": "138", "name": "Нарушение тайны переписки", "joke": "залез в чужой телефон"},
+    {"num": "139", "name": "Нарушение неприкосновенности жилища", "joke": "зашёл в гости без приглашения"},
+    {"num": "141", "name": "Воспрепятствование осуществлению избирательных прав", "joke": "запретил соседу голосовать"},
+    {"num": "143", "name": "Нарушение требований охраны труда", "joke": "забыл выдать каски бригаде"},
+    {"num": "144", "name": "Воспрепятствование журналистской деятельности", "joke": "выгнал репортёра с заседания"},
+    {"num": "145", "name": "Необоснованный отказ в приёме на работу", "joke": "не взял из-за татуировки"},
+    {"num": "145.1", "name": "Невыплата заработной платы", "joke": "«ну подожди ещё месяцок»"},
+    {"num": "146", "name": "Нарушение авторских прав", "joke": "качал фильмы с торрентов"},
+    {"num": "150", "name": "Вовлечение несовершеннолетнего в преступление", "joke": "научил младшего брата плохому"},
+    {"num": "151", "name": "Вовлечение несовершеннолетнего в антиобщественные действия", "joke": "учил подростков курить за гаражами"},
+    {"num": "151.1", "name": "Розничная продажа алкоголя несовершеннолетним", "joke": "продал колу с привкусом 🍺"},
+    {"num": "153", "name": "Подмена ребёнка", "joke": "перепутал в роддоме (намеренно)"},
+    {"num": "156", "name": "Неисполнение обязанностей по воспитанию несовершеннолетнего", "joke": "оставил ребёнка одного с ноутбуком на неделю"},
+    {"num": "157", "name": "Неуплата алиментов", "joke": "пора платить, папа"},
+    {"num": "158", "name": "Кража", "joke": "взял чужое 👜"},
+    {"num": "158.1", "name": "Мелкое хищение, совершённое лицом, подвергнутым адм. наказанию", "joke": "вернулся в магазин за добавкой"},
+    {"num": "159", "name": "Мошенничество", "joke": "развёл бабушку в чате"},
+    {"num": "159.1", "name": "Мошенничество в сфере кредитования", "joke": "взял кредит на чужой паспорт"},
+    {"num": "159.2", "name": "Мошенничество при получении выплат", "joke": "получал больничный, гуляя в Турции"},
+    {"num": "159.3", "name": "Мошенничество с использованием платёжных карт", "joke": "не та карта, не тот пароль"},
+    {"num": "159.5", "name": "Мошенничество в сфере страхования", "joke": "ДТП было, но не такое"},
+    {"num": "159.6", "name": "Мошенничество в сфере компьютерной информации", "joke": "слишком увлёкся социальной инженерией"},
+    {"num": "160", "name": "Присвоение или растрата", "joke": "взял из кассы «на минутку»"},
+    {"num": "161", "name": "Грабёж", "joke": "ушёл с чужой шапкой без спроса"},
+    {"num": "162", "name": "Разбой", "joke": "не та статья для шуток"},
+    {"num": "163", "name": "Вымогательство", "joke": "«гони денежки, пацан»"},
+    {"num": "165", "name": "Причинение имущественного ущерба путём обмана", "joke": "проехал в автобусе зайцем"},
+    {"num": "166", "name": "Угон", "joke": "покатался на чужой машине без спроса"},
+    {"num": "167", "name": "Умышленное уничтожение имущества", "joke": "сломал чужой телефон в порыве чувств"},
+    {"num": "168", "name": "Уничтожение имущества по неосторожности", "joke": "уронил чужой ноутбук"},
+    {"num": "171", "name": "Незаконное предпринимательство", "joke": "печёт торты без ИП"},
+    {"num": "174", "name": "Легализация (отмывание) денежных средств", "joke": "слишком много стиральных машин"},
+    {"num": "175", "name": "Сбыт имущества, добытого преступным путём", "joke": "купил «у пацанов» и перепродал"},
+    {"num": "176", "name": "Незаконное получение кредита", "joke": "приукрасил справку о доходах"},
+    {"num": "177", "name": "Злостное уклонение от погашения кредита", "joke": "не отвечает на звонки банка год"},
+    {"num": "183", "name": "Незаконное получение коммерческой тайны", "joke": "подсмотрел чужой пароль"},
+    {"num": "184", "name": "Подкуп при спортивном соревновании", "joke": "уговорил вратаря пропустить"},
+    {"num": "186", "name": "Изготовление поддельных денег", "joke": "не получится, не пробуй"},
+    {"num": "187", "name": "Неправомерный оборот средств платежей", "joke": "клонировал чужую карту"},
+    {"num": "191", "name": "Незаконный оборот драгоценных металлов", "joke": "копил золотые слитки в подвале"},
+    {"num": "194", "name": "Уклонение от уплаты таможенных платежей", "joke": "провёз чемодан с электроникой «для себя»"},
+    {"num": "195", "name": "Неправомерные действия при банкротстве", "joke": "вывел активы перед банкротством"},
+    {"num": "196", "name": "Преднамеренное банкротство", "joke": "довёл фирму до банкротства намеренно"},
+    {"num": "197", "name": "Фиктивное банкротство", "joke": "разыграл банкротство, а сам с деньгами"},
+    {"num": "198", "name": "Уклонение физлица от уплаты налогов", "joke": "забыл задекларировать заначку"},
+    {"num": "199", "name": "Уклонение от уплаты налогов организации", "joke": "забыл подать декларацию"},
+    {"num": "200.3", "name": "Привлечение средств граждан в нарушение требований", "joke": "запустил «инвестиционный проект» в Телеграме"},
+    {"num": "201", "name": "Злоупотребление полномочиями", "joke": "выписал себе премию через себя же"},
+    {"num": "204", "name": "Коммерческий подкуп", "joke": "поднёс шефу коньячок не по уставу"},
+    {"num": "207", "name": "Заведомо ложное сообщение об акте терроризма", "joke": "пошутил про бомбу в школе"},
+    {"num": "210", "name": "Организация преступного сообщества", "joke": "сколотил банду из трёх человек"},
+    {"num": "212", "name": "Массовые беспорядки", "joke": "слишком громко не согласился"},
+    {"num": "213", "name": "Хулиганство", "joke": "горланил песни в метро 🎤"},
+    {"num": "214", "name": "Вандализм", "joke": "разрисовал лавочку"},
+    {"num": "215.3", "name": "Самовольное подключение к нефтепроводам", "joke": "провёл себе личный нефтепровод"},
+    {"num": "219", "name": "Нарушение требований пожарной безопасности", "joke": "топил баню докрасна, баня сгорела"},
+    {"num": "222", "name": "Незаконный оборот оружия", "joke": "нашёл и не сдал"},
+    {"num": "223", "name": "Незаконное изготовление оружия", "joke": "слишком увлёкся 3D-печатью"},
+    {"num": "224", "name": "Небрежное хранение огнестрельного оружия", "joke": "оставил карабин в прихожей рядом с ботинками"},
+    {"num": "227", "name": "Пиратство", "joke": "поднял на лодке весёлый Роджер 🏴‍☠️"},
+    {"num": "228", "name": "Незаконный оборот наркотиков", "joke": "не та страна для шуток на эту тему"},
+    {"num": "230", "name": "Склонение к потреблению наркотиков", "joke": "плохо рассказал про химию"},
+    {"num": "231", "name": "Незаконное культивирование", "joke": "слишком увлёкся ботаникой"},
+    {"num": "236", "name": "Нарушение санитарно-эпидемиологических правил", "joke": "продавал шаурму с балкона"},
+    {"num": "238", "name": "Производство и сбыт небезопасной продукции", "joke": "продал просрочку"},
+    {"num": "240", "name": "Вовлечение в занятие проституцией", "joke": "не та работа агентом"},
+    {"num": "242", "name": "Незаконные действия с порнографическими материалами", "joke": "не открывай в общественном месте"},
+    {"num": "243", "name": "Уничтожение объектов культурного наследия", "joke": "написал на стене кремля имя"},
+    {"num": "244", "name": "Надругательство над телами умерших", "joke": "не лазь на кладбище после полуночи"},
+    {"num": "245", "name": "Жестокое обращение с животными", "joke": "обидел котика — отвечай"},
+    {"num": "250", "name": "Загрязнение вод", "joke": "слил в реку машинного масла"},
+    {"num": "251", "name": "Загрязнение атмосферы", "joke": "жёг покрышки на даче"},
+    {"num": "256", "name": "Незаконная добыча водных биоресурсов", "joke": "ловил рыбу сетью в нерест"},
+    {"num": "258", "name": "Незаконная охота", "joke": "стрелял в лося без лицензии"},
+    {"num": "260", "name": "Незаконная рубка лесных насаждений", "joke": "срубил ёлку в лесу под Новый год"},
+    {"num": "261", "name": "Уничтожение или повреждение лесных насаждений", "joke": "не потушил костёр в лесу"},
+    {"num": "264", "name": "Нарушение ПДД, повлёкшее последствия", "joke": "слишком быстро ехал во дворе"},
+    {"num": "264.1", "name": "Нарушение ПДД лицом, подвергнутым адм. наказанию", "joke": "поехал пьяным во второй раз"},
+    {"num": "267", "name": "Приведение в негодность путей сообщения", "joke": "клал на рельсы пятаки слишком долго"},
+    {"num": "272", "name": "Неправомерный доступ к компьютерной информации", "joke": "подобрал чужой пароль 🔐"},
+    {"num": "273", "name": "Создание и распространение вредоносных программ", "joke": "написал «безобидный» вирус"},
+    {"num": "274.1", "name": "Воздействие на критическую информационную инфраструктуру", "joke": "слишком увлёкся хакингом"},
+    {"num": "275", "name": "Государственная измена", "joke": "сболтнул лишнего иностранцу"},
+    {"num": "276", "name": "Шпионаж", "joke": "плохой день для туриста с фотоаппаратом у военной части"},
+    {"num": "280", "name": "Публичные призывы к экстремистской деятельности", "joke": "не тот пост в соцсетях"},
+    {"num": "282", "name": "Возбуждение ненависти либо вражды", "joke": "не тот мем"},
+    {"num": "285", "name": "Злоупотребление должностными полномочиями", "joke": "пристроил кума на тёплое место"},
+    {"num": "286", "name": "Превышение должностных полномочий", "joke": "взял на себя слишком много"},
+    {"num": "289", "name": "Незаконное участие в предпринимательской деятельности", "joke": "чиновник с тремя фирмами на тёще"},
+    {"num": "290", "name": "Получение взятки", "joke": "взял конвертик «за помощь»"},
+    {"num": "291", "name": "Дача взятки", "joke": "сунул конвертик «за услугу»"},
+    {"num": "291.1", "name": "Посредничество во взяточничестве", "joke": "был курьером не той посылки"},
+    {"num": "292", "name": "Служебный подлог", "joke": "подправил справку для друга"},
+    {"num": "293", "name": "Халатность", "joke": "забил на работу — а кому-то прилетело"},
+    {"num": "297", "name": "Неуважение к суду", "joke": "пришёл в шортах и тапках"},
+    {"num": "303", "name": "Фальсификация доказательств", "joke": "подбросил чужой телефон в сумку"},
+    {"num": "306", "name": "Заведомо ложный донос", "joke": "написал жалобу на соседа из вредности"},
+    {"num": "307", "name": "Заведомо ложные показания", "joke": "не там и не то сказал в суде"},
+    {"num": "308", "name": "Отказ от дачи показаний", "joke": "«я ничего не видел, не слышал, не понимаю»"},
+    {"num": "312", "name": "Действия в отношении арестованного имущества", "joke": "продал арестованный телевизор соседу"},
+    {"num": "313", "name": "Побег из места лишения свободы", "joke": "не из той истории"},
+    {"num": "314.1", "name": "Уклонение от административного надзора", "joke": "пропал из города без предупреждения"},
+    {"num": "316", "name": "Укрывательство преступлений", "joke": "прикрыл другана"},
+    {"num": "318", "name": "Применение насилия в отношении представителя власти", "joke": "толкнул сотрудника в ответ"},
+    {"num": "319", "name": "Оскорбление представителя власти", "joke": "наговорил полицейскому лишнего"},
+    {"num": "322", "name": "Незаконное пересечение границы", "joke": "решил срезать через лес не туда"},
+    {"num": "324", "name": "Приобретение или сбыт государственных наград", "joke": "продал дедушкину медаль на «Авито»"},
+    {"num": "325", "name": "Похищение документов, штампов, печатей", "joke": "забрал из офиса печать «на всякий»"},
+    {"num": "326", "name": "Подделка идентификационного номера ТС", "joke": "перебил номер на машине"},
+    {"num": "327", "name": "Подделка документов", "joke": "нарисовал себе справку в фотошопе"},
+    {"num": "328", "name": "Уклонение от военной службы", "joke": "вечно «болеет» в военкомате"},
+    {"num": "329", "name": "Надругательство над Государственным гербом или флагом", "joke": "не то сделал с триколором"},
+    {"num": "330", "name": "Самоуправство", "joke": "сам забрал у соседа долг"},
+    {"num": "337", "name": "Самовольное оставление части", "joke": "соскучился по маме, ушёл без увольнительной"},
+    {"num": "338", "name": "Дезертирство", "joke": "ушёл со службы и не вернулся"},
+    {"num": "354.1", "name": "Реабилитация нацизма", "joke": "пошутил не по теме в День Победы"},
+]
+
+
+# Варианты «не нашлось статьи» — небольшой шанс (~12%), чтобы было нескучно
+UK_NO_ARTICLE_RESPONSES = [
+    "🚪 Картотека закрыта на обед. Загляни позже.",
+    "📁 Папка с твоим делом куда-то потерялась. Повезло.",
+    "👮 Следователь сегодня в отгуле. Свободен.",
+    "📜 Подходящей статьи на тебя не нашлось. Праздник?",
+    "🤷 Сегодня без статьи — но это пока.",
+    "⚖️ Адвокат отговорил судью. Ты чист.",
+    "🕊 Амнистия! Сегодня ты свободный человек.",
+    "📂 Дело отправлено на доработку. Возвращайся завтра.",
+]
+
+# Триггер-фразы (нормализуем: нижний регистр, без знаков препинания, lstrip/rstrip).
+ARTICLE_TRIGGERS = {"моя статья", "моястатья", "статья моя"}
+
+# КД между запросами одного юзера, в часах
+ARTICLE_COOLDOWN_HOURS = 24
+
+
+def _normalize_trigger(text: str) -> str:
+    """Нижний регистр + убираем все знаки препинания/эмодзи на краях."""
+    if not text:
+        return ""
+    t = text.strip().lower()
+    # Убираем повторяющиеся пробелы и невидимые символы
+    t = re.sub(r'\s+', ' ', t)
+    # Убираем знаки препинания на краях
+    t = t.strip(".,!?;:()[]{}«»\"'-—–…•· ")
+    return t
+
+
+def _get_last_article_at(user_id: int):
+    """Возвращает datetime МСК последнего запроса юзера, либо None."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT last_article_at FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+    except Exception:
+        return None
+
+
+def _set_last_article_at(user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET last_article_at = ? WHERE user_id = ?',
+              (now_msk_str("%Y-%m-%d %H:%M:%S"), user_id))
+    conn.commit()
+    conn.close()
+
+
+async def handle_my_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Реакция на фразу «моя статья» в ЛС бота или в конференции.
+    КД 1 день, ~12% шанс «не нашлось». В остальных случаях — рандомная статья УК РФ.
+    """
+    if not update.message or not update.message.text:
+        return
+    
+    user = update.effective_user
+    if not user:
+        return
+    
+    # Проверяем что юзер вообще зарегистрирован — иначе игнорируем
+    user_data = get_user_data(user.id)
+    if not user_data:
+        return
+    
+    # Проверяем КД
+    last_at = _get_last_article_at(user.id)
+    if last_at is not None:
+        elapsed = now_msk() - last_at
+        cooldown = timedelta(hours=ARTICLE_COOLDOWN_HOURS)
+        if elapsed < cooldown:
+            remaining = cooldown - elapsed
+            await update.message.reply_text(
+                "⚖️ Картотека УК РФ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"Сегодня ты уже получал статью.\n"
+                f"⏳ Следующий запрос через: {format_duration(remaining)}"
+            )
+            return
+    
+    # Ставим КД сразу — независимо от исхода
+    _set_last_article_at(user.id)
+    
+    # Шанс «не выдалась»
+    if random.random() < 0.12:
+        text = random.choice(UK_NO_ARTICLE_RESPONSES)
+        await update.message.reply_text(
+            "⚖️ Картотека УК РФ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 {user_data['callsign']}\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"{text}"
+        )
+        return
+    
+    # Выдаём статью
+    article = random.choice(UK_ARTICLES)
+    
+    # Логируем выдачу в article_history (для топа «преступник дня/недели»)
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO article_history (user_id, article_num, article_name, given_at) VALUES (?, ?, ?, ?)',
+            (user.id, article['num'], article['name'], now_msk_str()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"article_history insert failed: {e}")
+    
+    await update.message.reply_text(
+        "⚖️ ТВОЯ СТАТЬЯ УК РФ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {user_data['callsign']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📜 Статья {article['num']} УК РФ\n"
+        f"⚖️ {article['name']}\n"
+        f"💭 {article['joke']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Следующая статья — через {ARTICLE_COOLDOWN_HOURS}ч."
+    )
+
+
+async def article_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Универсальный роутер для текстовых триггер-фраз ('моя статья').
+    Регистрируется в group=2 (после tracker'ов), не блокирует другие хэндлеры.
+    """
+    if not update.message or not update.message.text:
+        return
+    normalized = _normalize_trigger(update.message.text)
+    if normalized in ARTICLE_TRIGGERS:
+        await handle_my_article(update, context)
+
+
+# ============ ТОП «ГЛАВНЫЙ ПРЕСТУПНИК» ============
+
+def _get_article_top(since: datetime = None, limit: int = 10) -> list:
+    """
+    Возвращает топ юзеров по числу полученных статей с момента since.
+    since=None → за всё время.
+    Каждый элемент: {user_id, total, top_articles: [(num, name, count), ...]}
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if since:
+        since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+        c.execute(
+            '''SELECT user_id, COUNT(*) as total
+               FROM article_history
+               WHERE given_at >= ?
+               GROUP BY user_id
+               ORDER BY total DESC
+               LIMIT ?''',
+            (since_str, limit),
+        )
+    else:
+        c.execute(
+            '''SELECT user_id, COUNT(*) as total
+               FROM article_history
+               GROUP BY user_id
+               ORDER BY total DESC
+               LIMIT ?''',
+            (limit,),
+        )
+    rows = c.fetchall()
+    result = []
+    for uid, total in rows:
+        # Топ-3 статей у этого юзера
+        if since:
+            c.execute(
+                '''SELECT article_num, article_name, COUNT(*) as cnt
+                   FROM article_history
+                   WHERE user_id = ? AND given_at >= ?
+                   GROUP BY article_num
+                   ORDER BY cnt DESC
+                   LIMIT 3''',
+                (uid, since_str),
+            )
+        else:
+            c.execute(
+                '''SELECT article_num, article_name, COUNT(*) as cnt
+                   FROM article_history
+                   WHERE user_id = ?
+                   GROUP BY article_num
+                   ORDER BY cnt DESC
+                   LIMIT 3''',
+                (uid,),
+            )
+        top_articles = c.fetchall()
+        result.append({
+            'user_id': uid,
+            'total': total,
+            'top_articles': top_articles,
+        })
+    conn.close()
+    return result
+
+
+def _format_top_list(top: list, *, with_articles: bool = True) -> str:
+    """Форматирует топ-список в текст."""
+    if not top:
+        return "Пока никто не получал статью."
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, entry in enumerate(top):
+        ud = get_user_data(entry['user_id'])
+        name = ud['callsign'] if ud else f"id {entry['user_id']}"
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{medal} {name} — {entry['total']} ст.")
+        if with_articles and entry['top_articles'] and i < 3:
+            for num, art_name, cnt in entry['top_articles']:
+                lines.append(f"    • ст.{num} «{art_name}» ×{cnt}")
+    return "\n".join(lines)
+
+
+async def aukrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Топ «главных преступников» по числу полученных статей.
+    
+    /aukrating              — за всё время
+    /aukrating day          — за последние 24 часа
+    /aukrating week         — за последние 7 дней
+    /aukrating month        — за последние 30 дней
+    """
+    period = (context.args[0].lower() if context.args else 'all').strip()
+    
+    since = None
+    period_label = "ЗА ВСЁ ВРЕМЯ"
+    if period in ('day', 'd', 'сутки', 'день'):
+        since = now_msk() - timedelta(hours=24)
+        period_label = "ЗА СУТКИ"
+    elif period in ('week', 'w', 'неделя', 'нед'):
+        since = now_msk() - timedelta(days=7)
+        period_label = "ЗА НЕДЕЛЮ"
+    elif period in ('month', 'm', 'месяц', 'мес'):
+        since = now_msk() - timedelta(days=30)
+        period_label = "ЗА МЕСЯЦ"
+    elif period in ('all', 'всё', 'все'):
+        since = None
+    
+    top = _get_article_top(since=since, limit=10)
+    
+    if not top:
+        await update.message.reply_text(
+            "⚖️ КАРТОТЕКА УК РФ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📊 Рейтинг {period_label.lower()}: пусто.\n"
+            "Никто ещё не пробовал свою статью."
+        )
+        return
+    
+    body = _format_top_list(top, with_articles=True)
+    text = (
+        "🏆 ГЛАВНЫЕ ПРЕСТУПНИКИ КОНФЕРЕНЦИИ\n"
+        f"📅 {period_label}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{body}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"💡 Доступно: /aukrating day | week | month | all"
+    )
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневно в 21:00 МСК постит главного преступника дня в конференцию."""
+    if not CONFERENCE_CHAT_ID:
+        return
+    since = now_msk() - timedelta(hours=24)
+    top = _get_article_top(since=since, limit=3)
+    if not top:
+        return  # Никто не пробовал — молчим
+    
+    leader = top[0]
+    ud = get_user_data(leader['user_id'])
+    name = ud['callsign'] if ud else f"id {leader['user_id']}"
+    
+    lines = [
+        "🏆 ГЛАВНЫЙ ПРЕСТУПНИК ДНЯ",
+        "━━━━━━━━━━━━━━━━━",
+        f"🥇 {name} — {leader['total']} статей за сутки",
+    ]
+    if leader['top_articles']:
+        lines.append("📜 Любимые статьи:")
+        for num, art_name, cnt in leader['top_articles']:
+            lines.append(f"  • ст.{num} «{art_name}» ×{cnt}")
+    
+    if len(top) > 1:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("📊 Серебро и бронза:")
+        for i, entry in enumerate(top[1:], 2):
+            ud2 = get_user_data(entry['user_id'])
+            n2 = ud2['callsign'] if ud2 else f"id {entry['user_id']}"
+            medal = "🥈" if i == 2 else "🥉"
+            lines.append(f"  {medal} {n2} — {entry['total']} ст.")
+    
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("💡 Свою судьбу можно узнать фразой «моя статья».")
+    
+    try:
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text="\n".join(lines))
+    except Exception as e:
+        logger.error(f"daily_criminal_job send error: {e}")
+
+
+async def weekly_criminal_job(context: ContextTypes.DEFAULT_TYPE):
+    """Еженедельно (воскресенье 22:00 МСК) постит топ-5 преступников недели."""
+    if not CONFERENCE_CHAT_ID:
+        return
+    since = now_msk() - timedelta(days=7)
+    top = _get_article_top(since=since, limit=5)
+    if not top:
+        return
+    
+    body = _format_top_list(top, with_articles=True)
+    text = (
+        "🏆 ИТОГИ НЕДЕЛИ — ТОП-5 ПРЕСТУПНИКОВ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{body}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💡 Завтра — новая неделя, новые статьи."
+    )
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    try:
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
+    except Exception as e:
+        logger.error(f"weekly_criminal_job send error: {e}")
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -6844,6 +7400,7 @@ def main():
         'aaudit': aaudit, 'ahistory': ahistory,
         'amooddebug': amooddebug,
         'aunwarngame': aunwarngame,
+        'aukrating': aukrating,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -6915,12 +7472,25 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     # Сбор сообщений для анализа настроения (только в конференции)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
+    # «моя статья» — fun-фишка, не блокирующая. group=2, как и другие трекеры.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, article_trigger_router), group=2)
     
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
     application.job_queue.run_repeating(expire_warnings_job, interval=3600, first=30)
     # Авто-разбан временных банов: проверяем каждые 5 минут.
     application.job_queue.run_repeating(auto_unban_job, interval=300, first=45)
+    # Главный преступник дня — ежедневно в 21:00 МСК
+    application.job_queue.run_daily(
+        daily_criminal_job,
+        time=time(hour=21, minute=0, tzinfo=MSK),
+    )
+    # Итоги недели — воскресенье в 22:00 МСК (день 6 в datetime.weekday)
+    application.job_queue.run_daily(
+        weekly_criminal_job,
+        time=time(hour=22, minute=0, tzinfo=MSK),
+        days=(6,),
+    )
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
