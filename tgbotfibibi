@@ -7112,7 +7112,7 @@ async def handle_my_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚖️ Картотека УК РФ\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"👤 {user_data['callsign']}\n"
+            f"👤 {user_data['nick']}\n"
             f"━━━━━━━━━━━━━━━━━\n"
             f"{text}"
         )
@@ -7137,7 +7137,7 @@ async def handle_my_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚖️ ТВОЯ СТАТЬЯ УК РФ\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👤 {user_data['callsign']}\n"
+        f"👤 {user_data['nick']}\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"📜 Статья {article['num']} УК РФ\n"
         f"⚖️ {article['name']}\n"
