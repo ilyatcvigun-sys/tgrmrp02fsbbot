@@ -7089,6 +7089,27 @@ async def article_trigger_router(update: Update, context: ContextTypes.DEFAULT_T
         await handle_my_article(update, context)
 
 
+async def duel_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Текстовый триггер дуэли — позволяет писать «дуэль @user», «дуэль <id>» или
+    «дуэль» ответом на сообщение, без слэша. Эквивалент команды /aduel.
+    Должен быть зарегистрирован в отдельной группе.
+    """
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    # Срабатывает только когда «дуэль» — первое слово сообщения (регистр любой),
+    # чтобы случайные «эта дуэль была эпичной» не запускали бой.
+    parts = text.split()
+    if not parts or parts[0].lower() != "дуэль":
+        return
+    
+    # Подкладываем оставшиеся слова в context.args, чтобы aduel смогла извлечь цель.
+    # Если их нет, aduel сама проверит reply_to_message.
+    context.args = parts[1:]
+    await aduel(update, context)
+
+
 async def areloadarticles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Перезагружает базу статей УК РФ из uk_articles.json без рестарта бота.
@@ -8042,6 +8063,8 @@ def main():
     # «моя статья» — fun-фишка. ВАЖНО: отдельная группа, иначе PTB запустит только track_message
     # (внутри одной группы срабатывает только первый совпавший хэндлер).
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, article_trigger_router), group=3)
+    # «дуэль ...» — текст-триггер, эквивалент /aduel. Отдельная группа по той же причине.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, duel_trigger_router), group=4)
     
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
