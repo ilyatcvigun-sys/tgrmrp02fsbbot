@@ -4841,26 +4841,6 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
 
-async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправка changelog в конференцию"""
-    user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'achangelog'):
-        await update.message.reply_text("❌ Только генералы.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("❌ /achangelog Текст")
-        return
-    
-    changes = ' '.join(context.args)
-    changelog_text = f"🔄 ОБНОВЛЕНИЕ БОТА\n\n📝 {changes}\n\n📅 {now_msk_str('%Y-%m-%d %H:%M')}"
-    
-    try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=changelog_text)
-        await update.message.reply_text("✅ Изменения отправлены в конфу")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
 async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача жетона"""
     user_id = update.effective_user.id
@@ -8756,8 +8736,8 @@ async def achangelog_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     а остаток — заголовком; со следующей строки — содержимое.
     """
     user_id = update.effective_user.id
-    if not is_main_admin(user_id):
-        await update.message.reply_text("❌ Команда доступна только главному админу.")
+    if not has_permission(user_id, 'gban', 'achangelog_add'):
+        await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
     # Берём весь текст ПОСЛЕ команды (включая переносы)
@@ -8820,8 +8800,8 @@ async def achangelog_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Собрать черновик новых фишек, анализируя audit_log с момента последнего опубликованного changelog.
     """
     user_id = update.effective_user.id
-    if not is_main_admin(user_id):
-        await update.message.reply_text("❌ Команда доступна только главному админу.")
+    if not has_permission(user_id, 'gban', 'achangelog_draft'):
+        await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
     since_at = _changelog_get_last_published_at()
@@ -8880,8 +8860,8 @@ async def achangelog_publish(update: Update, context: ContextTypes.DEFAULT_TYPE)
     /achangelog_publish          — последний черновик
     """
     user_id = update.effective_user.id
-    if not is_main_admin(user_id):
-        await update.message.reply_text("❌ Команда доступна только главному админу.")
+    if not has_permission(user_id, 'gban', 'achangelog_publish'):
+        await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
     cid = None
@@ -8967,8 +8947,8 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     if cid:
-        # Юзеры могут смотреть только published; админ — любой
-        if is_main_admin(user_id):
+        # Юзеры могут смотреть только published; редакторы (gban-grant) — любой
+        if has_permission(user_id, 'gban', 'achangelog'):
             c.execute("SELECT * FROM changelogs WHERE id = ?", (cid,))
         else:
             c.execute("SELECT * FROM changelogs WHERE id = ? AND status = 'published'", (cid,))
@@ -9001,7 +8981,7 @@ async def achangelog_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    if is_main_admin(user_id):
+    if has_permission(user_id, 'gban', 'achangelog_list'):
         c.execute("SELECT id, version, title, status, created_at, published_at FROM changelogs ORDER BY id DESC")
     else:
         c.execute(
@@ -9036,10 +9016,10 @@ async def achangelog_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def achangelog_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удалить changelog (главный админ). /achangelog_delete <id>"""
+    """Удалить changelog. /achangelog_delete <id>"""
     user_id = update.effective_user.id
-    if not is_main_admin(user_id):
-        await update.message.reply_text("❌ Команда доступна только главному админу.")
+    if not has_permission(user_id, 'gban', 'achangelog_delete'):
+        await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
     if not context.args:
@@ -9139,7 +9119,7 @@ def main():
         'awarns': awarns, 'awarnlist': awarns, 'aunwarn': aunwarn, 'aunwarnall': aunwarnall,
         'asetrank': asetrank, 'asetdept': asetdept, 'asettoken': asettoken,
         'aadmins': aadmins, 'auserlist': auserlist, 'awho': awhoprofile,
-        'areports': areports, 'achangelog': achangelog, 'acallsign': acallsign,
+        'areports': areports, 'acallsign': acallsign,
         'ablock': ablock, 'aunblock': aunblock, 'amood': amood,
         'aspecial': aspecial, 'awhois': awhois, 'abroadcast': abroadcast,
         'abackup': abackup, 'aregister': aregister, 'aforcereg': aforcereg,
