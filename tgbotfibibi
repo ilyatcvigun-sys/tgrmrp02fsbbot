@@ -806,6 +806,26 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Changelogs — обновления бота: черновики и опубликованные посты.
+    # status: 'draft' (видно только админам) | 'published' (видно всем через /achangelog).
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS changelogs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT,                     -- например "v3"; авто, если не указано
+            title TEXT,
+            content TEXT NOT NULL,
+            status TEXT DEFAULT 'draft',
+            created_by INTEGER,
+            created_at TEXT DEFAULT '',
+            published_at TEXT DEFAULT '',
+            published_message_id INTEGER      -- если опубликован в конференцию
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_changelogs_status ON changelogs(status, published_at)')
+    except sqlite3.OperationalError:
+        pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1638,6 +1658,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /aduel_stats [@user] — статистика дуэлей\n"
         "├ /acubes [@user] — кубы 🎲 (без аргумента — открытый вызов)\n"
         "├ /acubes_stats [@user] — статистика кубов\n"
+        "├ /achangelog [id] — обновления бота\n"
+        "├ /achangelog_list — список обновлений\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -2354,13 +2376,29 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text + "\nУточните: /gban ID причина")
         return
     
-    await send_action_message(update, context, target_id, "gban", reason)
+    # ГБАН без публичных уведомлений: пользователь не должен видеть никаких сообщений
+    # ни в чате (театральное «залутал чс»), ни в личку. Кикаем тихо, подтверждение
+    # отправляем вызвавшему в ЛС.
     add_gban(target_id, reason, user_id)
     await kick_user_from_chat(update, context, target_id)
     
     target_data = get_user_data(target_id)
     target_name = target_data['callsign'] if target_data else f"User {target_id}"
-    await update.message.reply_text(f"🚫 ОЧС\n👤 {target_name}\n📝 {reason}")
+    confirm = (
+        f"🚫 ОЧС (тихо)\n"
+        f"👤 {target_name}\n"
+        f"📝 {reason}"
+    )
+    # Подтверждение шлём в личку вызвавшему, чтобы в общий чат ничего не утекало.
+    try:
+        await context.bot.send_message(chat_id=user_id, text=confirm)
+    except Exception as e:
+        # Если у вызвавшего нет открытой ЛС с ботом — фоллбэк на тихий reply (без театра)
+        logger.debug(f"gban DM confirm failed for {user_id}: {e}")
+        try:
+            await update.message.reply_text(confirm)
+        except Exception:
+            pass
 
 # ============ ВАРНЫ ============
 
@@ -5079,10 +5117,19 @@ async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не найден.")
         return
     
+    # Снятие ОЧС без публичных уведомлений. Подтверждение — в личку вызвавшему.
     if remove_gban(target_id):
-        await update.message.reply_text("✅ Снят ЧС")
+        confirm = "✅ Снят ЧС (тихо)"
     else:
-        await update.message.reply_text("❌ Не в ЧС")
+        confirm = "❌ Не в ЧС"
+    try:
+        await context.bot.send_message(chat_id=user_id, text=confirm)
+    except Exception as e:
+        logger.debug(f"ungban DM confirm failed for {user_id}: {e}")
+        try:
+            await update.message.reply_text(confirm)
+        except Exception:
+            pass
 
 async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список ЧС"""
@@ -7147,6 +7194,8 @@ async def cube_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
       «кубы @user» / «кубы 123» — закрытый вызов
       «кубы» (reply)            — закрытый вызов автору
       «кто кубы»                — синоним открытого вызова
+      «кубы да»                 — принять активный вызов на себя
+      «кубы нет»                — отклонить активный вызов на себя
       «кубы стата»              — топ статистики
       «кубы стата @user»        — статистика конкретного юзера
     Должен быть зарегистрирован в отдельной группе.
@@ -7169,6 +7218,11 @@ async def cube_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     if first != "кубы":
         return
     
+    # «кубы да» / «кубы нет» — принять/отклонить вызов на себя
+    if len(parts) >= 2 and parts[1].lower() in ("да", "нет"):
+        await _cube_text_decision(update, context, accept=(parts[1].lower() == "да"))
+        return
+    
     # «кубы стата» / «кубы стата @user» → статистика
     if len(parts) >= 2 and parts[1].lower() in ("стата", "статистика"):
         context.args = parts[2:]
@@ -7178,6 +7232,62 @@ async def cube_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Остальные варианты: open («кубы»), closed («кубы @user»), reply
     context.args = parts[1:]
     await acubes(update, context)
+
+
+async def _cube_text_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, accept: bool):
+    """Принять или отклонить вызов в кубы текстом «кубы да» / «кубы нет»."""
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        return  # тихо — фраза могла быть случайной
+    
+    chat_id = update.effective_chat.id
+    
+    # Ищем активный pending-вызов в этом чате, где user — соперник
+    # (для закрытого: p2_id == user; для открытого: p2_id IS NULL и любой может принять)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''SELECT id, p1_id, p2_id, is_open FROM cube_games
+           WHERE chat_id = ? AND status = 'pending'
+             AND (p2_id = ? OR (is_open = 1 AND p2_id IS NULL))
+             AND p1_id != ?
+           ORDER BY id DESC LIMIT 1''',
+        (chat_id, user_id, user_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return  # нет вызова — молчим (фраза могла быть случайной)
+    cube_id, p1_id, p2_id, is_open = row
+    
+    if accept:
+        # Открытый вызов — атомарно занимаем место p2
+        if is_open and p2_id is None:
+            if not _cube_set_opponent(cube_id, user_id):
+                return  # кто-то опередил
+        cube = _cube_get(cube_id)
+        if not cube or cube['status'] != 'pending':
+            return
+        # Запускаем бросок
+        await _run_cube_battle(context, cube_id)
+        return
+    
+    # Отказ: только для закрытого вызова на этого юзера
+    if not is_open:
+        _cube_cancel_pending(cube_id, reason='rejected')
+        cube = _cube_get(cube_id)
+        p1 = get_user_data(cube['p1_id'])
+        p2 = get_user_data(cube['p2_id'])
+        n1 = p1['nick'] if p1 else f"id {cube['p1_id']}"
+        n2 = p2['nick'] if p2 else f"id {cube['p2_id']}"
+        try:
+            await context.bot.edit_message_text(
+                chat_id=cube['chat_id'],
+                message_id=cube['message_id'],
+                text=f"🐔 {n2} отказался играть с {n1}.",
+            )
+        except Exception:
+            pass
 
 
 async def areloadarticles(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8016,7 +8126,7 @@ async def aduel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # При ничьей предлагается переиграть (текстовая фраза «кубы да» / кнопка / просто новый вызов).
 # Без автокика — как и дуэли, только запись в статистику.
 
-CUBE_PENDING_TIMEOUT_MIN = 5         # мин до автоотмены «висящего» вызова
+CUBE_PENDING_TIMEOUT_MIN = 30        # как в Iris — 30 минут на принятие
 CUBE_ROLL_DELAY_SEC = 4              # сколько ждать анимацию кубика, прежде чем объявить итог
 
 
@@ -8102,13 +8212,12 @@ def _cube_kb_pending(cube_id: int, is_open: bool) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🎲 Принять (любой)", callback_data=f"cube:accept:{cube_id}")],
             [InlineKeyboardButton("↩️ Отменить вызов", callback_data=f"cube:cancel:{cube_id}")],
         ])
-    # Закрытый вызов: принять может только вызванный.
+    # Закрытый вызов: принять может только вызванный. Кнопки в стиле Iris.
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎲 Принять", callback_data=f"cube:accept:{cube_id}"),
-            InlineKeyboardButton("❌ Отказаться", callback_data=f"cube:reject:{cube_id}"),
+            InlineKeyboardButton("🐔 Отказ", callback_data=f"cube:reject:{cube_id}"),
         ],
-        [InlineKeyboardButton("↩️ Отменить вызов", callback_data=f"cube:cancel:{cube_id}")],
     ])
 
 
@@ -8166,21 +8275,16 @@ async def acubes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_open:
         text = (
-            "🎲 КТО СЫГРАЕТ В КУБЫ?\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"⚔️ {user_data['nick']} ищет соперника.\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "Каждый бросит кубик 🎲 — у кого больше точек, тот победил.\n"
-            f"⏱ На принятие — {CUBE_PENDING_TIMEOUT_MIN} минут."
+            f"🎲 {user_data['nick']} ищет соперника для игры в кубики!\n\n"
+            "💬 Чтобы принять вызов, нажмите кнопку ниже или введите \"кубы да\".\n"
+            f"На принятие решения есть {CUBE_PENDING_TIMEOUT_MIN} минут"
         )
     else:
         text = (
-            "🎲 ВЫЗОВ В КУБЫ\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"⚔️ {user_data['nick']} вызывает {opp_data['nick']} сыграть в кубы.\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "Каждый бросит кубик 🎲 — у кого больше точек, тот победил.\n"
-            f"⏱ На принятие — {CUBE_PENDING_TIMEOUT_MIN} минут."
+            f"🎲 {opp_data['nick']}, минуточку внимания!\n"
+            f"{user_data['nick']} приглашает Вас сыграть в кубики\n\n"
+            "💬 Чтобы принять вызов, введите \"кубы да\", или отменить \"кубы нет\"\n"
+            f"На принятие решения у вас есть {CUBE_PENDING_TIMEOUT_MIN} минут"
         )
     sent = await update.message.reply_text(text, reply_markup=_cube_kb_pending(cube_id, is_open))
     _cube_set_message(cube_id, sent.message_id)
@@ -8209,11 +8313,7 @@ async def _cube_pending_timeout_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_text(
             chat_id=cube['chat_id'],
             message_id=cube['message_id'],
-            text=(
-                "🎲 КУБЫ\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"⏱ Никто не принял вызов {n1} вовремя — аннулирован."
-            ),
+            text=f"⏱ Время вышло. Никто не принял вызов {n1} на игру в кубики.",
         )
     except Exception:
         pass
@@ -8221,8 +8321,13 @@ async def _cube_pending_timeout_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
     """
-    Запускает фазу бросков: шлёт два анимированных кубика, ждёт анимацию, объявляет итог.
-    Вызывается из cube_callback после успешного принятия.
+    Запускает фазу бросков в стиле Iris:
+    
+      1. Редактируем исходное сообщение → "🎲 Первый бросок кубика совершает X"
+      2. Шлём анимированный кубик от лица бота
+      3. После анимации дописываем в исходное сообщение строку "🎲 Второй бросок совершает Y"
+      4. Шлём второй анимированный кубик
+      5. После анимации финализируем исходное сообщение текстом с победителем
     """
     cube = _cube_get(cube_id)
     if not cube or cube['status'] != 'pending':
@@ -8233,23 +8338,18 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
     n2 = p2['nick'] if p2 else f"id {cube['p2_id']}"
     chat_id = cube['chat_id']
     
-    # Промежуточное сообщение «бросаем»
+    # === Этап 1: сообщение про первый бросок ===
+    stage1_text = f"🎲 Первый бросок кубика совершает {n1}"
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=cube['message_id'],
-            text=(
-                "🎲 КУБЫ\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"⚔️ {n1} vs {n2}\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                "🎬 Кидаем кубики…"
-            ),
+            text=stage1_text,
         )
     except Exception:
         pass
     
-    # Бросок №1 — за инициатора
+    # === Этап 2: сам кубик ===
     try:
         msg1 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲")
         roll1 = msg1.dice.value
@@ -8257,10 +8357,24 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
         logger.error(f"cube send_dice p1 error: {e}")
         return
     
-    # Небольшая пауза перед вторым кубом, чтобы не были «слипшимися»
-    await asyncio.sleep(0.5)
+    # Ждём анимацию первого кубика
+    await asyncio.sleep(CUBE_ROLL_DELAY_SEC)
     
-    # Бросок №2 — за оппонента
+    # === Этап 3: добавляем строку про второй бросок ===
+    stage2_text = (
+        f"🎲 Первый бросок кубика совершает {n1}\n"
+        f"🎲 Второй бросок кубика совершает {n2}"
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=cube['message_id'],
+            text=stage2_text,
+        )
+    except Exception:
+        pass
+    
+    # === Этап 4: второй кубик ===
     try:
         msg2 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲")
         roll2 = msg2.dice.value
@@ -8268,41 +8382,44 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
         logger.error(f"cube send_dice p2 error: {e}")
         return
     
-    # Ждём, пока обе анимации в клиенте закончатся
+    # Ждём анимацию второго
     await asyncio.sleep(CUBE_ROLL_DELAY_SEC)
     
-    # Определяем победителя
+    # === Этап 5: финал ===
     if roll1 > roll2:
         winner_id, loser_id = cube['p1_id'], cube['p2_id']
         win_name, los_name = n1, n2
-        result_line = f"🏆 Победа: {win_name} ({roll1} vs {roll2})"
+        win_roll, los_roll = roll1, roll2
         reason = 'roll'
     elif roll2 > roll1:
         winner_id, loser_id = cube['p2_id'], cube['p1_id']
         win_name, los_name = n2, n1
-        result_line = f"🏆 Победа: {win_name} ({roll2} vs {roll1})"
+        win_roll, los_roll = roll2, roll1
         reason = 'roll'
     else:
         winner_id, loser_id = None, None
-        result_line = f"🤝 Ничья ({roll1} : {roll1}) — никто не победил."
         reason = 'draw'
     
     _cube_finish(cube_id, roll1, roll2, winner_id, loser_id, reason)
     
-    # Итог
-    text = (
-        "🎲 КУБЫ — ИТОГ\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"🧍 {n1}: 🎲 {roll1}\n"
-        f"🧍 {n2}: 🎲 {roll2}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"{result_line}"
-    )
+    if reason == 'draw':
+        final_text = (
+            f"🎲 Первый бросок кубика совершает {n1}\n"
+            f"🎲 Игроки бросили кубики на доску. И у нас ничья!\n"
+            f"🤝 {roll1} : {roll2}"
+        )
+    else:
+        final_text = (
+            f"🎲 Первый бросок кубика совершает {n1}\n"
+            "🎲 Игроки бросили кубики на доску. И у нас есть победитель!\n\n"
+            f"{win_roll} Победа: {win_name}\n"
+            f"{los_roll} Поражение: {los_name}"
+        )
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=cube['message_id'],
-            text=text,
+            text=final_text,
         )
     except Exception:
         pass
@@ -8310,7 +8427,7 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
     if reason == 'roll':
         log_action(None, 'cube_finished', loser_id, f"#{cube_id}: win={winner_id} roll={roll1}vs{roll2}")
     else:
-        log_action(None, 'cube_finished', None, f"#{cube_id}: draw {roll1}vs{roll1}")
+        log_action(None, 'cube_finished', None, f"#{cube_id}: draw {roll1}vs{roll2}")
 
 
 async def cube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8380,9 +8497,7 @@ async def cube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         try:
             await query.edit_message_text(
-                "🎲 КУБЫ\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"❌ {n2} отказался играть с {n1}."
+                f"🐔 {n2} отказался играть с {n1}."
             )
         except Exception:
             pass
@@ -8401,9 +8516,7 @@ async def cube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         try:
             await query.edit_message_text(
-                "🎲 КУБЫ\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"↩️ {n1} отменил вызов."
+                f"↩️ {n1} отменил вызов на игру в кубики."
             )
         except Exception:
             pass
@@ -8491,6 +8604,515 @@ async def acubes_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ============ CHANGELOG — обновления бота ============
+# Идея: changelog составляется полуавтоматически. Бот анализирует audit_log и
+# показывает, какие новые типы действий появились с момента последнего опубликованного
+# changelog. Главный админ дорабатывает текст и публикует через /achangelog_publish.
+
+# Семантика action → читаемое описание. Когда в audit_log впервые появляется action из
+# этого словаря — бот предлагает его как кандидата в новый changelog.
+# Можно дополнять: ключ = action, значение = заголовок фичи.
+_ACTION_TO_FEATURE = {
+    'warn_game_start': '🎮 Игра за снятие предупреждения (камень-ножницы-бумага)',
+    'warn_game_win': '🏆 Победа в игре за снятие предупреждения',
+    'warn_game_loss': '😔 Учёт поражений в игре за снятие',
+    'cube_finished': '🎲 Модуль «Кубы» (по образцу Iris)',
+    'duel_finished': '🔫 Модуль «Дуэли» (по образцу Iris)',
+    'report_reopened': '🔄 Перепроверка жалоб модераторами 5+',
+    'report_deleted': '🗑 Удаление жалоб модераторами 5+',
+    'report_submitted': '📨 Подача жалобы',
+    'report_approve': '✅ Одобрение жалобы',
+    'report_reject': '❌ Отказ по жалобе',
+    'rank_change': '📊 Изменение ранга',
+    'department_change': '🏢 Изменение департамента',
+    'kick': '⛔️ Кик из конференции',
+    'ban': '🔒 Бан с возможностью указания срока',
+    'unban': '🔓 Снятие бана',
+    'mute': '🔇 Мут',
+    'unmute': '🔊 Снятие мута',
+    'warn': '⚠️ Предупреждение',
+    'unwarn': '✅ Снятие предупреждения',
+    'award': '🏅 Награда',
+    'block': '🚫 Блокировка пользователя от бота',
+    'unblock': '🔓 Снятие блокировки',
+    'special_access_grant': '🔐 Выдача спецдопуска',
+    'special_access_revoke': '🔐 Снятие спецдопуска',
+    'grant_command': '🎫 Индивидуальная выдача прав на команду',
+    'revoke_command': '🎫 Отзыв индивидуальных прав',
+    'tag_all': '📢 Тег всех (4+)',
+    'tag_department': '📢 Тег по отделу',
+    'request_decided': '📋 Решение по запросам на смену ранга/отдела',
+}
+
+
+def _changelog_get_last_published_at() -> str:
+    """Время публикации последнего changelog. Пусто если ещё не было."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT published_at FROM changelogs WHERE status = 'published' "
+        "ORDER BY published_at DESC LIMIT 1"
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else ""
+
+
+def _changelog_get_new_actions_since(since_at: str) -> list:
+    """
+    Возвращает action-типы, которые ВПЕРВЫЕ появились после since_at.
+    Если since_at пустой — возвращает все типы action из БД.
+    Каждый элемент: (action, first_seen_at, count_since)
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if since_at:
+        # action, у которых MIN(created_at) > since_at
+        c.execute(
+            '''SELECT action, MIN(created_at) as first_at, COUNT(*) as cnt
+               FROM audit_log
+               GROUP BY action
+               HAVING first_at > ?
+               ORDER BY first_at''',
+            (since_at,),
+        )
+    else:
+        c.execute(
+            '''SELECT action, MIN(created_at) as first_at, COUNT(*) as cnt
+               FROM audit_log
+               GROUP BY action
+               ORDER BY first_at'''
+        )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def _changelog_next_version() -> str:
+    """Авто-версия по следующему опубликованному номеру."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM changelogs WHERE status = 'published'")
+    n = c.fetchone()[0]
+    conn.close()
+    return f"v{n + 1}"
+
+
+def _changelog_save_draft(content: str, version: str = None, title: str = None,
+                           created_by: int = None) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''INSERT INTO changelogs (version, title, content, status, created_by, created_at)
+           VALUES (?, ?, ?, 'draft', ?, ?)''',
+        (version, title, content, created_by, now_msk_str()),
+    )
+    cid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return cid
+
+
+def _changelog_get(cid: int) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM changelogs WHERE id = ?', (cid,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _changelog_format(cl: dict) -> str:
+    """Единое оформление changelog: для просмотра, для черновика, для публикации."""
+    head = f"📰 ОБНОВЛЕНИЕ"
+    if cl.get('version'):
+        head += f" {cl['version']}"
+    head += f" #{cl['id']}"
+    if cl['status'] == 'draft':
+        head += " (черновик)"
+    
+    body = f"{head}\n"
+    if cl.get('title'):
+        body += f"📌 {cl['title']}\n"
+    body += "━━━━━━━━━━━━━━━━━\n"
+    body += cl['content'] + "\n"
+    body += "━━━━━━━━━━━━━━━━━\n"
+    if cl['status'] == 'published':
+        body += f"📅 Опубликовано: {cl['published_at']}"
+    else:
+        body += f"📅 Черновик от: {cl['created_at']}"
+    return body
+
+
+async def achangelog_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Создать черновик changelog'а с указанным текстом.
+    
+    /achangelog_add <текст>
+    
+    Можно через несколько строк (бот возьмёт всё что после команды).
+    Первая строка после команды может быть «v3 Заголовок» — тогда v3 будет версией,
+    а остаток — заголовком; со следующей строки — содержимое.
+    """
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return
+    
+    # Берём весь текст ПОСЛЕ команды (включая переносы)
+    raw = update.message.text or ""
+    # Убираем саму команду (со слэшем) — она в первом «слове»
+    space_idx = raw.find(' ')
+    nl_idx = raw.find('\n')
+    cut = -1
+    for idx in (space_idx, nl_idx):
+        if idx >= 0 and (cut < 0 or idx < cut):
+            cut = idx
+    if cut < 0:
+        await update.message.reply_text(
+            "❌ Пустой текст.\n\n"
+            "Использование:\n"
+            "<code>/achangelog_add\nv3 Декабрьские фишки\n• Добавили кубы\n• Поправили дуэли</code>",
+            parse_mode='HTML',
+        )
+        return
+    
+    text_after_cmd = raw[cut:].strip()
+    if not text_after_cmd:
+        await update.message.reply_text("❌ Пустой текст.")
+        return
+    
+    lines = text_after_cmd.split('\n', 1)
+    first_line = lines[0].strip()
+    rest = lines[1] if len(lines) > 1 else ""
+    
+    # Проверим, начинается ли первая строка с «v<число>» — тогда это версия
+    version = None
+    title = None
+    m = re.match(r'^(v\d+(?:\.\d+)?)\s*(.*)$', first_line, re.IGNORECASE)
+    if m:
+        version = m.group(1).lower()
+        title = m.group(2).strip() or None
+        content = rest.strip()
+    else:
+        content = text_after_cmd  # вся первая строка — часть контента
+    
+    if not content:
+        content = title or "Изменения без описания"
+        title = None
+    
+    if not version:
+        version = _changelog_next_version()
+    
+    cid = _changelog_save_draft(content, version=version, title=title, created_by=user_id)
+    cl = _changelog_get(cid)
+    
+    await update.message.reply_text(
+        _changelog_format(cl) + 
+        f"\n\n💡 Опубликовать: /achangelog_publish {cid}\n"
+        f"💡 Удалить: /achangelog_delete {cid}"
+    )
+
+
+async def achangelog_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Собрать черновик новых фишек, анализируя audit_log с момента последнего опубликованного changelog.
+    """
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return
+    
+    since_at = _changelog_get_last_published_at()
+    new_actions = _changelog_get_new_actions_since(since_at)
+    
+    head = "📰 ЧЕРНОВИК ОБНОВЛЕНИЯ"
+    if since_at:
+        head += f"\n📅 С момента последнего: {since_at}"
+    else:
+        head += f"\n📅 За всё время (первый changelog)"
+    
+    if not new_actions:
+        await update.message.reply_text(
+            head + "\n━━━━━━━━━━━━━━━━━\n"
+            "ℹ️ Новых типов активности не обнаружено.\n"
+            "Если фича добавлена, но никто ей ещё не пользовался — её здесь не будет.\n"
+            "Можете создать вручную через /achangelog_add."
+        )
+        return
+    
+    lines = [head, "━━━━━━━━━━━━━━━━━",
+             "🆕 Впервые замеченные типы действий:"]
+    
+    described = []
+    unknown = []
+    for action, first_at, count in new_actions:
+        if action in _ACTION_TO_FEATURE:
+            described.append(f"  • {_ACTION_TO_FEATURE[action]}  _(впервые {first_at}, {count}×)_")
+        else:
+            unknown.append(f"  • `{action}`  _(впервые {first_at}, {count}×)_")
+    
+    if described:
+        lines.append("\n🎯 Распознанные фичи:")
+        lines.extend(described)
+    if unknown:
+        lines.append("\n❓ Нераспознанные action-типы (можно добавить в `_ACTION_TO_FEATURE`):")
+        lines.extend(unknown)
+    
+    lines.append("\n━━━━━━━━━━━━━━━━━")
+    lines.append("💡 Дальше отредактируйте текст и вызовите /achangelog_add с готовой версией.")
+    lines.append("Например:")
+    lines.append("`/achangelog_add v" + str(int(_changelog_next_version()[1:])) + " Новые фишки`")
+    lines.append("`• ...`")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def achangelog_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Опубликовать черновик: помечает как published, рассылает в конференцию.
+    
+    /achangelog_publish <id>    — конкретный
+    /achangelog_publish          — последний черновик
+    """
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return
+    
+    cid = None
+    if context.args:
+        try:
+            cid = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.")
+            return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if cid:
+        c.execute("SELECT id FROM changelogs WHERE id = ? AND status = 'draft'", (cid,))
+    else:
+        c.execute("SELECT id FROM changelogs WHERE status = 'draft' ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        await update.message.reply_text(
+            "❌ Подходящий черновик не найден. Создайте через /achangelog_add."
+        )
+        return
+    cid = row[0]
+    
+    # Помечаем как опубликованный
+    c.execute(
+        "UPDATE changelogs SET status = 'published', published_at = ? WHERE id = ?",
+        (now_msk_str(), cid),
+    )
+    conn.commit()
+    conn.close()
+    
+    cl = _changelog_get(cid)
+    text = _changelog_format(cl)
+    
+    # Шлём в конференцию
+    published_message_id = None
+    try:
+        sent = await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
+        published_message_id = sent.message_id
+    except Exception as e:
+        logger.error(f"changelog publish to conference failed: {e}")
+    
+    if published_message_id:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('UPDATE changelogs SET published_message_id = ? WHERE id = ?',
+                  (published_message_id, cid))
+        conn.commit()
+        conn.close()
+    
+    log_action(user_id, 'changelog_published', None, f"#{cid}: {cl.get('version') or '—'}")
+    
+    await update.message.reply_text(
+        f"✅ Changelog #{cid} опубликован" +
+        (f" в конференции (msg_id={published_message_id})." if published_message_id
+         else " (в БД), но не удалось отправить в конференцию — см. логи.")
+    )
+
+
+async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Показать changelog.
+    
+    /achangelog          — последний опубликованный (доступно всем)
+    /achangelog <id>     — конкретный
+    """
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    cid = None
+    if context.args:
+        try:
+            cid = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.")
+            return
+    
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if cid:
+        # Юзеры могут смотреть только published; админ — любой
+        if is_main_admin(user_id):
+            c.execute("SELECT * FROM changelogs WHERE id = ?", (cid,))
+        else:
+            c.execute("SELECT * FROM changelogs WHERE id = ? AND status = 'published'", (cid,))
+    else:
+        c.execute(
+            "SELECT * FROM changelogs WHERE status = 'published' "
+            "ORDER BY published_at DESC LIMIT 1"
+        )
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        await update.message.reply_text(
+            "ℹ️ Changelog не найден или ещё не опубликован."
+        )
+        return
+    
+    await update.message.reply_text(_changelog_format(dict(row)))
+
+
+async def achangelog_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Список changelog'ов. Юзеры видят опубликованные, главный админ — и черновики.
+    """
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if is_main_admin(user_id):
+        c.execute("SELECT id, version, title, status, created_at, published_at FROM changelogs ORDER BY id DESC")
+    else:
+        c.execute(
+            "SELECT id, version, title, status, created_at, published_at FROM changelogs "
+            "WHERE status = 'published' ORDER BY published_at DESC"
+        )
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        await update.message.reply_text("ℹ️ Changelog'ов пока нет.")
+        return
+    
+    lines = ["📰 СПИСОК ОБНОВЛЕНИЙ", "━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        marker = "📌" if r['status'] == 'published' else "📝"
+        ver = r['version'] or "—"
+        title = r['title'] or ""
+        date = r['published_at'] if r['status'] == 'published' else (r['created_at'] + " (черновик)")
+        line = f"{marker} #{r['id']} {ver}"
+        if title:
+            line += f" — {title}"
+        line += f"\n   📅 {date}"
+        lines.append(line)
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("Просмотр: /achangelog <id>")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def achangelog_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить changelog (главный админ). /achangelog_delete <id>"""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /achangelog_delete <id>")
+        return
+    try:
+        cid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+    
+    cl = _changelog_get(cid)
+    if not cl:
+        await update.message.reply_text("❌ Не найдено.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM changelogs WHERE id = ?", (cid,))
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'changelog_deleted', None, f"#{cid}: {cl.get('version') or '—'}")
+    await update.message.reply_text(f"🗑 Changelog #{cid} удалён.")
+
+
+async def changelog_startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Однократно при старте бота: если со времени последнего опубликованного changelog
+    появились новые типы action — DM главному админу с предложением сделать новый.
+    """
+    since_at = _changelog_get_last_published_at()
+    new_actions = _changelog_get_new_actions_since(since_at)
+    if not new_actions:
+        return
+    
+    # Главный админ — возьмём из MAIN_ADMIN_IDS
+    admin_ids = MAIN_ADMIN_IDS if isinstance(MAIN_ADMIN_IDS, (list, set, tuple)) else [MAIN_ADMIN_IDS]
+    if not admin_ids:
+        return
+    
+    lines = [
+        "📰 НАПОМИНАНИЕ ПРО CHANGELOG",
+        "━━━━━━━━━━━━━━━━━",
+        f"С момента последнего обновления ({since_at or 'никогда'}) появились новые типы активности.",
+        "Возможно, стоит опубликовать новый changelog.",
+        "",
+    ]
+    described = []
+    for action, first_at, count in new_actions[:15]:
+        feature = _ACTION_TO_FEATURE.get(action, f"`{action}` (новый тип)")
+        described.append(f"  • {feature} (впервые {first_at})")
+    if described:
+        lines.append("🎯 Что замечено:")
+        lines.extend(described)
+        if len(new_actions) > 15:
+            lines.append(f"  …и ещё {len(new_actions) - 15}")
+    lines.append("")
+    lines.append("💡 Команды:")
+    lines.append("  /achangelog_draft — собрать полный черновик")
+    lines.append("  /achangelog_add — создать changelog вручную")
+    lines.append("  /achangelog_list — все обновления")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    
+    for admin_id in admin_ids:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as e:
+            logger.debug(f"changelog notify {admin_id}: {e}")
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -8539,6 +9161,9 @@ def main():
         'areloadarticles': areloadarticles,
         'aduel': aduel, 'aduel_stats': aduel_stats,
         'acubes': acubes, 'acubes_stats': acubes_stats,
+        'achangelog': achangelog, 'achangelog_list': achangelog_list,
+        'achangelog_add': achangelog_add, 'achangelog_draft': achangelog_draft,
+        'achangelog_publish': achangelog_publish, 'achangelog_delete': achangelog_delete,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -8638,6 +9263,9 @@ def main():
         time=time(hour=22, minute=0, tzinfo=MSK),
         days=(6,),
     )
+    # Стартовое напоминание: через 30 сек после запуска, если есть новые типы action
+    # с момента последнего опубликованного changelog — DM главному админу.
+    application.job_queue.run_once(changelog_startup_notify_job, when=30)
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
