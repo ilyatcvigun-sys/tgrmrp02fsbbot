@@ -779,6 +779,33 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Кубы (Iris-style). p2_id может быть NULL до принятия (открытый вызов «Кто кубы»).
+    # Результаты бросков (p1_roll, p2_roll) — значения 1..6 от Telegram sendDice.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS cube_games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            p1_id INTEGER NOT NULL,
+            p2_id INTEGER,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER,
+            is_open INTEGER DEFAULT 0,        -- 1 = «Кто кубы» (открытый вызов любому)
+            status TEXT DEFAULT 'pending',    -- pending | finished | cancelled
+            p1_roll INTEGER,
+            p2_roll INTEGER,
+            winner_id INTEGER,
+            loser_id INTEGER,
+            end_reason TEXT,                  -- 'roll' | 'draw' | 'cancelled' | 'rejected' | 'timeout'
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_cubes_status ON cube_games(status)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_cubes_winner ON cube_games(winner_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_cubes_loser ON cube_games(loser_id)')
+    except sqlite3.OperationalError:
+        pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1609,6 +1636,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /aukrating [day/week/month/all] — топ преступников\n"
         "├ /aduel <@user> — вызвать на дуэль 🔫\n"
         "├ /aduel_stats [@user] — статистика дуэлей\n"
+        "├ /acubes [@user] — кубы 🎲 (без аргумента — открытый вызов)\n"
+        "├ /acubes_stats [@user] — статистика кубов\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -7110,6 +7139,47 @@ async def duel_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     await aduel(update, context)
 
 
+async def cube_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Текстовый триггер кубов в стиле Iris.
+    Поддерживает:
+      «кубы»                    — открытый вызов («Кто кубы»)
+      «кубы @user» / «кубы 123» — закрытый вызов
+      «кубы» (reply)            — закрытый вызов автору
+      «кто кубы»                — синоним открытого вызова
+      «кубы стата»              — топ статистики
+      «кубы стата @user»        — статистика конкретного юзера
+    Должен быть зарегистрирован в отдельной группе.
+    """
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    parts = text.split()
+    if not parts:
+        return
+    
+    first = parts[0].lower()
+    
+    # «кто кубы» — синоним открытого вызова
+    if first == "кто" and len(parts) >= 2 and parts[1].lower() == "кубы":
+        context.args = []
+        await acubes(update, context)
+        return
+    
+    if first != "кубы":
+        return
+    
+    # «кубы стата» / «кубы стата @user» → статистика
+    if len(parts) >= 2 and parts[1].lower() in ("стата", "статистика"):
+        context.args = parts[2:]
+        await acubes_stats(update, context)
+        return
+    
+    # Остальные варианты: open («кубы»), closed («кубы @user»), reply
+    context.args = parts[1:]
+    await acubes(update, context)
+
+
 async def areloadarticles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Перезагружает базу статей УК РФ из uk_articles.json без рестарта бота.
@@ -7940,6 +8010,487 @@ async def aduel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ============ КУБЫ (Iris-style) ============
+# Двое игроков бросают анимированные Telegram-кубики (sendDice), побеждает у кого больше точек.
+# Поддержка двух режимов: закрытый вызов конкретного юзера и открытый «Кто кубы» (любой принимает).
+# При ничьей предлагается переиграть (текстовая фраза «кубы да» / кнопка / просто новый вызов).
+# Без автокика — как и дуэли, только запись в статистику.
+
+CUBE_PENDING_TIMEOUT_MIN = 5         # мин до автоотмены «висящего» вызова
+CUBE_ROLL_DELAY_SEC = 4              # сколько ждать анимацию кубика, прежде чем объявить итог
+
+
+def _cube_create(p1_id: int, chat_id: int, p2_id: int = None, is_open: bool = False) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''INSERT INTO cube_games (p1_id, p2_id, chat_id, is_open, status, started_at)
+           VALUES (?, ?, ?, ?, 'pending', ?)''',
+        (p1_id, p2_id, chat_id, 1 if is_open else 0, now_msk_str()),
+    )
+    cube_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return cube_id
+
+
+def _cube_get(cube_id: int) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM cube_games WHERE id = ?', (cube_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _cube_set_message(cube_id: int, message_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE cube_games SET message_id = ? WHERE id = ?', (message_id, cube_id))
+    conn.commit()
+    conn.close()
+
+
+def _cube_set_opponent(cube_id: int, p2_id: int) -> bool:
+    """Атомарно подставить p2_id для открытого вызова. False — кто-то опередил."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE cube_games SET p2_id = ?
+           WHERE id = ? AND status = 'pending' AND (p2_id IS NULL OR p2_id = ?)''',
+        (p2_id, cube_id, p2_id),
+    )
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def _cube_cancel_pending(cube_id: int, reason: str = 'cancelled') -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE cube_games SET status = 'cancelled', end_reason = ?, finished_at = ?
+           WHERE id = ? AND status = 'pending' ''',
+        (reason, now_msk_str(), cube_id),
+    )
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def _cube_finish(cube_id: int, p1_roll: int, p2_roll: int,
+                 winner_id: int, loser_id: int, reason: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE cube_games SET status = 'finished',
+           p1_roll = ?, p2_roll = ?, winner_id = ?, loser_id = ?,
+           end_reason = ?, finished_at = ? WHERE id = ?''',
+        (p1_roll, p2_roll, winner_id, loser_id, reason, now_msk_str(), cube_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _cube_kb_pending(cube_id: int, is_open: bool) -> InlineKeyboardMarkup:
+    if is_open:
+        # Открытый вызов: любой может принять. Инициатор может отменить.
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎲 Принять (любой)", callback_data=f"cube:accept:{cube_id}")],
+            [InlineKeyboardButton("↩️ Отменить вызов", callback_data=f"cube:cancel:{cube_id}")],
+        ])
+    # Закрытый вызов: принять может только вызванный.
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎲 Принять", callback_data=f"cube:accept:{cube_id}"),
+            InlineKeyboardButton("❌ Отказаться", callback_data=f"cube:reject:{cube_id}"),
+        ],
+        [InlineKeyboardButton("↩️ Отменить вызов", callback_data=f"cube:cancel:{cube_id}")],
+    ])
+
+
+async def acubes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Вызвать на кубы.
+    
+    /acubes               — открытый вызов («Кто кубы») — принять может любой
+    /acubes @user         — закрытый вызов конкретному игроку
+    (reply) /acubes       — закрытый вызов автору сообщения
+    """
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
+        return
+    
+    # Определяем цель: reply > args > пусто (открытый вызов)
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько пользователей с таким ником, уточните по ID.")
+        return
+    
+    is_open = target_id is None
+    if not is_open:
+        if target_id == user_id:
+            await update.message.reply_text("❌ С собой играть не интересно.")
+            return
+        opp_data = get_user_data(target_id)
+        if not opp_data:
+            await update.message.reply_text("❌ Соперник не зарегистрирован в боте.")
+            return
+    
+    # Защита от двойных вызовов от того же юзера
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id FROM cube_games WHERE p1_id = ? AND status = 'pending' LIMIT 1",
+        (user_id,),
+    )
+    existing = c.fetchone()
+    conn.close()
+    if existing:
+        await update.message.reply_text(
+            f"❌ У вас уже есть активный вызов в кубы (#{existing[0]}). Отмените его или дождитесь принятия."
+        )
+        return
+    
+    chat_id = update.effective_chat.id
+    cube_id = _cube_create(user_id, chat_id, p2_id=target_id, is_open=is_open)
+    
+    if is_open:
+        text = (
+            "🎲 КТО СЫГРАЕТ В КУБЫ?\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"⚔️ {user_data['nick']} ищет соперника.\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Каждый бросит кубик 🎲 — у кого больше точек, тот победил.\n"
+            f"⏱ На принятие — {CUBE_PENDING_TIMEOUT_MIN} минут."
+        )
+    else:
+        text = (
+            "🎲 ВЫЗОВ В КУБЫ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"⚔️ {user_data['nick']} вызывает {opp_data['nick']} сыграть в кубы.\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Каждый бросит кубик 🎲 — у кого больше точек, тот победил.\n"
+            f"⏱ На принятие — {CUBE_PENDING_TIMEOUT_MIN} минут."
+        )
+    sent = await update.message.reply_text(text, reply_markup=_cube_kb_pending(cube_id, is_open))
+    _cube_set_message(cube_id, sent.message_id)
+    
+    if context.job_queue:
+        context.job_queue.run_once(
+            _cube_pending_timeout_job,
+            when=CUBE_PENDING_TIMEOUT_MIN * 60,
+            data={'cube_id': cube_id},
+            name=f"cube_pending_{cube_id}",
+        )
+
+
+async def _cube_pending_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    cube_id = data.get('cube_id')
+    if not cube_id:
+        return
+    cube = _cube_get(cube_id)
+    if not cube or cube['status'] != 'pending':
+        return
+    _cube_cancel_pending(cube_id, reason='timeout')
+    p1 = get_user_data(cube['p1_id'])
+    n1 = p1['nick'] if p1 else f"id {cube['p1_id']}"
+    try:
+        await context.bot.edit_message_text(
+            chat_id=cube['chat_id'],
+            message_id=cube['message_id'],
+            text=(
+                "🎲 КУБЫ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"⏱ Никто не принял вызов {n1} вовремя — аннулирован."
+            ),
+        )
+    except Exception:
+        pass
+
+
+async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
+    """
+    Запускает фазу бросков: шлёт два анимированных кубика, ждёт анимацию, объявляет итог.
+    Вызывается из cube_callback после успешного принятия.
+    """
+    cube = _cube_get(cube_id)
+    if not cube or cube['status'] != 'pending':
+        return
+    p1 = get_user_data(cube['p1_id'])
+    p2 = get_user_data(cube['p2_id'])
+    n1 = p1['nick'] if p1 else f"id {cube['p1_id']}"
+    n2 = p2['nick'] if p2 else f"id {cube['p2_id']}"
+    chat_id = cube['chat_id']
+    
+    # Промежуточное сообщение «бросаем»
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=cube['message_id'],
+            text=(
+                "🎲 КУБЫ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"⚔️ {n1} vs {n2}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "🎬 Кидаем кубики…"
+            ),
+        )
+    except Exception:
+        pass
+    
+    # Бросок №1 — за инициатора
+    try:
+        msg1 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲")
+        roll1 = msg1.dice.value
+    except Exception as e:
+        logger.error(f"cube send_dice p1 error: {e}")
+        return
+    
+    # Небольшая пауза перед вторым кубом, чтобы не были «слипшимися»
+    await asyncio.sleep(0.5)
+    
+    # Бросок №2 — за оппонента
+    try:
+        msg2 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲")
+        roll2 = msg2.dice.value
+    except Exception as e:
+        logger.error(f"cube send_dice p2 error: {e}")
+        return
+    
+    # Ждём, пока обе анимации в клиенте закончатся
+    await asyncio.sleep(CUBE_ROLL_DELAY_SEC)
+    
+    # Определяем победителя
+    if roll1 > roll2:
+        winner_id, loser_id = cube['p1_id'], cube['p2_id']
+        win_name, los_name = n1, n2
+        result_line = f"🏆 Победа: {win_name} ({roll1} vs {roll2})"
+        reason = 'roll'
+    elif roll2 > roll1:
+        winner_id, loser_id = cube['p2_id'], cube['p1_id']
+        win_name, los_name = n2, n1
+        result_line = f"🏆 Победа: {win_name} ({roll2} vs {roll1})"
+        reason = 'roll'
+    else:
+        winner_id, loser_id = None, None
+        result_line = f"🤝 Ничья ({roll1} : {roll1}) — никто не победил."
+        reason = 'draw'
+    
+    _cube_finish(cube_id, roll1, roll2, winner_id, loser_id, reason)
+    
+    # Итог
+    text = (
+        "🎲 КУБЫ — ИТОГ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"🧍 {n1}: 🎲 {roll1}\n"
+        f"🧍 {n2}: 🎲 {roll2}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{result_line}"
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=cube['message_id'],
+            text=text,
+        )
+    except Exception:
+        pass
+    
+    if reason == 'roll':
+        log_action(None, 'cube_finished', loser_id, f"#{cube_id}: win={winner_id} roll={roll1}vs{roll2}")
+    else:
+        log_action(None, 'cube_finished', None, f"#{cube_id}: draw {roll1}vs{roll1}")
+
+
+async def cube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок в кубах. callback_data='cube:<action>:<id>'."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    action = parts[1]
+    try:
+        cube_id = int(parts[2])
+    except ValueError:
+        await query.answer()
+        return
+    
+    cube = _cube_get(cube_id)
+    if not cube:
+        await query.answer("Игра не найдена.", show_alert=True)
+        return
+    
+    user_id = query.from_user.id
+    
+    if action == 'accept':
+        if cube['status'] != 'pending':
+            await query.answer("Уже не актуально.", show_alert=True)
+            return
+        # Инициатор не может принять собственный вызов
+        if user_id == cube['p1_id']:
+            await query.answer("Нельзя принимать собственный вызов.", show_alert=True)
+            return
+        # Закрытый вызов: только указанный соперник
+        if not cube['is_open']:
+            if user_id != cube['p2_id']:
+                await query.answer("Принять может только тот, кого вызвали.", show_alert=True)
+                return
+        else:
+            # Открытый: проверяем регистрацию + ставим p2_id атомарно
+            if not get_user_data(user_id):
+                await query.answer("Вы не зарегистрированы в боте.", show_alert=True)
+                return
+            if not _cube_set_opponent(cube_id, user_id):
+                await query.answer("Уже кто-то принял раньше.", show_alert=True)
+                return
+            cube = _cube_get(cube_id)
+        
+        await query.answer("Принято! Кидаем кубы 🎲")
+        # Сразу запускаем бросок
+        await _run_cube_battle(context, cube_id)
+        return
+    
+    if action == 'reject':
+        if cube['status'] != 'pending':
+            await query.answer("Уже не актуально.", show_alert=True)
+            return
+        if cube['is_open']:
+            await query.answer("Это открытый вызов — отказываться от него не нужно, просто не нажимайте.", show_alert=True)
+            return
+        if user_id != cube['p2_id']:
+            await query.answer("Отклонить может только тот, кого вызвали.", show_alert=True)
+            return
+        _cube_cancel_pending(cube_id, reason='rejected')
+        p1 = get_user_data(cube['p1_id'])
+        p2 = get_user_data(cube['p2_id'])
+        n1 = p1['nick'] if p1 else f"id {cube['p1_id']}"
+        n2 = p2['nick'] if p2 else f"id {cube['p2_id']}"
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "🎲 КУБЫ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"❌ {n2} отказался играть с {n1}."
+            )
+        except Exception:
+            pass
+        return
+    
+    if action == 'cancel':
+        if cube['status'] != 'pending':
+            await query.answer("Уже не актуально.", show_alert=True)
+            return
+        if user_id != cube['p1_id']:
+            await query.answer("Отменить может только вызывающий.", show_alert=True)
+            return
+        _cube_cancel_pending(cube_id, reason='cancelled')
+        p1 = get_user_data(cube['p1_id'])
+        n1 = p1['nick'] if p1 else f"id {cube['p1_id']}"
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "🎲 КУБЫ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"↩️ {n1} отменил вызов."
+            )
+        except Exception:
+            pass
+        return
+
+
+async def acubes_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика кубов. Без аргумента — топ-10, с @user — карточка игрока."""
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    target_id = None
+    if context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id in (None, -1):
+            await update.message.reply_text("❌ Пользователь не найден.")
+            return
+    elif update.message and update.message.reply_to_message:
+        target_id = update.message.reply_to_message.from_user.id
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    if target_id:
+        td = get_user_data(target_id)
+        name = td['nick'] if td else f"id {target_id}"
+        c.execute("SELECT COUNT(*) FROM cube_games WHERE winner_id = ? AND status = 'finished'", (target_id,))
+        wins = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM cube_games WHERE loser_id = ? AND status = 'finished'", (target_id,))
+        losses = c.fetchone()[0]
+        c.execute(
+            '''SELECT COUNT(*) FROM cube_games WHERE status = 'finished'
+               AND end_reason = 'draw' AND (p1_id = ? OR p2_id = ?)''',
+            (target_id, target_id),
+        )
+        draws = c.fetchone()[0]
+        conn.close()
+        
+        total = wins + losses + draws
+        winrate = f"{round(wins / total * 100)}%" if total else "—"
+        text = (
+            "🎲 СТАТИСТИКА КУБОВ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 {name}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"🏆 Побед: {wins}\n"
+            f"💀 Поражений: {losses}\n"
+            f"🤝 Ничьих: {draws}\n"
+            f"📊 Винрейт: {winrate}\n"
+            f"🎲 Всего партий: {total}"
+        )
+        await update.message.reply_text(text)
+        return
+    
+    # Топ-10 по победам
+    c.execute(
+        '''SELECT winner_id, COUNT(*) as wins FROM cube_games
+           WHERE status = 'finished' AND winner_id IS NOT NULL
+           GROUP BY winner_id ORDER BY wins DESC LIMIT 10'''
+    )
+    top = c.fetchall()
+    conn.close()
+    
+    if not top:
+        await update.message.reply_text(
+            "🎲 СТАТИСТИКА КУБОВ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Партий ещё не было."
+        )
+        return
+    
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🎲 ТОП-10 ПО КУБАМ", "━━━━━━━━━━━━━━━━━"]
+    for i, (uid, w) in enumerate(top):
+        ud = get_user_data(uid)
+        name = ud['nick'] if ud else f"id {uid}"
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{medal} {name} — {w} побед")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("Лично: /acubes_stats @user")
+    await update.message.reply_text("\n".join(lines))
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -7987,6 +8538,7 @@ def main():
         'aukrating': aukrating,
         'areloadarticles': areloadarticles,
         'aduel': aduel, 'aduel_stats': aduel_stats,
+        'acubes': acubes, 'acubes_stats': acubes_stats,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -8056,6 +8608,8 @@ def main():
     application.add_handler(CallbackQueryHandler(warn_game_callback, pattern=r'^wgame:'))
     # Дуэли
     application.add_handler(CallbackQueryHandler(duel_callback, pattern=r'^duel:'))
+    # Кубы
+    application.add_handler(CallbackQueryHandler(cube_callback, pattern=r'^cube:'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     # Сбор сообщений для анализа настроения (только в конференции)
@@ -8065,6 +8619,8 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, article_trigger_router), group=3)
     # «дуэль ...» — текст-триггер, эквивалент /aduel. Отдельная группа по той же причине.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, duel_trigger_router), group=4)
+    # «кубы ...» / «кто кубы» — текст-триггер, эквивалент /acubes. Тоже отдельная группа.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cube_trigger_router), group=5)
     
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
