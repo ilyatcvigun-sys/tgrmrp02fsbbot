@@ -9912,12 +9912,7 @@ def main():
     # Стартовое напоминание: через 30 сек после запуска, если есть новые типы action
     # с момента последнего опубликованного changelog — DM главному админу.
     application.job_queue.run_once(changelog_startup_notify_job, when=30)
-    # Еженедельный сбор идей — четверг 18:00 МСК. Юзеры получают DM с кнопками.
-    application.job_queue.run_daily(
-        weekly_ideas_poll_job,
-        time=time(hour=18, minute=0, tzinfo=MSK),
-        days=(3,),  # 3 = четверг (понедельник=0)
-    )
+
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
