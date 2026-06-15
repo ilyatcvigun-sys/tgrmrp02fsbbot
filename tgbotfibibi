@@ -826,6 +826,46 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Опросы по сбору идей. status: 'active' пока идёт сбор, 'closed' когда вручную или
+    # авто-закрыт. Один активный poll за раз достаточно — но схема не запрещает несколько.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS idea_polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_by INTEGER,
+            prompt TEXT,                       -- кастомный текст приглашения (необязательный)
+            status TEXT DEFAULT 'active',      -- active | closed
+            started_at TEXT DEFAULT '',
+            closed_at TEXT DEFAULT ''
+        )
+    ''')
+    
+    # Ответы и идеи. response:
+    #   'no_idea' — нажал «Нет идей»
+    #   'pending_input' — нажал «Есть идеи», ждём текст
+    #   'submitted'    — текст идеи прислан
+    # status (актуален только для submitted):
+    #   'submitted' | 'approved' | 'rejected' | 'implemented'
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ideas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poll_id INTEGER,
+            user_id INTEGER NOT NULL,
+            response TEXT,
+            text TEXT,
+            status TEXT,
+            decided_by INTEGER,
+            decision_comment TEXT,
+            created_at TEXT DEFAULT '',
+            decided_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_ideas_poll ON ideas(poll_id, response)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_ideas_status ON ideas(status)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_ideas_user ON ideas(user_id)')
+    except sqlite3.OperationalError:
+        pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1660,6 +1700,9 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /acubes_stats [@user] — статистика кубов\n"
         "├ /achangelog [id] — обновления бота\n"
         "├ /achangelog_list — список обновлений\n"
+        "├ /aidea_submit <текст> — предложить идею для улучшения бота\n"
+        "├ /aideas [status] — список идей\n"
+        "├ /aidea_info <id> — детально про идею\n"
         "├ /areport — подать жалобу\n"
         "├ /check_gban — проверить ЧС\n"
         "├ /aperms — ваши индивидуальные доступы\n"
@@ -9045,6 +9088,620 @@ async def achangelog_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑 Changelog #{cid} удалён.")
 
 
+# ============ ИДЕИ / ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ БОТА ============
+# По образцу weekly_rank_check: запускается опрос → юзеры получают DM с кнопками
+# «Есть идеи» / «Нет идей». «Есть идеи» переводит юзера в режим ожидания текста
+# в ЛС. После получения идеи бот шлёт её главному админу с кнопками решения.
+
+DEFAULT_IDEA_PROMPT = (
+    "💡 ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ БОТА\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "Ваше мнение очень важно для нас)\n"
+"
+)
+
+
+def _idea_get_main_admins() -> list:
+    """Куда слать DM-уведомления про идеи. Возвращает список user_id."""
+    if isinstance(MAIN_ADMIN_IDS, (list, set, tuple)):
+        return list(MAIN_ADMIN_IDS)
+    return [MAIN_ADMIN_IDS] if MAIN_ADMIN_IDS else []
+
+
+def _idea_kb_prompt(poll_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💡 Есть идеи", callback_data=f"idea:yes:{poll_id}"),
+        InlineKeyboardButton("✋ Нет идей", callback_data=f"idea:no:{poll_id}"),
+    ]])
+
+
+def _idea_kb_decision(idea_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Принять", callback_data=f"idea:approve:{idea_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"idea:reject:{idea_id}"),
+        ],
+        [InlineKeyboardButton("🚧 В работу", callback_data=f"idea:implement:{idea_id}")],
+    ])
+
+
+def _idea_get(idea_id: int) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM ideas WHERE id = ?', (idea_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _idea_create_response(poll_id: int, user_id: int, response: str) -> int:
+    """
+    Записывает/обновляет ответ юзера на опрос. Один user на один poll даёт один ответ —
+    если ответ был, обновляем; иначе создаём.
+    Возвращает id записи.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'SELECT id FROM ideas WHERE poll_id = ? AND user_id = ? AND text IS NULL LIMIT 1',
+        (poll_id, user_id),
+    )
+    row = c.fetchone()
+    if row:
+        idea_id = row[0]
+        c.execute('UPDATE ideas SET response = ?, created_at = ? WHERE id = ?',
+                  (response, now_msk_str(), idea_id))
+    else:
+        c.execute(
+            '''INSERT INTO ideas (poll_id, user_id, response, created_at)
+               VALUES (?, ?, ?, ?)''',
+            (poll_id, user_id, response, now_msk_str()),
+        )
+        idea_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return idea_id
+
+
+def _idea_finalize_text(idea_id: int, text: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE ideas SET text = ?, response = 'submitted', status = 'submitted',
+           created_at = ? WHERE id = ?''',
+        (text, now_msk_str(), idea_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _idea_set_decision(idea_id: int, status: str, decided_by: int, comment: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE ideas SET status = ?, decided_by = ?, decision_comment = ?, decided_at = ?
+           WHERE id = ?''',
+        (status, decided_by, comment, now_msk_str(), idea_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _idea_create_submission(user_id: int, text: str) -> int:
+    """Создание идеи без привязки к опросу (через /aidea_submit)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''INSERT INTO ideas (poll_id, user_id, response, text, status, created_at)
+           VALUES (NULL, ?, 'submitted', ?, 'submitted', ?)''',
+        (user_id, text, now_msk_str()),
+    )
+    idea_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return idea_id
+
+
+def _format_idea_card(idea: dict, *, for_admin: bool) -> str:
+    """Карточка идеи: для админа полная, для автора без чувствительных деталей."""
+    author = get_user_data(idea['user_id'])
+    author_name = author['nick'] if author else f"id {idea['user_id']}"
+    head = f"💡 ИДЕЯ #{idea['id']}"
+    status = idea.get('status') or '—'
+    status_emoji = {
+        'submitted': '⏳ ожидает',
+        'approved': '✅ принята',
+        'rejected': '❌ отклонена',
+        'implemented': '🚧 в работе',
+    }.get(status, status)
+    head += f" — {status_emoji}"
+    
+    body = f"{head}\n━━━━━━━━━━━━━━━━━\n"
+    body += f"👤 Автор: {author_name}"
+    if for_admin and author and author.get('callsign'):
+        body += f" ({author['callsign']})"
+    body += f"\n📅 Подано: {idea.get('created_at') or '—'}\n"
+    if idea.get('poll_id'):
+        body += f"📋 Опрос: #{idea['poll_id']}\n"
+    body += "━━━━━━━━━━━━━━━━━\n"
+    body += idea.get('text') or "(пусто)"
+    if idea.get('status') and idea['status'] != 'submitted':
+        decider = get_user_data(idea['decided_by']) if idea.get('decided_by') else None
+        decider_name = decider['nick'] if decider else (f"id {idea['decided_by']}" if idea.get('decided_by') else "—")
+        body += f"\n━━━━━━━━━━━━━━━━━\n"
+        body += f"👮 Решил: {decider_name}\n"
+        body += f"📅 {idea.get('decided_at') or '—'}\n"
+        if idea.get('decision_comment'):
+            body += f"💬 {idea['decision_comment']}"
+    return body.rstrip()
+
+
+async def aideas_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Запустить новый опрос «есть ли у тебя идеи». Рассылка в ЛС всем зарегистрированным.
+    /aideas_start             — стандартный текст
+    /aideas_start <кастомный текст>
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban', 'aideas_start'):
+        await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
+        return
+    
+    # Кастомный текст после команды
+    raw = update.message.text or ""
+    space_idx = raw.find(' ')
+    nl_idx = raw.find('\n')
+    cut = -1
+    for idx in (space_idx, nl_idx):
+        if idx >= 0 and (cut < 0 or idx < cut):
+            cut = idx
+    prompt = raw[cut:].strip() if cut > 0 else ""
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO idea_polls (started_by, prompt, status, started_at) VALUES (?, ?, "active", ?)',
+        (user_id, prompt or None, now_msk_str()),
+    )
+    poll_id = c.lastrowid
+    c.execute(
+        'SELECT user_id FROM users WHERE bot_blocked = "Нет"'
+    )
+    targets = [r[0] for r in c.fetchall()]
+    conn.close()
+    
+    prompt_text = prompt if prompt else DEFAULT_IDEA_PROMPT
+    if not prompt_text.startswith("💡"):
+        prompt_text = "💡 ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ БОТА\n━━━━━━━━━━━━━━━━━\n" + prompt_text
+    
+    kb = _idea_kb_prompt(poll_id)
+    sent = 0
+    failed = 0
+    for uid in targets:
+        try:
+            await context.bot.send_message(chat_id=uid, text=prompt_text, reply_markup=kb)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logger.debug(f"aideas_start DM to {uid}: {e}")
+        await asyncio.sleep(0.05)
+    
+    log_action(user_id, 'ideas_poll_started', None, f"#{poll_id}: sent={sent}, failed={failed}")
+    await update.message.reply_text(
+        f"💡 ОПРОС #{poll_id} ЗАПУЩЕН\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📤 Доставлено: {sent}\n"
+        f"❌ Не дошло: {failed} (заблокировали бота)\n\n"
+        f"Ответы будут приходить вам в ЛС по мере поступления.\n"
+        f"Сводка: /aideas"
+    )
+
+
+async def idea_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок: idea:yes/no/approve/reject/implement:<id>"""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    action = parts[1]
+    try:
+        target_id = int(parts[2])
+    except ValueError:
+        await query.answer()
+        return
+    
+    user_id = query.from_user.id
+    user_data = get_user_data(user_id)
+    if not user_data and action in ('yes', 'no'):
+        await query.answer("Вы не зарегистрированы.", show_alert=True)
+        return
+    
+    # ===== Ответы юзера на опрос =====
+    if action == 'no':
+        # target_id = poll_id
+        idea_id = _idea_create_response(target_id, user_id, 'no_idea')
+        await query.answer("Спасибо! Хорошего дня.")
+        try:
+            await query.edit_message_text(
+                "💡 СПАСИБО!\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Если идеи появятся — можешь в любой момент написать\n"
+                "/aidea_submit <текст>"
+            )
+        except Exception:
+            pass
+        # DM админам
+        for admin_id in _idea_get_main_admins():
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        f"💡 ОПРОС #{target_id}: ответ\n"
+                        f"👤 {user_data['nick']} ({user_data['callsign']}) — ✋ нет идей"
+                    ),
+                )
+            except Exception:
+                pass
+        return
+    
+    if action == 'yes':
+        # target_id = poll_id
+        idea_id = _idea_create_response(target_id, user_id, 'pending_input')
+        # Ставим state для приёма текста
+        context.user_data['pending_idea_input'] = idea_id
+        await query.answer("Опиши идею следующим сообщением.")
+        try:
+            await query.edit_message_text(
+                "💡 РАССКАЖИ ПОДРОБНЕЕ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Опиши свою идею следующим сообщением.\n"
+                "Можно в свободной форме — чем подробнее, тем лучше.\n\n"
+                "✖️ Для отмены — /cancel"
+            )
+        except Exception:
+            pass
+        return
+    
+    # ===== Решения админа =====
+    if action in ('approve', 'reject', 'implement'):
+        if not has_permission(user_id, 'gban', 'aidea_decide'):
+            await query.answer("Только со спецдоступом.", show_alert=True)
+            return
+        idea = _idea_get(target_id)
+        if not idea:
+            await query.answer("Идея не найдена.", show_alert=True)
+            return
+        if idea.get('status') and idea['status'] != 'submitted':
+            await query.answer("Уже решена.", show_alert=True)
+            return
+        # Ставим state ожидания комментария от админа
+        context.user_data['pending_idea_decision'] = {
+            'idea_id': target_id,
+            'action': action,
+        }
+        action_label = {'approve': 'ПРИНЯТЬ', 'reject': 'ОТКЛОНИТЬ', 'implement': 'В РАБОТУ'}[action]
+        await query.answer(f"Идея #{target_id}: {action_label}")
+        try:
+            await query.edit_message_text(
+                _format_idea_card(idea, for_admin=True) + 
+                f"\n\n📌 Решение: {action_label}\n"
+                f"💬 Напишите комментарий для автора следующим сообщением (или '-' без комментария):"
+            )
+        except Exception:
+            pass
+        return
+
+
+async def handle_idea_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Получение текста идеи от юзера (после нажатия «Есть идеи»).
+    Срабатывает только в личке и только если есть pending_idea_input.
+    """
+    if not update.message or not update.message.text:
+        return
+    if 'pending_idea_input' not in context.user_data:
+        return
+    # Только в ЛС
+    if update.effective_chat.type != 'private':
+        return
+    
+    text = update.message.text.strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        context.user_data.pop('pending_idea_input', None)
+        await update.message.reply_text("✖️ Идея не отправлена.")
+        return
+    if len(text) < 5:
+        await update.message.reply_text("❌ Слишком коротко. Опишите подробнее или /cancel.")
+        return
+    
+    idea_id = context.user_data.pop('pending_idea_input')
+    _idea_finalize_text(idea_id, text)
+    log_action(update.effective_user.id, 'idea_submitted', None, f"#{idea_id}")
+    
+    idea = _idea_get(idea_id)
+    
+    await update.message.reply_text(
+        f"✅ ИДЕЯ #{idea_id} ПРИНЯТА К РАССМОТРЕНИЮ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Спасибо за предложение! Я уведомлю, когда решение будет принято."
+    )
+    
+    # DM админам с карточкой и кнопками
+    card = _format_idea_card(idea, for_admin=True)
+    kb = _idea_kb_decision(idea_id)
+    for admin_id in _idea_get_main_admins():
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=card, reply_markup=kb)
+        except Exception as e:
+            logger.debug(f"idea card DM to {admin_id}: {e}")
+
+
+async def handle_idea_decision_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принимает комментарий от админа после клика «Принять/Отклонить/В работу».
+    Срабатывает только при pending_idea_decision.
+    """
+    if 'pending_idea_decision' not in context.user_data:
+        return
+    if not update.message or not update.message.text:
+        return
+    
+    state = context.user_data.pop('pending_idea_decision')
+    idea_id = state['idea_id']
+    action = state['action']
+    comment = (update.message.text or "").strip() or "—"
+    
+    status_map = {'approve': 'approved', 'reject': 'rejected', 'implement': 'implemented'}
+    status = status_map[action]
+    
+    _idea_set_decision(idea_id, status, update.effective_user.id, comment)
+    log_action(update.effective_user.id, f'idea_{status}', None, f"#{idea_id}: {comment[:120]}")
+    
+    idea = _idea_get(idea_id)
+    
+    # Уведомляем автора
+    label = {'approved': '✅ ПРИНЯТА', 'rejected': '❌ ОТКЛОНЕНА', 'implemented': '🚧 В РАБОТУ'}[status]
+    try:
+        await context.bot.send_message(
+            chat_id=idea['user_id'],
+            text=(
+                f"💡 РЕШЕНИЕ ПО ИДЕЕ #{idea_id}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"📊 Статус: {label}\n"
+                f"💬 {comment}"
+            ),
+        )
+    except Exception:
+        pass
+    
+    await update.message.reply_text(
+        f"✅ Идея #{idea_id} → {label}. Автор уведомлён."
+    )
+
+
+async def aidea_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Юзер может в любой момент отправить идею, без опроса.
+    /aidea_submit <текст>
+    """
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    raw = update.message.text or ""
+    space_idx = raw.find(' ')
+    nl_idx = raw.find('\n')
+    cut = -1
+    for idx in (space_idx, nl_idx):
+        if idx >= 0 and (cut < 0 or idx < cut):
+            cut = idx
+    text = raw[cut:].strip() if cut > 0 else ""
+    
+    if not text or len(text) < 5:
+        await update.message.reply_text(
+            "❌ Использование: /aidea_submit <текст идеи>\n"
+            "Минимум 5 символов."
+        )
+        return
+    
+    idea_id = _idea_create_submission(user_id, text)
+    log_action(user_id, 'idea_submitted', None, f"#{idea_id} (free-form)")
+    
+    await update.message.reply_text(
+        f"✅ ИДЕЯ #{idea_id} ПРИНЯТА К РАССМОТРЕНИЮ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Спасибо! Я уведомлю, когда решение будет принято."
+    )
+    
+    idea = _idea_get(idea_id)
+    card = _format_idea_card(idea, for_admin=True)
+    kb = _idea_kb_decision(idea_id)
+    for admin_id in _idea_get_main_admins():
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=card, reply_markup=kb)
+        except Exception as e:
+            logger.debug(f"idea card DM to {admin_id}: {e}")
+
+
+async def aideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Список идей. Юзер видит только свои; админ — все.
+    /aideas              — все ожидающие
+    /aideas all          — все (любой статус)
+    /aideas approved     — принятые
+    /aideas rejected     — отклонённые
+    /aideas implemented  — взятые в работу
+    """
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    is_admin = has_permission(user_id, 'gban', 'aideas')
+    flt = (context.args[0].lower() if context.args else 'submitted').strip()
+    
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    base = "SELECT * FROM ideas WHERE text IS NOT NULL"
+    params = []
+    if flt != 'all':
+        base += " AND status = ?"
+        params.append(flt)
+    if not is_admin:
+        base += " AND user_id = ?"
+        params.append(user_id)
+    base += " ORDER BY id DESC LIMIT 30"
+    c.execute(base, params)
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    
+    if not rows:
+        await update.message.reply_text("ℹ️ Идей не найдено.")
+        return
+    
+    label_map = {
+        'submitted': '⏳ ожидают',
+        'approved': '✅ принятые',
+        'rejected': '❌ отклонённые',
+        'implemented': '🚧 в работе',
+        'all': 'всех статусов',
+    }
+    title = f"💡 ИДЕИ ({label_map.get(flt, flt)})"
+    if not is_admin:
+        title += " — только ваши"
+    
+    lines = [title, "━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        author = get_user_data(r['user_id'])
+        a_name = author['nick'] if author else f"id {r['user_id']}"
+        status = r.get('status') or '—'
+        emoji = {'submitted': '⏳', 'approved': '✅', 'rejected': '❌', 'implemented': '🚧'}.get(status, '•')
+        preview = (r.get('text') or '').replace('\n', ' ')[:60]
+        if len((r.get('text') or '')) > 60:
+            preview += '…'
+        lines.append(f"{emoji} #{r['id']} {a_name}: {preview}")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("Детально: /aidea_info <id>")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def aidea_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Детально про идею. /aidea_info <id>. Автор видит свою, админ — любую."""
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /aidea_info <id>")
+        return
+    try:
+        idea_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+    
+    idea = _idea_get(idea_id)
+    if not idea or not idea.get('text'):
+        await update.message.reply_text("❌ Идея не найдена.")
+        return
+    
+    is_admin = has_permission(user_id, 'gban', 'aidea_info')
+    if not is_admin and idea['user_id'] != user_id:
+        await update.message.reply_text("❌ Вы можете смотреть только свои идеи.")
+        return
+    
+    card = _format_idea_card(idea, for_admin=is_admin)
+    kb = None
+    # Если ещё ожидает и юзер — админ, добавим кнопки решения
+    if is_admin and idea.get('status') == 'submitted':
+        kb = _idea_kb_decision(idea_id)
+    
+    await update.message.reply_text(card, reply_markup=kb)
+
+
+async def aidea_to_changelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Конвертирует одобренную/реализованную идею в черновик changelog.
+    /aidea_to_changelog <idea_id>
+    Полезно при подготовке очередного обновления.
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban', 'aidea_to_changelog'):
+        await update.message.reply_text("❌ Команда доступна со спецдоступом.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /aidea_to_changelog <idea_id>")
+        return
+    try:
+        idea_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+    
+    idea = _idea_get(idea_id)
+    if not idea or not idea.get('text'):
+        await update.message.reply_text("❌ Идея не найдена.")
+        return
+    
+    author = get_user_data(idea['user_id'])
+    author_name = author['nick'] if author else f"id {idea['user_id']}"
+    content = f"💡 {idea['text']}\n\n📌 Идея #{idea_id} от {author_name}"
+    version = _changelog_next_version()
+    cid = _changelog_save_draft(content, version=version, title=None, created_by=user_id)
+    cl = _changelog_get(cid)
+    
+    await update.message.reply_text(
+        _changelog_format(cl) +
+        f"\n\n💡 Опубликовать: /achangelog_publish {cid}"
+    )
+
+
+async def weekly_ideas_poll_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Еженедельный авто-опрос идей. Запускается из job_queue (например, четверг 18:00 МСК).
+    Аналогичен ручному /aideas_start, но без аргументов.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO idea_polls (started_by, prompt, status, started_at) VALUES (NULL, NULL, "active", ?)',
+        (now_msk_str(),),
+    )
+    poll_id = c.lastrowid
+    c.execute('SELECT user_id FROM users WHERE bot_blocked = "Нет"')
+    targets = [r[0] for r in c.fetchall()]
+    conn.close()
+    
+    kb = _idea_kb_prompt(poll_id)
+    sent = 0
+    for uid in targets:
+        try:
+            await context.bot.send_message(chat_id=uid, text=DEFAULT_IDEA_PROMPT, reply_markup=kb)
+            sent += 1
+        except Exception as e:
+            logger.debug(f"weekly_ideas_poll DM to {uid}: {e}")
+        await asyncio.sleep(0.05)
+    
+    log_action(None, 'ideas_poll_started_auto', None, f"#{poll_id}: sent={sent}")
+    # DM админам
+    for admin_id in _idea_get_main_admins():
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"💡 Автоматический опрос идей #{poll_id} запущен, доставлено: {sent}.",
+            )
+        except Exception:
+            pass
+
+
 async def changelog_startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Однократно при старте бота: если со времени последнего опубликованного changelog
@@ -9144,6 +9801,8 @@ def main():
         'achangelog': achangelog, 'achangelog_list': achangelog_list,
         'achangelog_add': achangelog_add, 'achangelog_draft': achangelog_draft,
         'achangelog_publish': achangelog_publish, 'achangelog_delete': achangelog_delete,
+        'aideas_start': aideas_start, 'aideas': aideas, 'aidea_info': aidea_info,
+        'aidea_submit': aidea_submit, 'aidea_to_changelog': aidea_to_changelog,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -9215,8 +9874,15 @@ def main():
     application.add_handler(CallbackQueryHandler(duel_callback, pattern=r'^duel:'))
     # Кубы
     application.add_handler(CallbackQueryHandler(cube_callback, pattern=r'^cube:'))
+    # Идеи: ответы юзеров и решения админов
+    application.add_handler(CallbackQueryHandler(idea_callback, pattern=r'^idea:'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
+    # Идеи в личке: текст идеи (после клика «Есть идеи») и комментарий админа к решению.
+    # ВАЖНО: разные группы, иначе PTB запустит только первый — каждый хэндлер сам
+    # проверяет наличие своего state в context.user_data и тихо return-ит если не его случай.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idea_input), group=10)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idea_decision_comment), group=11)
     # Сбор сообщений для анализа настроения (только в конференции)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
     # «моя статья» — fun-фишка. ВАЖНО: отдельная группа, иначе PTB запустит только track_message
@@ -9246,6 +9912,12 @@ def main():
     # Стартовое напоминание: через 30 сек после запуска, если есть новые типы action
     # с момента последнего опубликованного changelog — DM главному админу.
     application.job_queue.run_once(changelog_startup_notify_job, when=30)
+    # Еженедельный сбор идей — четверг 18:00 МСК. Юзеры получают DM с кнопками.
+    application.job_queue.run_daily(
+        weekly_ideas_poll_job,
+        time=time(hour=18, minute=0, tzinfo=MSK),
+        days=(3,),  # 3 = четверг (понедельник=0)
+    )
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
