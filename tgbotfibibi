@@ -9096,15 +9096,20 @@ async def achangelog_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 DEFAULT_IDEA_PROMPT = (
     "💡 ПРЕДЛОЖЕНИЯ ПО УЛУЧШЕНИЮ БОТА\n"
     "━━━━━━━━━━━━━━━━━\n"
-    "Ваше мнение очень важно для нас)\n"
+    "Привет! Поделись идеями, как сделать бота лучше.\n"
+    "Возможно, есть фишка, которую хочется добавить, или что-то, что раздражает?\n\n"
+    "Жми кнопку ниже — а дальше расскажешь подробности."
 )
 
 
 def _idea_get_main_admins() -> list:
     """Куда слать DM-уведомления про идеи. Возвращает список user_id."""
-    if isinstance(MAIN_ADMIN_IDS, (list, set, tuple)):
-        return list(MAIN_ADMIN_IDS)
-    return [MAIN_ADMIN_IDS] if MAIN_ADMIN_IDS else []
+    try:
+        if isinstance(ADMIN_IDS, (list, set, tuple)):
+            return list(ADMIN_IDS)
+        return [ADMIN_IDS] if ADMIN_IDS else []
+    except NameError:
+        return []
 
 
 def _idea_kb_prompt(poll_id: int) -> InlineKeyboardMarkup:
@@ -9711,8 +9716,11 @@ async def changelog_startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
     if not new_actions:
         return
     
-    # Главный админ — возьмём из MAIN_ADMIN_IDS
-    admin_ids = MAIN_ADMIN_IDS if isinstance(MAIN_ADMIN_IDS, (list, set, tuple)) else [MAIN_ADMIN_IDS]
+    # Главный админ — возьмём из ADMIN_IDS
+    try:
+        admin_ids = list(ADMIN_IDS) if isinstance(ADMIN_IDS, (list, set, tuple)) else ([ADMIN_IDS] if ADMIN_IDS else [])
+    except NameError:
+        admin_ids = []
     if not admin_ids:
         return
     
@@ -9911,7 +9919,12 @@ def main():
     # Стартовое напоминание: через 30 сек после запуска, если есть новые типы action
     # с момента последнего опубликованного changelog — DM главному админу.
     application.job_queue.run_once(changelog_startup_notify_job, when=30)
-
+    # Еженедельный сбор идей — четверг 18:00 МСК. Юзеры получают DM с кнопками.
+    application.job_queue.run_daily(
+        weekly_ideas_poll_job,
+        time=time(hour=18, minute=0, tzinfo=MSK),
+        days=(3,),  # 3 = четверг (понедельник=0)
+    )
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
