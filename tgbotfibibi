@@ -9668,44 +9668,6 @@ async def aidea_to_changelog(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def weekly_ideas_poll_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Еженедельный авто-опрос идей. Запускается из job_queue (например, четверг 18:00 МСК).
-    Аналогичен ручному /aideas_start, но без аргументов.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        'INSERT INTO idea_polls (started_by, prompt, status, started_at) VALUES (NULL, NULL, "active", ?)',
-        (now_msk_str(),),
-    )
-    poll_id = c.lastrowid
-    c.execute('SELECT user_id FROM users WHERE bot_blocked = "Нет"')
-    targets = [r[0] for r in c.fetchall()]
-    conn.close()
-    
-    kb = _idea_kb_prompt(poll_id)
-    sent = 0
-    for uid in targets:
-        try:
-            await context.bot.send_message(chat_id=uid, text=DEFAULT_IDEA_PROMPT, reply_markup=kb)
-            sent += 1
-        except Exception as e:
-            logger.debug(f"weekly_ideas_poll DM to {uid}: {e}")
-        await asyncio.sleep(0.05)
-    
-    log_action(None, 'ideas_poll_started_auto', None, f"#{poll_id}: sent={sent}")
-    # DM админам
-    for admin_id in _idea_get_main_admins():
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"💡 Автоматический опрос идей #{poll_id} запущен, доставлено: {sent}.",
-            )
-        except Exception:
-            pass
-
-
 async def changelog_startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Однократно при старте бота: если со времени последнего опубликованного changelog
@@ -9919,12 +9881,6 @@ def main():
     # Стартовое напоминание: через 30 сек после запуска, если есть новые типы action
     # с момента последнего опубликованного changelog — DM главному админу.
     application.job_queue.run_once(changelog_startup_notify_job, when=30)
-    # Еженедельный сбор идей — четверг 18:00 МСК. Юзеры получают DM с кнопками.
-    application.job_queue.run_daily(
-        weekly_ideas_poll_job,
-        time=time(hour=18, minute=0, tzinfo=MSK),
-        days=(3,),  # 3 = четверг (понедельник=0)
-    )
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
