@@ -1,8 +1,8 @@
 import random
 import logging
 import asyncio
-from datetime import datetime, timedelta, time
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime, timedelta, time, timezone
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop
 import sqlite3
 import os
@@ -66,6 +66,15 @@ DB_FILE = str(DATA_DIR / "conference.db")
 
 VERDICT_TOPIC_ID = 40224
 CONFERENCE_CHAT_ID = -1003389197905
+# Топик, в котором разрешены игры (кубы, моя статья).
+# В других топиках конференции эти команды наказываются — см. _handle_topic_violation.
+GAMES_ALLOWED_TOPIC_ID = 52562
+TOPIC_VIOLATION_WINDOW_DAYS = 7              # за сколько дней считаем нарушения
+TOPIC_VIOLATION_MUTE_AT = 3                  # с какого по счёту нарушения — мут
+TOPIC_VIOLATION_WARN_AT = 4                  # с какого — реальный варн поверх мута
+TOPIC_VIOLATION_MUTE_MIN_FIRST = 5           # длительность первого мута, мин
+TOPIC_VIOLATION_MUTE_MIN_REPEAT = 15         # длительность мута при повторах
+TOPIC_VIOLATION_REACT_COOLDOWN_SEC = 60      # антифлуд замечания (на одного юзера)
 
 chat_messages = []
 
@@ -890,6 +899,21 @@ def init_database():
         c.execute('CREATE INDEX IF NOT EXISTS idx_ideas_poll ON ideas(poll_id, response)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_ideas_status ON ideas(status)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_ideas_user ON ideas(user_id)')
+    except sqlite3.OperationalError:
+        pass
+    
+    # Журнал нарушений топика играми (кубы / моя статья в неправильном топике).
+    # Счётчик за окно TOPIC_VIOLATION_WINDOW_DAYS определяет ступень санкции.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS topic_violations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT,                       -- 'cubes' | 'article'
+            occurred_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_topic_violations_user ON topic_violations(user_id, occurred_at)')
     except sqlite3.OperationalError:
         pass
     
@@ -7029,6 +7053,181 @@ async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.debug(f"track_message: buffer={len(chat_messages)}/100")
 
 
+# ============ ПРОВЕРКА ТОПИКА ДЛЯ ИГР ============
+
+def _is_in_games_topic(update) -> bool:
+    """
+    True, если сообщение в правильном топике конференции (или вообще не в конфе —
+    тогда без ограничений, например в ЛС). False — в конфе, но в неправильном топике.
+    """
+    if not update or not update.message:
+        return True
+    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+        return True  # вне конфы — без ограничений
+    thread_id = getattr(update.message, 'message_thread_id', None)
+    return thread_id == GAMES_ALLOWED_TOPIC_ID
+
+
+async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> bool:
+    """
+    Применяет накопительные санкции за игру в неправильном топике:
+      • 1–2 нарушения за окно: удалить сообщение + замечание
+      • 3-е: + мут 5 мин
+      • 4+: + мут 15 мин + реальный варн через add_warning
+    
+    Возвращает True (handled), чтобы вызывающий мог сразу выйти.
+    Антифлуд: повторное замечание не чаще раза в TOPIC_VIOLATION_REACT_COOLDOWN_SEC сек.
+    """
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    # 1. Удалить сообщение (если у бота есть права)
+    try:
+        await update.message.delete()
+    except Exception as e:
+        logger.debug(f"topic violation: cannot delete msg: {e}")
+    
+    # Незарегистрированных не наказываем, но сообщение всё равно стёрли
+    if not user_data:
+        return True
+    
+    # 2. Подсчёт нарушений за окно + последнее
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    since = (now_msk() - timedelta(days=TOPIC_VIOLATION_WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "SELECT COUNT(*), MAX(occurred_at) FROM topic_violations WHERE user_id = ? AND occurred_at > ?",
+        (user_id, since),
+    )
+    prev_count, last_at = c.fetchone()
+    prev_count = prev_count or 0
+    
+    # Антифлуд: реагируем не чаще раза в минуту
+    react = True
+    if last_at:
+        try:
+            last_dt = datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+            if (now_msk() - last_dt).total_seconds() < TOPIC_VIOLATION_REACT_COOLDOWN_SEC:
+                react = False
+        except Exception:
+            pass
+    
+    # 3. Записываем нарушение
+    c.execute(
+        "INSERT INTO topic_violations (user_id, kind, occurred_at) VALUES (?, ?, ?)",
+        (user_id, kind, now_msk_str("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+    
+    if not react:
+        return True  # тихо стёрли, но без флуда в чат
+    
+    count = prev_count + 1
+    
+    # 4. Санкция
+    mute_min = 0
+    extra_warn = False
+    if count >= TOPIC_VIOLATION_WARN_AT:
+        mute_min = TOPIC_VIOLATION_MUTE_MIN_REPEAT
+        extra_warn = True
+    elif count >= TOPIC_VIOLATION_MUTE_AT:
+        mute_min = TOPIC_VIOLATION_MUTE_MIN_FIRST
+    
+    # 5. Применяем мут (если есть)
+    mute_applied = False
+    if mute_min > 0:
+        try:
+            until = datetime.now(timezone.utc) + timedelta(minutes=mute_min)
+            await context.bot.restrict_chat_member(
+                chat_id=CONFERENCE_CHAT_ID,
+                user_id=user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_audios=False,
+                    can_send_documents=False,
+                    can_send_photos=False,
+                    can_send_videos=False,
+                    can_send_video_notes=False,
+                    can_send_voice_notes=False,
+                    can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                ),
+                until_date=until,
+            )
+            mute_applied = True
+        except Exception as e:
+            logger.warning(f"topic violation: cannot mute {user_id}: {e}")
+    
+    # 6. Реальный варн (для 4+ нарушений)
+    warn_msg = ""
+    if extra_warn:
+        try:
+            ok, msg, _ = add_warning(
+                user_id,
+                ADMIN_IDS[0] if ADMIN_IDS else 0,
+                f"Повторное нарушение топика играми (всего {count} за {TOPIC_VIOLATION_WINDOW_DAYS} дней)",
+            )
+            if ok:
+                warn_msg = msg
+        except Exception as e:
+            logger.warning(f"topic violation: add_warning failed: {e}")
+    
+    # 7. Составляем санкционную строку
+    kind_label = {"cubes": "«кубы»", "article": "«моя статья»"}.get(kind, kind)
+    sanction_lines = ["🗑 Сообщение удалено"]
+    if mute_applied:
+        sanction_lines.append(f"🤐 Мут на {mute_min} мин")
+    elif mute_min > 0:
+        sanction_lines.append(f"⚠️ Не удалось замутить (нет прав «Ограничивать пользователей»)")
+    if warn_msg:
+        sanction_lines.append(f"⚠️ {warn_msg}")
+    
+    # Ссылка на правильный топик (deep-link для супергрупп)
+    cid_short = str(CONFERENCE_CHAT_ID).replace('-100', '', 1)
+    topic_url = f"https://t.me/c/{cid_short}/{GAMES_ALLOWED_TOPIC_ID}"
+    
+    text = (
+        f"🚫 НАРУШЕНИЕ ТОПИКА\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"👤 {user_data['nick']}\n"
+        f"📍 Триггер: {kind_label} вне игрового топика\n"
+        f"📊 Нарушений за {TOPIC_VIOLATION_WINDOW_DAYS} дн.: {count}\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(sanction_lines) +
+        f"\n━━━━━━━━━━━━━━━━━\n"
+        f"💡 Игры — в [этом топике]({topic_url})."
+    )
+    
+    # 8. Шлём замечание в тот же топик где было нарушение — чтобы юзер сразу увидел.
+    target_thread = getattr(update.message, 'message_thread_id', None)
+    try:
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text=text,
+            message_thread_id=target_thread,
+            parse_mode='Markdown',
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.debug(f"topic violation: send notice failed: {e}")
+        # Фоллбэк без Markdown — на случай, если в нике есть проблемные символы
+        try:
+            await context.bot.send_message(
+                chat_id=CONFERENCE_CHAT_ID,
+                text=text.replace('[этом топике]', f'этом топике ({topic_url})').replace('(' + topic_url + ')', '', 1),
+                message_thread_id=target_thread,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+    
+    log_action(None, 'topic_violation', user_id,
+               f"kind={kind} count={count} mute_min={mute_min} warn={extra_warn}")
+    return True
+
+
 # ============ «МОЯ СТАТЬЯ» — рандомная статья УК РФ ============
 
 # База статей УК РФ загружается из файла uk_articles.json рядом с bot.py.
@@ -7131,12 +7330,20 @@ async def handle_my_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Реакция на фразу «моя статья» в ЛС бота или в конференции.
     КД 1 день, ~12% шанс «не нашлось». В остальных случаях — рандомная статья УК РФ.
+    
+    В конференции работает ТОЛЬКО в игровом топике (GAMES_ALLOWED_TOPIC_ID).
+    Иначе — санкции через _handle_topic_violation.
     """
     if not update.message or not update.message.text:
         return
     
     user = update.effective_user
     if not user:
+        return
+    
+    # Проверка топика: в конфе работает только в игровом топике
+    if not _is_in_games_topic(update):
+        await _handle_topic_violation(update, context, kind='article')
         return
     
     # Проверяем что юзер вообще зарегистрирован — иначе игнорируем
@@ -8278,7 +8485,15 @@ async def acubes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /acubes               — открытый вызов («Кто кубы») — принять может любой
     /acubes @user         — закрытый вызов конкретному игроку
     (reply) /acubes       — закрытый вызов автору сообщения
+    
+    В конференции работает ТОЛЬКО в игровом топике (GAMES_ALLOWED_TOPIC_ID).
+    Иначе — санкции через _handle_topic_violation.
     """
+    # Проверка топика: в конфе работает только в игровом топике
+    if not _is_in_games_topic(update):
+        await _handle_topic_violation(update, context, kind='cubes')
+        return
+    
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     if not user_data:
