@@ -54,6 +54,8 @@ OPENROUTER_FALLBACK_MODELS = [
 
 GAME_NICK, CALLSIGN = range(2)
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
+# States для /apunish (форма выдачи наказания, только в личке).
+PUNISH_VIOLATOR, PUNISH_VIOLATION, PUNISH_EVIDENCE, PUNISH_FACTION, PUNISH_WARNS, PUNISH_CONFIRM = range(20, 26)
 
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 ADMIN_IDS = [8026911824]
@@ -917,6 +919,31 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Публикации о выданных наказаниях (НЕ выдают реальный варн, только публикация).
+    # media_files — JSON-список вложений как в reports.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS punishments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            violator_nick TEXT NOT NULL,
+            violation TEXT NOT NULL,
+            evidence TEXT,
+            media_files TEXT,
+            issued_by INTEGER NOT NULL,      -- user_id выдавшего
+            issuer_nick TEXT,                -- ник выдавшего на момент публикации
+            published_at TEXT DEFAULT '',
+            message_id INTEGER               -- ID сообщения в VERDICT_TOPIC_ID
+        )
+    ''')
+    # Миграции для уже существующих БД
+    for col_sql in (
+        "ALTER TABLE punishments ADD COLUMN faction TEXT",
+        "ALTER TABLE punishments ADD COLUMN warns_after TEXT",
+    ):
+        try:
+            c.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass
+    
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
     if c.fetchone()[0] == 0:
@@ -1674,6 +1701,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         if rank >= 5:
             keyboard.append([KeyboardButton("📋 Список участников")])
+        # Кнопка выдачи выговора — модераторам с 4 ранга (или со спецдоступом).
+        if rank >= 4 or has_special_access(user_id):
+            keyboard.append([KeyboardButton("🚓 Выдать выговор")])
         
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         permissions = get_user_permissions(user_id)
@@ -9961,6 +9991,407 @@ async def changelog_startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"changelog notify {admin_id}: {e}")
 
 
+# ============ ВЫДАЧА НАКАЗАНИЯ (/apunish) ============
+# Форма в личке: ник нарушителя → нарушение → доказательство (текст/медиа) → превью →
+# публикация в VERDICT_TOPIC_ID. Реального варна НЕ выдаёт — только публикация-объявление.
+
+
+def _format_punishment_card(p: dict) -> str:
+    """Сухой рапорт (Вариант 1) + поля «Фракция» и «Стало выговоров»."""
+    head = f"⚖️ ВЫДАН ВЫГОВОР #{p['id']}"
+    return (
+        f"{head}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 Нарушитель: {p['violator_nick']}\n"
+        f"🏛 Фракция: {p.get('faction') or '—'}\n"
+        f"⚠️ Нарушение: {p['violation']}\n"
+        f"📎 Доказательство: {p.get('evidence') or '—'}\n"
+        f"📊 Выговоров стало: {p.get('warns_after') or '—'}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👮 Выдал: {p.get('issuer_nick') or '—'}\n"
+        f"📅 {p['published_at']}"
+    )
+
+
+def _punish_kb_faction() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("МВД", callback_data="punish:fac:МВД"),
+            InlineKeyboardButton("МО", callback_data="punish:fac:МО"),
+            InlineKeyboardButton("ФСИН", callback_data="punish:fac:ФСИН"),
+        ],
+        [InlineKeyboardButton("✖️ Отмена", callback_data="punish:cancel")],
+    ])
+
+
+def _punish_kb_warns() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1/3", callback_data="punish:warns:1/3"),
+            InlineKeyboardButton("2/3", callback_data="punish:warns:2/3"),
+            InlineKeyboardButton("3/3", callback_data="punish:warns:3/3"),
+        ],
+        [InlineKeyboardButton("✖️ Отмена", callback_data="punish:cancel")],
+    ])
+
+
+def _punish_kb_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Опубликовать", callback_data="punish:publish"),
+            InlineKeyboardButton("✖️ Отменить", callback_data="punish:cancel"),
+        ]
+    ])
+
+
+async def apunish_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Старт формы выдачи выговора. Только в личке, для модераторов 4+ ранга."""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return ConversationHandler.END
+    if user_data.get('rank', 0) < 4 and not has_special_access(user_id):
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
+        return ConversationHandler.END
+    
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ Эта команда работает только в личке с ботом.")
+        return ConversationHandler.END
+    
+    # Очищаем возможные остатки от предыдущей попытки
+    for k in ('punish_violator', 'punish_violation', 'punish_evidence',
+              'punish_media', 'punish_faction', 'punish_warns'):
+        context.user_data.pop(k, None)
+    
+    await update.message.reply_text(
+        "⚖️ ВЫДАЧА ВЫГОВОРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Шаг 1/3 — Ник нарушителя\n\n"
+        "✖️ Для отмены — /cancel"
+    )
+    return PUNISH_VIOLATOR
+
+
+async def punish_violator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        await update.message.reply_text("✖️ Отменено.")
+        return ConversationHandler.END
+    if len(text) < 2:
+        await update.message.reply_text("❌ Слишком коротко. Повторите или /cancel.")
+        return PUNISH_VIOLATOR
+    if len(text) > 64:
+        await update.message.reply_text("❌ Слишком длинно (макс 64). Повторите или /cancel.")
+        return PUNISH_VIOLATOR
+    
+    context.user_data['punish_violator'] = text
+    await update.message.reply_text(
+        "⚖️ ВЫДАЧА ВЫГОВОРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Шаг 2/3 — Нарушение\n\n"
+        "✖️ Для отмены — /cancel"
+    )
+    return PUNISH_VIOLATION
+
+
+async def punish_violation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        await update.message.reply_text("✖️ Отменено.")
+        return ConversationHandler.END
+    if len(text) < 3:
+        await update.message.reply_text("❌ Слишком коротко. Опишите подробнее или /cancel.")
+        return PUNISH_VIOLATION
+    if len(text) > 500:
+        await update.message.reply_text("❌ Слишком длинно (макс 500). Сократите или /cancel.")
+        return PUNISH_VIOLATION
+    
+    context.user_data['punish_violation'] = text
+    await update.message.reply_text(
+        "⚖️ ВЫДАЧА ВЫГОВОРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Шаг 3/3 — Доказательство\n\n"
+        "✖️ Для отмены — /cancel"
+    )
+    return PUNISH_EVIDENCE
+
+
+async def punish_evidence_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Юзер прислал медиа на шаге доказательств — собираем file_id."""
+    msg = update.message
+    media = context.user_data.setdefault('punish_media', [])
+    
+    kind = None
+    file_id = None
+    caption = msg.caption or ""
+    if msg.photo:
+        kind, file_id = 'photo', msg.photo[-1].file_id
+    elif msg.video:
+        kind, file_id = 'video', msg.video.file_id
+    elif msg.document:
+        kind, file_id = 'document', msg.document.file_id
+    elif msg.voice:
+        kind, file_id = 'voice', msg.voice.file_id
+    elif msg.video_note:
+        kind, file_id = 'video_note', msg.video_note.file_id
+    elif msg.audio:
+        kind, file_id = 'audio', msg.audio.file_id
+    elif msg.animation:
+        kind, file_id = 'animation', msg.animation.file_id
+    
+    if not kind:
+        return PUNISH_EVIDENCE
+    
+    media.append({'type': kind, 'file_id': file_id, 'caption': caption})
+    await msg.reply_text(
+        f"✅ Прикреплено ({kind}). Всего вложений: {len(media)}.\n"
+        "Можете прислать ещё, либо отправьте текст со ссылками\n"
+        "или слово «готово» — перейдём дальше."
+    )
+    return PUNISH_EVIDENCE
+
+
+async def punish_evidence_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Текст на шаге доказательств — ссылки или «готово»."""
+    text = (update.message.text or "").strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        await update.message.reply_text("✖️ Отменено.")
+        return ConversationHandler.END
+    
+    media = context.user_data.get('punish_media') or []
+    
+    if text.lower() in ('готово', 'нет', '-', 'next', 'далее'):
+        if not media:
+            await update.message.reply_text(
+                "❌ Нужно либо прикрепить медиа, либо прислать ссылки. Или /cancel."
+            )
+            return PUNISH_EVIDENCE
+        context.user_data['punish_evidence'] = "Только медиа во вложении"
+    else:
+        if len(text) > 500:
+            await update.message.reply_text("❌ Слишком длинно (макс 500). Сократите или /cancel.")
+            return PUNISH_EVIDENCE
+        context.user_data['punish_evidence'] = text
+    
+    # Шаг 4 — выбор фракции нарушителя
+    await update.message.reply_text(
+        "⚖️ ВЫДАЧА ВЫГОВОРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "🏛 Фракция нарушителя",
+        reply_markup=_punish_kb_faction(),
+    )
+    return PUNISH_FACTION
+
+
+async def punish_faction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline-кнопка выбора фракции."""
+    query = update.callback_query
+    parts = (query.data or "").split(":", 2)
+    if len(parts) < 3 or parts[1] != 'fac':
+        await query.answer()
+        return PUNISH_FACTION
+    
+    faction = parts[2]
+    context.user_data['punish_faction'] = faction
+    await query.answer(f"Фракция: {faction}")
+    
+    try:
+        await query.edit_message_text(
+            "⚖️ ВЫДАЧА ВЫГОВОРА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"🏛 Фракция: {faction}\n\n"
+            "📊 Стало выговоров",
+            reply_markup=_punish_kb_warns(),
+        )
+    except Exception:
+        pass
+    return PUNISH_WARNS
+
+
+async def punish_warns_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline-кнопка выбора счётчика выговоров."""
+    query = update.callback_query
+    parts = (query.data or "").split(":", 2)
+    if len(parts) < 3 or parts[1] != 'warns':
+        await query.answer()
+        return PUNISH_WARNS
+    
+    warns_after = parts[2]
+    context.user_data['punish_warns'] = warns_after
+    await query.answer(f"Стало: {warns_after}")
+    
+    # Превью
+    user_id = query.from_user.id
+    ud = get_user_data(user_id)
+    issuer_nick = ud['nick'] if ud else f"id {user_id}"
+    media = context.user_data.get('punish_media') or []
+    
+    preview = {
+        'id': '—',
+        'violator_nick': context.user_data['punish_violator'],
+        'faction': context.user_data.get('punish_faction', '—'),
+        'violation': context.user_data['punish_violation'],
+        'evidence': context.user_data['punish_evidence'],
+        'warns_after': warns_after,
+        'issuer_nick': issuer_nick,
+        'published_at': now_msk_str("%d.%m.%Y %H:%M"),
+    }
+    media_note = f"\n\n📎 Вложений к публикации: {len(media)}" if media else ""
+    preview_body = _format_punishment_card(preview).split('\n', 1)[1]  # без head
+    
+    try:
+        await query.edit_message_text(
+            "🔍 ПРОВЕРЬТЕ ПЕРЕД ПУБЛИКАЦИЕЙ\n"
+            + preview_body
+            + media_note,
+            reply_markup=_punish_kb_confirm(),
+        )
+    except Exception:
+        # Если edit не сработал (например, после клавиатуры) — шлём новое сообщение
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="🔍 ПРОВЕРЬТЕ ПЕРЕД ПУБЛИКАЦИЕЙ\n" + preview_body + media_note,
+            reply_markup=_punish_kb_confirm(),
+        )
+    return PUNISH_CONFIRM
+
+
+async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «✅ Опубликовать» / «✖️ Отменить» после превью.
+    
+    Также обрабатывает «punish:cancel» с любого предыдущего шага (фракция/выговоры),
+    потому что зарегистрирован под общим паттерном punish:.
+    """
+    query = update.callback_query
+    parts = (query.data or "").split(":", 2)
+    action = parts[1] if len(parts) > 1 else ""
+    user_id = query.from_user.id
+    
+    if action == 'cancel':
+        for k in ('punish_violator', 'punish_violation', 'punish_evidence',
+                  'punish_media', 'punish_faction', 'punish_warns'):
+            context.user_data.pop(k, None)
+        await query.answer("Отменено.")
+        try:
+            await query.edit_message_text("✖️ Публикация отменена.")
+        except Exception:
+            pass
+        return ConversationHandler.END
+    
+    if action != 'publish':
+        await query.answer()
+        return PUNISH_CONFIRM
+    
+    ud_check = get_user_data(user_id)
+    if not ud_check or (ud_check.get('rank', 0) < 4 and not has_special_access(user_id)):
+        await query.answer("❌ Нет прав.", show_alert=True)
+        return ConversationHandler.END
+    
+    violator = context.user_data.get('punish_violator')
+    violation = context.user_data.get('punish_violation')
+    evidence = context.user_data.get('punish_evidence')
+    faction = context.user_data.get('punish_faction')
+    warns_after = context.user_data.get('punish_warns')
+    media = context.user_data.get('punish_media') or []
+    
+    if not (violator and violation and evidence and faction and warns_after):
+        await query.answer("❌ Данные потерялись, начните заново.", show_alert=True)
+        return ConversationHandler.END
+    
+    ud = get_user_data(user_id)
+    issuer_nick = ud['nick'] if ud else f"id {user_id}"
+    published_at_db = now_msk_str("%Y-%m-%d %H:%M:%S")
+    published_at_view = now_msk_str("%d.%m.%Y %H:%M")
+    
+    # Сохраняем в БД
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''INSERT INTO punishments
+           (violator_nick, violation, evidence, media_files, issued_by, issuer_nick,
+            published_at, faction, warns_after)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (violator, violation, evidence, json.dumps(media), user_id, issuer_nick,
+         published_at_db, faction, warns_after),
+    )
+    pid = c.lastrowid
+    conn.commit()
+    conn.close()
+    
+    record = {
+        'id': pid,
+        'violator_nick': violator,
+        'faction': faction,
+        'violation': violation,
+        'evidence': evidence,
+        'warns_after': warns_after,
+        'issuer_nick': issuer_nick,
+        'published_at': published_at_view,
+    }
+    card_text = _format_punishment_card(record)
+    
+    # Публикуем в VERDICT_TOPIC_ID
+    message_id = None
+    try:
+        sent = await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text=card_text,
+            message_thread_id=VERDICT_TOPIC_ID,
+        )
+        message_id = sent.message_id
+        if media:
+            await forward_report_media(context, CONFERENCE_CHAT_ID, media)
+    except Exception as e:
+        logger.error(f"apunish publish failed: {e}")
+        await query.answer("Ошибка публикации, см. логи.", show_alert=True)
+        try:
+            await query.edit_message_text(
+                "❌ Не удалось опубликовать в топик вердиктов.\n"
+                "Запись сохранена в БД с #" + str(pid) + ". См. логи."
+            )
+        except Exception:
+            pass
+        return ConversationHandler.END
+    
+    if message_id:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('UPDATE punishments SET message_id = ? WHERE id = ?', (message_id, pid))
+        conn.commit()
+        conn.close()
+    
+    log_action(user_id, 'punishment_issued', None,
+               f"#{pid}: {violator} ({faction}) / {violation} / {warns_after}")
+    
+    for k in ('punish_violator', 'punish_violation', 'punish_evidence',
+              'punish_media', 'punish_faction', 'punish_warns'):
+        context.user_data.pop(k, None)
+    
+    await query.answer("Опубликовано.")
+    try:
+        await query.edit_message_text(
+            f"✅ ВЫГОВОР #{pid} ОПУБЛИКОВАН\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 {violator} ({faction})\n"
+            f"⚠️ {violation}\n"
+            f"📊 Стало: {warns_after}\n\n"
+            f"Карточка ушла в топик вердиктов."
+        )
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+
+async def punish_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сброс ConversationHandler по /cancel."""
+    for k in ('punish_violator', 'punish_violation', 'punish_evidence',
+              'punish_media', 'punish_faction', 'punish_warns'):
+        context.user_data.pop(k, None)
+    await update.message.reply_text("✖️ Отменено.")
+    return ConversationHandler.END
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -10056,6 +10487,39 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     application.add_handler(report_handler)
+    
+    # Форма выдачи выговора (только в ЛС). Срабатывает по команде /apunish или
+    # по кнопке reply-keyboard «🚓 Выдать выговор» (видна модераторам с 4 ранга).
+    punish_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('apunish', apunish_start),
+            MessageHandler(filters.Regex('^🚓 Выдать выговор$') & filters.ChatType.PRIVATE, apunish_start),
+        ],
+        states={
+            PUNISH_VIOLATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, punish_violator)],
+            PUNISH_VIOLATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, punish_violation)],
+            PUNISH_EVIDENCE: [
+                MessageHandler(
+                    filters.PHOTO | filters.VIDEO | filters.Document.ALL |
+                    filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.ANIMATION,
+                    punish_evidence_media,
+                ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, punish_evidence_text),
+            ],
+            PUNISH_FACTION: [
+                CallbackQueryHandler(punish_faction_callback, pattern=r'^punish:fac:'),
+                CallbackQueryHandler(punish_confirm_callback, pattern=r'^punish:cancel$'),
+            ],
+            PUNISH_WARNS: [
+                CallbackQueryHandler(punish_warns_callback, pattern=r'^punish:warns:'),
+                CallbackQueryHandler(punish_confirm_callback, pattern=r'^punish:cancel$'),
+            ],
+            PUNISH_CONFIRM: [CallbackQueryHandler(punish_confirm_callback, pattern=r'^punish:')],
+        },
+        fallbacks=[CommandHandler('cancel', punish_cancel)],
+        per_chat=True,
+    )
+    application.add_handler(punish_handler)
     
     # КРИТИЧНО: gate отрезает заблокированных юзеров в ЛС ДО любой другой обработки.
     # group=-2 → раньше track_username и всего остального.
