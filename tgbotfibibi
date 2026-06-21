@@ -634,6 +634,21 @@ def init_database():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL
     )''')
+    
+    # Миграция: добавляем флаг видимости отдела в /find.
+    # Если колонки ещё нет — это первая миграция: воспроизводим прежнее
+    # поведение `depts[:-2]`, то есть скрываем последние два отдела.
+    try:
+        c.execute('ALTER TABLE departments ADD COLUMN show_in_find INTEGER DEFAULT 1')
+        # Бэкфилл — только при первичном добавлении колонки
+        c.execute('SELECT id FROM departments ORDER BY id')
+        dept_ids = [r[0] for r in c.fetchall()]
+        if len(dept_ids) > 2:
+            for hidden_id in dept_ids[-2:]:
+                c.execute('UPDATE departments SET show_in_find = 0 WHERE id = ?', (hidden_id,))
+        logger.info(f"departments.show_in_find: миграция применена, скрыто {min(2, len(dept_ids))} отделов")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS polls (
@@ -4902,9 +4917,12 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Вы не зарегистрированы.")
         return
     
-    depts = get_departments()[:-2]  # Все кроме последних двух
+    # Отделы для отображения — берём из таблицы departments по флагу show_in_find.
+    # Управление набором — через /afindsetup (главный админ).
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute('SELECT name FROM departments WHERE show_in_find = 1 ORDER BY id')
+    depts = [r[0] for r in c.fetchall()]
     
     text = "👥 РУКОВОДЯЩИЙ СОСТАВ:\n\n"
     total = 0
@@ -4922,6 +4940,116 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     text += f"👥 Всего в руководстве: {total}"
     await update.message.reply_text(text)
+
+
+def _get_departments_with_visibility() -> list:
+    """Возвращает [(id, name, show_in_find), ...] по порядку добавления."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, name, COALESCE(show_in_find, 1) FROM departments ORDER BY id')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def _afindsetup_kb() -> InlineKeyboardMarkup:
+    """Клавиатура: один ряд на отдел, нажатие переключает видимость."""
+    rows = _get_departments_with_visibility()
+    keyboard = []
+    for dept_id, name, show in rows:
+        marker = "✅" if show else "⬜"
+        keyboard.append([
+            InlineKeyboardButton(f"{marker} {name}", callback_data=f"findsetup:tog:{dept_id}")
+        ])
+    keyboard.append([InlineKeyboardButton("✖️ Закрыть", callback_data="findsetup:close")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _afindsetup_text() -> str:
+    rows = _get_departments_with_visibility()
+    shown = sum(1 for _, _, s in rows if s)
+    return (
+        "🔧 НАСТРОЙКА /find\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Какие отделы показывать в команде /find:\n"
+        "✅ — показывается  ⬜ — скрыт\n\n"
+        f"Сейчас отображается: {shown} из {len(rows)}\n"
+        "Жмите на отдел — переключит."
+    )
+
+
+async def afindsetup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открыть меню настройки видимости отделов в /find."""
+    user_id = update.effective_user.id
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
+        await update.message.reply_text("❌ Команда доступна главному админу или со спецдоступом.")
+        return
+    
+    rows = _get_departments_with_visibility()
+    if not rows:
+        await update.message.reply_text("ℹ️ Отделов в БД ещё нет.")
+        return
+    
+    await update.message.reply_text(_afindsetup_text(), reply_markup=_afindsetup_kb())
+
+
+async def afindsetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки переключения видимости и закрытия меню."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
+        await query.answer("❌ Нет прав.", show_alert=True)
+        return
+    
+    parts = (query.data or "").split(":")
+    if len(parts) < 2:
+        await query.answer()
+        return
+    action = parts[1]
+    
+    if action == 'close':
+        await query.answer("Закрыто.")
+        try:
+            await query.edit_message_text("🔧 Настройка /find закрыта.")
+        except Exception:
+            pass
+        return
+    
+    if action == 'tog' and len(parts) >= 3:
+        try:
+            dept_id = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            'UPDATE departments SET show_in_find = 1 - COALESCE(show_in_find, 1) WHERE id = ?',
+            (dept_id,),
+        )
+        c.execute('SELECT name, show_in_find FROM departments WHERE id = ?', (dept_id,))
+        row = c.fetchone()
+        conn.commit()
+        conn.close()
+        
+        if row:
+            name, show = row
+            state = "показывается" if show else "скрыт"
+            await query.answer(f"{name}: {state}")
+            log_action(user_id, 'find_visibility_changed', None,
+                       f"dept_id={dept_id} ({name}) → show={show}")
+        else:
+            await query.answer()
+        
+        # Перерисовываем меню с обновлёнными маркерами
+        try:
+            await query.edit_message_text(_afindsetup_text(), reply_markup=_afindsetup_kb())
+        except Exception:
+            pass
+        return
+    
+    await query.answer()
+
 
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Профиль другого пользователя"""
@@ -10067,7 +10195,7 @@ async def apunish_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚖️ ВЫДАЧА ВЫГОВОРА\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "Шаг 1/3 — Ник нарушителя\n\n"
+        "Шаг 1/5 — Ник нарушителя\n\n"
         "✖️ Для отмены — /cancel"
     )
     return PUNISH_VIOLATOR
@@ -10089,7 +10217,7 @@ async def punish_violator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚖️ ВЫДАЧА ВЫГОВОРА\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "Шаг 2/3 — Нарушение\n\n"
+        "Шаг 2/5 — Нарушение\n\n"
         "✖️ Для отмены — /cancel"
     )
     return PUNISH_VIOLATION
@@ -10111,7 +10239,7 @@ async def punish_violation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚖️ ВЫДАЧА ВЫГОВОРА\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "Шаг 3/3 — Доказательство\n\n"
+        "Шаг 3/5 — Доказательство\n\n"
         "✖️ Для отмены — /cancel"
     )
     return PUNISH_EVIDENCE
@@ -10178,7 +10306,7 @@ async def punish_evidence_text(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(
         "⚖️ ВЫДАЧА ВЫГОВОРА\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "🏛 Фракция нарушителя",
+        "Шаг 4/5 — Фракция нарушителя",
         reply_markup=_punish_kb_faction(),
     )
     return PUNISH_FACTION
@@ -10201,7 +10329,7 @@ async def punish_faction_callback(update: Update, context: ContextTypes.DEFAULT_
             "⚖️ ВЫДАЧА ВЫГОВОРА\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"🏛 Фракция: {faction}\n\n"
-            "📊 Стало выговоров",
+            "Шаг 5/5 — Стало выговоров",
             reply_markup=_punish_kb_warns(),
         )
     except Exception:
@@ -10427,6 +10555,7 @@ def main():
         'areport_info': areport_info, 'aspeciallist': aspeciallist,
         'adepartment': adepartment, 'asetalldept': asetalldept,
         'atest': atest, 'find': find, 
+        'afindsetup': afindsetup,
         'apoll_create': apoll_create, 'avote': avote, 'aadd': aadd, 'apoll_info': apoll_info, 'apoll_close': apoll_close, 'apolls': apolls,
         'atag': atag, 'atagdept': atagdept,
         'agrant': agrant, 'arevoke': arevoke, 'aperms': aperms, 'agrantlist': agrantlist, 'agrantcmds': agrantcmds,
@@ -10549,6 +10678,8 @@ def main():
     application.add_handler(CallbackQueryHandler(duel_callback, pattern=r'^duel:'))
     # Кубы
     application.add_handler(CallbackQueryHandler(cube_callback, pattern=r'^cube:'))
+    # Настройка видимости отделов в /find
+    application.add_handler(CallbackQueryHandler(afindsetup_callback, pattern=r'^findsetup:'))
     # Идеи: ответы юзеров и решения админов
     application.add_handler(CallbackQueryHandler(idea_callback, pattern=r'^idea:'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
