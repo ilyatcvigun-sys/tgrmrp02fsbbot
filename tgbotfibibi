@@ -7509,18 +7509,19 @@ async def handle_my_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_data:
         return
     
-    # Проверяем КД
+    # Проверяем КД: лимит 1 в день, сброс ровно в 00:00 МСК.
+    # Если последний запрос был сегодня (по МСК) — отказываем до полуночи.
     last_at = _get_last_article_at(user.id)
     if last_at is not None:
-        elapsed = now_msk() - last_at
-        cooldown = timedelta(hours=ARTICLE_COOLDOWN_HOURS)
-        if elapsed < cooldown:
-            remaining = cooldown - elapsed
+        # «Полночь следующего календарного дня после last_at» — момент сброса лимита
+        reset_at = last_at.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        if now_msk() < reset_at:
+            remaining = reset_at - now_msk()
             await update.message.reply_text(
                 "⚖️ Картотека УК РФ\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 f"Сегодня ты уже получал статью.\n"
-                f"⏳ Следующий запрос через: {format_duration(remaining)}"
+                f"⏳ Сброс в 00:00 МСК — через {format_duration(remaining)}."
             )
             return
     
@@ -7564,7 +7565,7 @@ async def handle_my_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚖️ {article['name']}\n"
         f"💭 {article['joke']}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"⏳ Следующая статья — через {ARTICLE_COOLDOWN_HOURS}ч."
+        f"⏳ Следующая статья — после 00:00 МСК."
     )
 
 
