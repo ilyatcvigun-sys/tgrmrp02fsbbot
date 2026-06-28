@@ -56,6 +56,8 @@ GAME_NICK, CALLSIGN = range(2)
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
 # States для /apunish (форма выдачи наказания, только в личке).
 PUNISH_VIOLATOR, PUNISH_VIOLATION, PUNISH_EVIDENCE, PUNISH_FACTION, PUNISH_WARNS, PUNISH_CONFIRM = range(20, 26)
+# State для интерактивного меню настройки доступов /apermsmenu (главный админ).
+PERMS_USER = 30
 
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 ADMIN_IDS = [8026911824]
@@ -1719,6 +1721,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Кнопка выдачи выговора — модераторам с 4 ранга (или со спецдоступом).
         if rank >= 4 or has_special_access(user_id):
             keyboard.append([KeyboardButton("🚓 Выдать выговор")])
+        # Кнопка настройки доступов — только главному админу.
+        if is_main_admin(user_id):
+            keyboard.append([KeyboardButton("🎫 Доступы")])
         
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         permissions = get_user_permissions(user_id)
@@ -10521,6 +10526,180 @@ async def punish_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ============ ИНТЕРАКТИВНОЕ МЕНЮ ДОСТУПОВ (/apermsmenu) ============
+# Только главный админ. Открывает меню «выбери юзера → набор галочек по командам».
+# Тык на галочку — мгновенно выдаёт или снимает индивидуальный грант через
+# grant_command_access / revoke_command_access. Параллельно работают и старые
+# команды /agrant, /arevoke — это просто более удобный UI поверх них.
+
+
+def _perms_kb_for_user(target_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура: один ряд на грантовую команду + её состояние ✅/⬜."""
+    granted = {g[0] for g in list_user_grants(target_id)}
+    rows = []
+    # Сортируем для стабильного отображения
+    for cmd in sorted(GRANTABLE_COMMANDS):
+        marker = "✅" if cmd in granted else "⬜"
+        rows.append([
+            InlineKeyboardButton(f"{marker} /{cmd}",
+                                 callback_data=f"perms:tog:{target_id}:{cmd}")
+        ])
+    rows.append([InlineKeyboardButton("👤 Другой пользователь", callback_data="perms:another")])
+    rows.append([InlineKeyboardButton("✖️ Закрыть", callback_data="perms:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _perms_text_for_user(target_id: int) -> str:
+    ud = get_user_data(target_id)
+    name = ud['nick'] if ud else f"id {target_id}"
+    callsign = f" ({ud['callsign']})" if ud and ud.get('callsign') else ""
+    rank = ud['rank'] if ud else None
+    rank_name = RANKS.get(rank, RANKS[0])['name'] if rank is not None else "—"
+    granted_count = len(list_user_grants(target_id))
+    
+    return (
+        "🎫 НАСТРОЙКА ДОСТУПОВ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {name}{callsign}\n"
+        f"⭐ Ранг: {rank_name}\n"
+        f"🎫 Грантов: {granted_count} из {len(GRANTABLE_COMMANDS)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Жмите на команду — переключит грант.\n"
+        "✅ — есть индивидуальный грант  ⬜ — нет"
+    )
+
+
+async def apermsmenu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открыть интерактивное меню настройки доступов. Только главный админ, только в ЛС."""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return ConversationHandler.END
+    
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ Эта команда работает только в личке с ботом.")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "🎫 НАСТРОЙКА ДОСТУПОВ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Введите ник, @username или ID пользователя,\n"
+        "которому нужно настроить доступы.\n\n"
+        "✖️ Для отмены — /cancel"
+    )
+    return PERMS_USER
+
+
+async def apermsmenu_pick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг: получили ник/@/ID — ищем юзера и показываем меню грантов."""
+    text = (update.message.text or "").strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        await update.message.reply_text("✖️ Отменено.")
+        return ConversationHandler.END
+    
+    target_id = extract_user_id(update, context, text)
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text(
+            "❌ Пользователь не найден. Попробуйте ещё раз — введите ник, @username или ID.\n"
+            "✖️ Для отмены — /cancel"
+        )
+        return PERMS_USER
+    
+    ud = get_user_data(target_id)
+    if not ud:
+        await update.message.reply_text(
+            "❌ Этот пользователь не зарегистрирован в боте.\n"
+            "Введите другого или /cancel."
+        )
+        return PERMS_USER
+    
+    await update.message.reply_text(
+        _perms_text_for_user(target_id),
+        reply_markup=_perms_kb_for_user(target_id),
+    )
+    return ConversationHandler.END  # дальше — через callback
+
+
+async def apermsmenu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопки меню грантов. Паттерны:
+      perms:tog:<target_id>:<cmd>  — переключить грант
+      perms:another                — выбрать другого юзера (запустить /apermsmenu заново)
+      perms:close                  — закрыть меню
+    """
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_main_admin(user_id):
+        await query.answer("❌ Нет прав.", show_alert=True)
+        return
+    
+    parts = (query.data or "").split(":")
+    if len(parts) < 2:
+        await query.answer()
+        return
+    action = parts[1]
+    
+    if action == 'close':
+        await query.answer("Закрыто.")
+        try:
+            await query.edit_message_text("🎫 Меню доступов закрыто.")
+        except Exception:
+            pass
+        return
+    
+    if action == 'another':
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "🎫 НАСТРОЙКА ДОСТУПОВ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Чтобы выбрать другого — вызовите /apermsmenu заново."
+            )
+        except Exception:
+            pass
+        return
+    
+    if action == 'tog' and len(parts) >= 4:
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
+        cmd = ":".join(parts[3:])  # на всякий случай — если в имени окажется ':'
+        if cmd not in GRANTABLE_COMMANDS:
+            await query.answer("❌ Команда не в списке грантовых.", show_alert=True)
+            return
+        
+        if has_command_access(target_id, cmd):
+            revoke_command_access(target_id, cmd)
+            log_action(user_id, 'revoke_command', target_id, f"/{cmd} (через меню)")
+            await query.answer(f"⬜ Снят грант на /{cmd}")
+        else:
+            grant_command_access(target_id, cmd, user_id)
+            log_action(user_id, 'grant_command', target_id, f"/{cmd} (через меню)")
+            await query.answer(f"✅ Выдан грант на /{cmd}")
+        
+        # Перерисовываем меню с обновлёнными галочками
+        try:
+            await query.edit_message_text(
+                _perms_text_for_user(target_id),
+                reply_markup=_perms_kb_for_user(target_id),
+            )
+        except Exception:
+            pass
+        return
+    
+    await query.answer()
+
+
+async def apermsmenu_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сброс /cancel в ConversationHandler меню."""
+    await update.message.reply_text("✖️ Отменено.")
+    return ConversationHandler.END
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -10650,6 +10829,22 @@ def main():
         per_chat=True,
     )
     application.add_handler(punish_handler)
+    
+    # Интерактивное меню настройки доступов (только главный админ).
+    # Стартует через команду /apermsmenu или reply-keyboard «🎫 Доступы».
+    perms_menu_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('apermsmenu', apermsmenu),
+            MessageHandler(filters.Regex('^🎫 Доступы$') & filters.ChatType.PRIVATE, apermsmenu),
+        ],
+        states={
+            PERMS_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, apermsmenu_pick_user)],
+        },
+        fallbacks=[CommandHandler('cancel', apermsmenu_cancel)],
+        per_chat=True,
+    )
+    application.add_handler(perms_menu_handler)
+    application.add_handler(CallbackQueryHandler(apermsmenu_callback, pattern=r'^perms:'))
     
     # КРИТИЧНО: gate отрезает заблокированных юзеров в ЛС ДО любой другой обработки.
     # group=-2 → раньше track_username и всего остального.
