@@ -139,17 +139,18 @@ RANKS = {
 DEPARTMENTS_INITIAL = [
     "🎯 Руководящий состав",
     "🔍 Начальник ОСБ",
+    "⚡️ Командир Управления 'A'",
     "🔍 Первый заместитель Начальник ОСБ ФСБ",
-    "⚡ Командир Управления 'A' ",
+    "⚡️ Заместитель командира Управления 'A'",
     "🛡 6-я служба ОСБ ФСБ - Куратор МВД",
     "🚁 6-я служба ОСБ ФСБ - Куратор МО",
     "💻 6-я служба ОСБ ФСБ - Куратор ФСИН",
-    "🏥 6-я служба ОСБ ФСБ - Заместитель куратора МВД",
+    "🚔 6-я служба ОСБ ФСБ - Заместитель куратора МВД",
     "🏥 6-я служба ОСБ ФСБ - Заместитель куратора МО",
     "🏥 6-я служба ОСБ ФСБ - Заместитель куратора ФСИН",
-    "⚡ Заместитель командира Управления 'A' ",
-    "⚡ Оперативник Управления 'A' ",
-    "📡 Оперативно-розыскной отдел 2-й службы ФСБ "
+    "🦅 Младший оперуполномоченный по государственным организациям",
+    "⚡️ Оперативник Управления 'A'",
+    "📡 Оперативно-розыскной отдел 2-й службы ФСБ",
 ]
 
 AWARDS = {
@@ -637,6 +638,14 @@ def init_database():
         name TEXT UNIQUE NOT NULL
     )''')
     
+    # Группы отделов («большие группы», в которые входят отделы). Если у отдела
+    # group_id = NULL — он показывается «без группы».
+    c.execute('''CREATE TABLE IF NOT EXISTS department_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        sort_order INTEGER DEFAULT 0
+    )''')
+    
     # Миграция: добавляем флаг видимости отдела в /find.
     # Если колонки ещё нет — это первая миграция: воспроизводим прежнее
     # поведение `depts[:-2]`, то есть скрываем последние два отдела.
@@ -651,6 +660,21 @@ def init_database():
         logger.info(f"departments.show_in_find: миграция применена, скрыто {min(2, len(dept_ids))} отделов")
     except sqlite3.OperationalError:
         pass  # колонка уже есть
+    
+    # Миграция: порядок отображения. По умолчанию = id (сохраняем текущий вид).
+    try:
+        c.execute('ALTER TABLE departments ADD COLUMN sort_order INTEGER DEFAULT 0')
+        c.execute('UPDATE departments SET sort_order = id WHERE sort_order = 0 OR sort_order IS NULL')
+        logger.info("departments.sort_order: миграция применена")
+    except sqlite3.OperationalError:
+        pass
+    
+    # Миграция: привязка к группе. NULL = без группы.
+    try:
+        c.execute('ALTER TABLE departments ADD COLUMN group_id INTEGER')
+        logger.info("departments.group_id: миграция применена")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS polls (
@@ -1667,13 +1691,17 @@ def get_report(report_id: int) -> dict:
     return None
 
 
-async def forward_report_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_files: list):
+async def forward_report_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                media_files: list, message_thread_id: int = None):
     """
-    Отправляет прикреплённые к жалобе медиа в указанный чат.
-    Каждый файл отправляется в правильный метод (photo/video/document/voice/etc).
+    Отправляет прикреплённые к жалобе медиа в указанный чат (и опционально в конкретный
+    форум-топик). Каждый файл идёт в правильный метод (photo/video/document/voice/etc).
     """
     if not media_files:
         return
+    extra = {}
+    if message_thread_id is not None:
+        extra['message_thread_id'] = message_thread_id
     for m in media_files:
         kind = m.get('type', '')
         fid = m.get('file_id', '')
@@ -1682,21 +1710,21 @@ async def forward_report_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             continue
         try:
             if kind == 'photo':
-                await context.bot.send_photo(chat_id, fid, caption=cap)
+                await context.bot.send_photo(chat_id, fid, caption=cap, **extra)
             elif kind == 'video':
-                await context.bot.send_video(chat_id, fid, caption=cap)
+                await context.bot.send_video(chat_id, fid, caption=cap, **extra)
             elif kind == 'document':
-                await context.bot.send_document(chat_id, fid, caption=cap)
+                await context.bot.send_document(chat_id, fid, caption=cap, **extra)
             elif kind == 'voice':
-                await context.bot.send_voice(chat_id, fid, caption=cap)
+                await context.bot.send_voice(chat_id, fid, caption=cap, **extra)
             elif kind == 'video_note':
-                await context.bot.send_video_note(chat_id, fid)
+                await context.bot.send_video_note(chat_id, fid, **extra)
             elif kind == 'audio':
-                await context.bot.send_audio(chat_id, fid, caption=cap)
+                await context.bot.send_audio(chat_id, fid, caption=cap, **extra)
             elif kind == 'animation':
-                await context.bot.send_animation(chat_id, fid, caption=cap)
+                await context.bot.send_animation(chat_id, fid, caption=cap, **extra)
         except Exception as e:
-            logger.debug(f"forward_report_media: {kind} {fid} → chat {chat_id}: {e}")
+            logger.debug(f"forward_report_media: {kind} {fid} → chat {chat_id} thread {message_thread_id}: {e}")
         await asyncio.sleep(0.05)
 
 # ============ КОМАНДЫ ============
@@ -4916,34 +4944,59 @@ async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Руководящий состав"""
+    """Руководящий состав. Отделы группируются по department_groups и сортируются по sort_order."""
     user_data = get_user_data(update.effective_user.id)
     if not user_data:
         await update.message.reply_text("❌ Вы не зарегистрированы.")
         return
     
-    # Отделы для отображения — берём из таблицы departments по флагу show_in_find.
-    # Управление набором — через /afindsetup (главный админ).
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT name FROM departments WHERE show_in_find = 1 ORDER BY id')
-    depts = [r[0] for r in c.fetchall()]
+    c.execute(
+        '''SELECT id, name, COALESCE(sort_order, id) AS so, group_id
+           FROM departments
+           WHERE show_in_find = 1
+           ORDER BY so, id'''
+    )
+    depts = c.fetchall()
+    
+    # Группы — для заголовков
+    c.execute('SELECT id, name FROM department_groups ORDER BY COALESCE(sort_order, id), id')
+    groups = {gid: gname for gid, gname in c.fetchall()}
+    
+    # Группируем отделы по group_id (сохраняя порядок sort_order)
+    sections = {}
+    section_order = []
+    for dept_id, name, so, group_id in depts:
+        key = group_id  # может быть None
+        if key not in sections:
+            sections[key] = []
+            section_order.append(key)
+        sections[key].append((name, dept_id))
     
     text = "👥 РУКОВОДЯЩИЙ СОСТАВ:\n\n"
     total = 0
     
-    for dept in depts:
-        c.execute('SELECT game_nick, callsign, rank FROM users WHERE department = ? ORDER BY rank DESC', (dept,))
-        members = c.fetchall()
-        if members:
-            text += f"📁 {dept}:\n"
-            for m in members:
-                text += f"├ {m[1]} ({m[0]}) — {RANKS.get(m[2], RANKS[0])['name']}\n"
-            text += "\n"
-            total += len(members)
+    for group_id in section_order:
+        if group_id is not None and group_id in groups:
+            text += f"━━━━━━━━━━━━━━━━━\n📁 {groups[group_id]}\n━━━━━━━━━━━━━━━━━\n"
+        for dept_name, _did in sections[group_id]:
+            c.execute(
+                'SELECT game_nick, callsign, rank FROM users WHERE department = ? ORDER BY rank DESC',
+                (dept_name,),
+            )
+            members = c.fetchall()
+            if members:
+                text += f"📁 {dept_name}:\n"
+                for m in members:
+                    text += f"├ {m[1]} ({m[0]}) — {RANKS.get(m[2], RANKS[0])['name']}\n"
+                text += "\n"
+                total += len(members)
     
     conn.close()
     text += f"👥 Всего в руководстве: {total}"
+    if len(text) > 4000:
+        text = text[:3997] + "..."
     await update.message.reply_text(text)
 
 
@@ -5054,6 +5107,334 @@ async def afindsetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     await query.answer()
+
+
+# ============ УПРАВЛЕНИЕ ОТДЕЛАМИ И ГРУППАМИ ============
+# Все команды доступны только главному админу (или со спецдоступом).
+
+def _depts_admin_check(user_id: int) -> bool:
+    return is_main_admin(user_id) or has_special_access(user_id)
+
+
+async def adept_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать все отделы с id / порядком / группой."""
+    user_id = update.effective_user.id
+    if not _depts_admin_check(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу или со спецдоступом.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, name FROM department_groups ORDER BY COALESCE(sort_order, id), id')
+    groups = {gid: name for gid, name in c.fetchall()}
+    c.execute(
+        '''SELECT id, name, COALESCE(sort_order, id), group_id, COALESCE(show_in_find, 1)
+           FROM departments ORDER BY COALESCE(sort_order, id), id'''
+    )
+    rows = c.fetchall()
+    conn.close()
+    
+    lines = ["🗂 ОТДЕЛЫ", "━━━━━━━━━━━━━━━━━"]
+    for i, (did, name, so, group_id, show) in enumerate(rows, 1):
+        marker = "✅" if show else "⬜"
+        group_label = f" [📁 {groups.get(group_id, '—')}]" if group_id else ""
+        lines.append(f"{i}. {marker} #{did} (порядок {so}) — {name}{group_label}")
+    
+    if groups:
+        lines.append("")
+        lines.append("📁 ГРУППЫ:")
+        for gid, gname in groups.items():
+            lines.append(f"  #{gid} — {gname}")
+    
+    lines.append("")
+    lines.append("Управление:")
+    lines.append("/adept_rename <id> <новое_имя>")
+    lines.append("/adept_move <id> <порядок>")
+    lines.append("/adept_group_add <название>")
+    lines.append("/adept_group_del <id>")
+    lines.append("/adept_group_assign <dept_id> <group_id|0>")
+    lines.append("/adept_apply_template — применить дефолтный шаблон")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def adept_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/adept_rename <dept_id> <новое имя>. Синхронизирует users.department."""
+    user_id = update.effective_user.id
+    if not _depts_admin_check(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    
+    if len(context.args or []) < 2:
+        await update.message.reply_text("❌ Использование: /adept_rename <id> <новое_имя>")
+        return
+    try:
+        dept_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ id должен быть числом.")
+        return
+    new_name = ' '.join(context.args[1:]).strip()
+    if not new_name:
+        await update.message.reply_text("❌ Пустое имя.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT name FROM departments WHERE id = ?', (dept_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        await update.message.reply_text("❌ Отдел не найден.")
+        return
+    old_name = row[0]
+    
+    try:
+        c.execute('UPDATE departments SET name = ? WHERE id = ?', (new_name, dept_id))
+        # Синхронизируем привязку юзеров
+        c.execute('UPDATE users SET department = ? WHERE department = ?', (new_name, old_name))
+        affected = c.rowcount
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        await update.message.reply_text(f"❌ Не удалось (имя уже используется?): {e}")
+        return
+    conn.close()
+    
+    log_action(user_id, 'dept_renamed', None, f"#{dept_id}: «{old_name}» → «{new_name}» (users: {affected})")
+    await update.message.reply_text(
+        f"✅ Отдел #{dept_id} переименован\n"
+        f"📝 Было: {old_name}\n"
+        f"📝 Стало: {new_name}\n"
+        f"👥 Привязок юзеров обновлено: {affected}"
+    )
+
+
+async def adept_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/adept_move <dept_id> <sort_order>. Изменить порядок (меньше — выше)."""
+    user_id = update.effective_user.id
+    if not _depts_admin_check(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    if len(context.args or []) < 2:
+        await update.message.reply_text("❌ Использование: /adept_move <id> <число_порядка>")
+        return
+    try:
+        dept_id = int(context.args[0])
+        new_order = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ id и порядок должны быть числами.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE departments SET sort_order = ? WHERE id = ?', (new_order, dept_id))
+    if c.rowcount == 0:
+        conn.close()
+        await update.message.reply_text("❌ Отдел не найден.")
+        return
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'dept_moved', None, f"#{dept_id} → sort_order={new_order}")
+    await update.message.reply_text(f"✅ Отдел #{dept_id} → порядок {new_order}.")
+
+
+async def adept_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/adept_group_add <название>. Создать новую группу отделов."""
+    user_id = update.effective_user.id
+    if not _depts_admin_check(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    name = ' '.join(context.args or []).strip()
+    if not name:
+        await update.message.reply_text("❌ Использование: /adept_group_add <название>")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute(
+            'INSERT INTO department_groups (name, sort_order) VALUES (?, (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM department_groups))',
+            (name,),
+        )
+        gid = c.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        await update.message.reply_text("❌ Группа с таким именем уже есть.")
+        return
+    conn.close()
+    log_action(user_id, 'dept_group_created', None, f"#{gid} «{name}»")
+    await update.message.reply_text(f"✅ Создана группа #{gid} — «{name}»")
+
+
+async def adept_group_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/adept_group_del <id>. Удалить группу. Отделы из неё становятся «без группы»."""
+    user_id = update.effective_user.id
+    if not _depts_admin_check(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /adept_group_del <id>")
+        return
+    try:
+        gid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ id должен быть числом.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT name FROM department_groups WHERE id = ?', (gid,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        await update.message.reply_text("❌ Группа не найдена.")
+        return
+    gname = row[0]
+    # Отвязываем отделы
+    c.execute('UPDATE departments SET group_id = NULL WHERE group_id = ?', (gid,))
+    detached = c.rowcount
+    c.execute('DELETE FROM department_groups WHERE id = ?', (gid,))
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'dept_group_deleted', None, f"#{gid} «{gname}» (отделов отвязано: {detached})")
+    await update.message.reply_text(
+        f"🗑 Группа #{gid} «{gname}» удалена.\n"
+        f"📁 Отделов отвязано: {detached}"
+    )
+
+
+async def adept_group_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/adept_group_assign <dept_id> <group_id|0>. 0 = убрать из группы."""
+    user_id = update.effective_user.id
+    if not _depts_admin_check(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    if len(context.args or []) < 2:
+        await update.message.reply_text("❌ Использование: /adept_group_assign <dept_id> <group_id|0>")
+        return
+    try:
+        dept_id = int(context.args[0])
+        group_id = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Оба ID должны быть числами.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT name FROM departments WHERE id = ?', (dept_id,))
+    drow = c.fetchone()
+    if not drow:
+        conn.close()
+        await update.message.reply_text("❌ Отдел не найден.")
+        return
+    if group_id == 0:
+        c.execute('UPDATE departments SET group_id = NULL WHERE id = ?', (dept_id,))
+        conn.commit()
+        conn.close()
+        log_action(user_id, 'dept_group_assigned', None, f"dept #{dept_id} → без группы")
+        await update.message.reply_text(f"✅ «{drow[0]}» убран из группы.")
+        return
+    
+    c.execute('SELECT name FROM department_groups WHERE id = ?', (group_id,))
+    grow = c.fetchone()
+    if not grow:
+        conn.close()
+        await update.message.reply_text("❌ Группа не найдена.")
+        return
+    c.execute('UPDATE departments SET group_id = ? WHERE id = ?', (group_id, dept_id))
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'dept_group_assigned', None, f"dept #{dept_id} «{drow[0]}» → group #{group_id} «{grow[0]}»")
+    await update.message.reply_text(f"✅ «{drow[0]}» → группа «{grow[0]}».")
+
+
+async def adept_apply_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Применить дефолтный шаблон DEPARTMENTS_INITIAL: исправляет порядок и имена.
+    Сопоставление по «ядру» названия — отрезаем эмодзи в начале и сравниваем оставшийся текст.
+    Существующие записи переименовываются (с синхронизацией users), отсутствующие добавляются.
+    Используется один раз для приведения порядка после миграции.
+    """
+    user_id = update.effective_user.id
+    if not _depts_admin_check(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    
+    # Подтверждение
+    if not context.args or context.args[0].lower() != 'confirm':
+        await update.message.reply_text(
+            "⚠️ ПРИМЕНИТЬ ДЕФОЛТНЫЙ ШАБЛОН ОТДЕЛОВ?\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Команда:\n"
+            "• обновит имена и эмодзи всех текущих отделов\n"
+            "• установит порядок согласно шаблону\n"
+            "• добавит недостающие отделы\n"
+            "• обновит привязки пользователей к переименованным отделам\n\n"
+            "Если согласны — отправьте:\n"
+            "/adept_apply_template confirm"
+        )
+        return
+    
+    def _core(name: str) -> str:
+        """Убирает эмодзи/пробелы в начале и нормализует пробелы — для сравнения."""
+        if not name:
+            return ""
+        s = name.strip()
+        # Срезаем все ведущие не-буквенные символы (эмодзи, пробелы)
+        i = 0
+        while i < len(s) and not (s[i].isalpha() or s[i].isdigit()):
+            i += 1
+        s = s[i:].strip()
+        return ' '.join(s.split()).lower()
+    
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, name FROM departments')
+    existing = c.fetchall()
+    existing_by_core = {_core(name): (did, name) for did, name in existing}
+    
+    actions = {'renamed': 0, 'added': 0, 'reordered': 0, 'users_synced': 0}
+    
+    for new_so, new_name in enumerate(DEPARTMENTS_INITIAL, start=1):
+        core = _core(new_name)
+        if core in existing_by_core:
+            did, old_name = existing_by_core[core]
+            if old_name != new_name:
+                c.execute('UPDATE departments SET name = ? WHERE id = ?', (new_name, did))
+                c.execute('UPDATE users SET department = ? WHERE department = ?', (new_name, old_name))
+                actions['users_synced'] += c.rowcount
+                actions['renamed'] += 1
+            c.execute('UPDATE departments SET sort_order = ? WHERE id = ?', (new_so, did))
+            actions['reordered'] += 1
+        else:
+            try:
+                c.execute('INSERT INTO departments (name, sort_order, show_in_find) VALUES (?, ?, 1)',
+                          (new_name, new_so))
+                actions['added'] += 1
+            except sqlite3.IntegrityError:
+                pass  # на всякий случай
+    
+    conn.commit()
+    conn.close()
+    
+    log_action(user_id, 'dept_template_applied', None,
+               f"renamed={actions['renamed']} added={actions['added']} "
+               f"reordered={actions['reordered']} users_synced={actions['users_synced']}")
+    
+    await update.message.reply_text(
+        "✅ ШАБЛОН ПРИМЕНЁН\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📝 Переименовано: {actions['renamed']}\n"
+        f"➕ Добавлено: {actions['added']}\n"
+        f"🔢 Порядок обновлён: {actions['reordered']}\n"
+        f"👥 Привязок юзеров: {actions['users_synced']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Проверьте: /adept_list и /find"
+    )
 
 
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6664,6 +7045,13 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
             ),
             message_thread_id=VERDICT_TOPIC_ID,
         )
+        # Доказательства (фото/видео и т.д.) тоже шлём в тот же топик после карточки
+        media = report.get('media_files') or []
+        if media:
+            await forward_report_media(
+                context, CONFERENCE_CHAT_ID, media,
+                message_thread_id=VERDICT_TOPIC_ID,
+            )
     except Exception:
         pass
     
@@ -10475,7 +10863,11 @@ async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         message_id = sent.message_id
         if media:
-            await forward_report_media(context, CONFERENCE_CHAT_ID, media)
+            # Медиа летят в тот же топик, что и карточка
+            await forward_report_media(
+                context, CONFERENCE_CHAT_ID, media,
+                message_thread_id=VERDICT_TOPIC_ID,
+            )
     except Exception as e:
         logger.error(f"apunish publish failed: {e}")
         await query.answer("Ошибка публикации, см. логи.", show_alert=True)
@@ -10736,6 +11128,9 @@ def main():
         'adepartment': adepartment, 'asetalldept': asetalldept,
         'atest': atest, 'find': find, 
         'afindsetup': afindsetup,
+        'adept_list': adept_list, 'adept_rename': adept_rename, 'adept_move': adept_move,
+        'adept_group_add': adept_group_add, 'adept_group_del': adept_group_del,
+        'adept_group_assign': adept_group_assign, 'adept_apply_template': adept_apply_template,
         'apoll_create': apoll_create, 'avote': avote, 'aadd': aadd, 'apoll_info': apoll_info, 'apoll_close': apoll_close, 'apolls': apolls,
         'atag': atag, 'atagdept': atagdept,
         'agrant': agrant, 'arevoke': arevoke, 'aperms': aperms, 'agrantlist': agrantlist, 'agrantcmds': agrantcmds,
