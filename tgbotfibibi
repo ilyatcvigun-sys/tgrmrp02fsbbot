@@ -951,12 +951,33 @@ def init_database():
         CREATE TABLE IF NOT EXISTS topic_violations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            kind TEXT,                       -- 'cubes' | 'article'
+            kind TEXT,                       -- 'cubes' | 'article' | 'wedding'
             occurred_at TEXT DEFAULT ''
         )
     ''')
     try:
         c.execute('CREATE INDEX IF NOT EXISTS idx_topic_violations_user ON topic_violations(user_id, occurred_at)')
+    except sqlite3.OperationalError:
+        pass
+    
+    # Браки (Iris-style «пары»). Один user может быть в одном active-браке.
+    # При разводе запись не удаляется — статус 'divorced' (для истории).
+    # Соглашение: user1_id < user2_id (упорядочиваем при INSERT для уникальности).
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS marriages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user1_id INTEGER NOT NULL,
+            user2_id INTEGER NOT NULL,
+            married_at TEXT NOT NULL,          -- 'YYYY-MM-DD HH:MM:SS'
+            married_by INTEGER,                 -- user_id того, кто поженил
+            status TEXT DEFAULT 'active',       -- active | divorced
+            divorced_at TEXT,
+            divorced_by INTEGER
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_marriages_u1 ON marriages(user1_id, status)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_marriages_u2 ON marriages(user2_id, status)')
     except sqlite3.OperationalError:
         pass
     
@@ -1758,7 +1779,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🤖 БОТ КОНФЕРЕНЦИИ\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"👋 С возвращением, {user_data['callsign']}!\n"
+            f"👋 С возвращением, {user_data['nick']}!\n"
             f"⭐ {permissions['name']}\n"
             "━━━━━━━━━━━━━━━━━\n"
             "Выберите действие на клавиатуре ниже\n"
@@ -1827,6 +1848,10 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /aduel_stats [@user] — статистика дуэлей\n"
         "├ /acubes [@user] — кубы 🎲 (без аргумента — открытый вызов)\n"
         "├ /acubes_stats [@user] — статистика кубов\n"
+        "├ /amarry @user1 @user2 — поженить пару 💍\n"
+        "├ /adivorce @user — развести пару 💔\n"
+        "├ /awedding [@user] — карточка пары\n"
+        "├ /aweddings_list — все пары\n"
         "├ /achangelog [id] — обновления бота\n"
         "├ /achangelog_list — список обновлений\n"
         "├ /aidea_submit <текст> — предложить идею для улучшения бота\n"
@@ -2555,7 +2580,7 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await kick_user_from_chat(update, context, target_id)
     
     target_data = get_user_data(target_id)
-    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    target_name = target_data['nick'] if target_data else f"User {target_id}"
     confirm = (
         f"🚫 ОЧС (тихо)\n"
         f"👤 {target_name}\n"
@@ -2606,7 +2631,7 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     success, message, kicked = add_warning(target_id, user_id, reason)
     target_data = get_user_data(target_id)
-    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    target_name = target_data['nick'] if target_data else f"User {target_id}"
     
     if success:
         log_action(user_id, 'warn', target_id, reason or '')
@@ -2641,7 +2666,7 @@ async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     target_data = get_user_data(target_id)
-    target_name = target_data['callsign'] if target_data else f"User {target_id}"
+    target_name = target_data['nick'] if target_data else f"User {target_id}"
     current_warns = target_data['warns']
     warns = get_warn_list(target_id)
     
@@ -2681,7 +2706,7 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     current_warns = target_data['warns']
     if current_warns == "0/0":
-        await update.message.reply_text(f"❌ У {target_data['callsign']} нет предов.")
+        await update.message.reply_text(f"❌ У {target_data['nick']} нет предов.")
         return
     
     parts = current_warns.split('/')
@@ -2718,7 +2743,7 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"✅ Снят {removed_type} пред\n"
-        f"👤 {target_data['callsign']}\n"
+        f"👤 {target_data['nick']}\n"
         f"⚠️ Было: {current_warns} → Стало: {new_warns}"
     )
     await notify_user(context, target_id,
@@ -2752,7 +2777,7 @@ async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     old_warns = target_data['warns']
     if old_warns == "0/0":
-        await update.message.reply_text(f"❌ У {target_data['callsign']} нет предупреждений.")
+        await update.message.reply_text(f"❌ У {target_data['nick']} нет предупреждений.")
         return
     
     conn = sqlite3.connect(DB_FILE)
@@ -2763,7 +2788,7 @@ async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     
     await update.message.reply_text(
-        f"✅ Все предупреждения сняты\n👤 {target_data['callsign']}\n"
+        f"✅ Все предупреждения сняты\n👤 {target_data['nick']}\n"
         f"⚠️ Было: {old_warns} → Стало: 0/0"
     )
 
@@ -4773,7 +4798,7 @@ async def areset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     
     target_data = get_user_data(target_id)
-    await update.message.reply_text(f"✅ {target_data['callsign']} сброшен.")
+    await update.message.reply_text(f"✅ {target_data['nick']} сброшен.")
 
 async def adelete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаление пользователя"""
@@ -4803,7 +4828,7 @@ async def adelete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     blocked_users.discard(target_id)
     
-    await update.message.reply_text(f"✅ {target_data['callsign']} удалён.")
+    await update.message.reply_text(f"✅ {target_data['nick']} удалён.")
 
 async def aglobal_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Массовый разбан"""
@@ -5508,7 +5533,7 @@ async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success, message = set_user_token(target_id, new_token)
     if success:
         target_data = get_user_data(target_id)
-        await update.message.reply_text(f"✅ {target_data['callsign']}\n🎫 {new_token}")
+        await update.message.reply_text(f"✅ {target_data['nick']}\n🎫 {new_token}")
     else:
         await update.message.reply_text(f"❌ {message}")
 
@@ -5703,7 +5728,7 @@ async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_action(user_id, 'unban', target_id)
         
         target_data = get_user_data(target_id)
-        target_name = target_data['callsign'] if target_data else f"User {target_id}"
+        target_name = target_data['nick'] if target_data else f"User {target_id}"
         issuer_name = get_admin_nick(user_id)
         await update.message.reply_text(
             "✅ РАЗБАН\n"
@@ -7153,7 +7178,7 @@ async def aspecial(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "выдан ✅"
     
     await notify_user(context, target_id, f"🔐 Спецдопуск {status}!\n👮 Выдал: {user_data['nick']}")
-    await update.message.reply_text(f"🔐 Спецдопуск {status}\n👤 {target_data['callsign']}")
+    await update.message.reply_text(f"🔐 Спецдопуск {status}\n👤 {target_data['nick']}")
 
 async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Полная информация по ID"""
@@ -8044,10 +8069,18 @@ async def cube_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _cube_text_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, accept: bool):
-    """Принять или отклонить вызов в кубы текстом «кубы да» / «кубы нет»."""
+    """Принять или отклонить вызов в кубы текстом «кубы да» / «кубы нет».
+    
+    Тоже проверяет топик — в неправильном кубы запрещены, как и сам вызов.
+    """
     user_id = update.effective_user.id
     if not get_user_data(user_id):
         return  # тихо — фраза могла быть случайной
+    
+    # Проверка топика: в конфе работает только в игровом топике
+    if not _is_in_games_topic(update):
+        await _handle_topic_violation(update, context, kind='cubes')
+        return
     
     chat_id = update.effective_chat.id
     
@@ -8202,7 +8235,7 @@ def _format_top_list(top: list, *, with_articles: bool = True) -> str:
     lines = []
     for i, entry in enumerate(top):
         ud = get_user_data(entry['user_id'])
-        name = ud['callsign'] if ud else f"id {entry['user_id']}"
+        name = ud['nick'] if ud else f"id {entry['user_id']}"
         medal = medals[i] if i < 3 else f"{i + 1}."
         lines.append(f"{medal} {name} — {entry['total']} ст.")
         if with_articles and entry['top_articles'] and i < 3:
@@ -8272,7 +8305,7 @@ async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     
     leader = top[0]
     ud = get_user_data(leader['user_id'])
-    name = ud['callsign'] if ud else f"id {leader['user_id']}"
+    name = ud['nick'] if ud else f"id {leader['user_id']}"
     
     lines = [
         "🏆 ГЛАВНЫЙ ПРЕСТУПНИК ДНЯ",
@@ -8289,7 +8322,7 @@ async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
         lines.append("📊 Серебро и бронза:")
         for i, entry in enumerate(top[1:], 2):
             ud2 = get_user_data(entry['user_id'])
-            n2 = ud2['callsign'] if ud2 else f"id {entry['user_id']}"
+            n2 = ud2['nick'] if ud2 else f"id {entry['user_id']}"
             medal = "🥈" if i == 2 else "🥉"
             lines.append(f"  {medal} {n2} — {entry['total']} ст.")
     
@@ -8297,7 +8330,11 @@ async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     lines.append("💡 Свою судьбу можно узнать фразой «моя статья».")
     
     try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text="\n".join(lines))
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text="\n".join(lines),
+            message_thread_id=GAMES_ALLOWED_TOPIC_ID,
+        )
     except Exception as e:
         logger.error(f"daily_criminal_job send error: {e}")
 
@@ -8322,7 +8359,11 @@ async def weekly_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     if len(text) > 4000:
         text = text[:3997] + "..."
     try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            text=text,
+            message_thread_id=GAMES_ALLOWED_TOPIC_ID,
+        )
     except Exception as e:
         logger.error(f"weekly_criminal_job send error: {e}")
 
@@ -9154,6 +9195,8 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
     n1 = p1['nick'] if p1 else f"id {cube['p1_id']}"
     n2 = p2['nick'] if p2 else f"id {cube['p2_id']}"
     chat_id = cube['chat_id']
+    # В конференции броски летят в игровой топик; в ЛС — без указания топика.
+    dice_extra = {'message_thread_id': GAMES_ALLOWED_TOPIC_ID} if chat_id == CONFERENCE_CHAT_ID else {}
     
     # === Этап 1: сообщение про первый бросок ===
     stage1_text = f"🎲 Первый бросок кубика совершает {n1}"
@@ -9168,7 +9211,7 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
     
     # === Этап 2: сам кубик ===
     try:
-        msg1 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲")
+        msg1 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲", **dice_extra)
         roll1 = msg1.dice.value
     except Exception as e:
         logger.error(f"cube send_dice p1 error: {e}")
@@ -9193,7 +9236,7 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
     
     # === Этап 4: второй кубик ===
     try:
-        msg2 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲")
+        msg2 = await context.bot.send_dice(chat_id=chat_id, emoji="🎲", **dice_extra)
         roll2 = msg2.dice.value
     except Exception as e:
         logger.error(f"cube send_dice p2 error: {e}")
@@ -11092,6 +11135,518 @@ async def apermsmenu_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ============ ПАРЫ / БРАКИ (Iris-style) ============
+# /amarry — поженить, /adivorce — развести, /awedding — карточка пары,
+# /aweddings_list — все активные, /awedding_setdate — изменить дату.
+# В чате конфы текстовые триггеры («поженить пару», «наша пара», «пары», «стаж»…)
+# работают ТОЛЬКО в игровом топике; в неправильном — санкция.
+
+
+def _format_marriage_duration(td: timedelta) -> str:
+    """«X лет, Y мес., Z дн.» для красивого отображения стажа."""
+    if td.total_seconds() < 0:
+        td = timedelta(0)
+    total_days = td.days
+    years = total_days // 365
+    rem = total_days - years * 365
+    months = rem // 30
+    days = rem - months * 30
+    parts = []
+    if years:
+        parts.append(f"{years} {'год' if years == 1 else ('года' if 2 <= years <= 4 else 'лет')}")
+    if months:
+        parts.append(f"{months} мес.")
+    if days or not parts:
+        parts.append(f"{days} {'день' if days == 1 else ('дня' if 2 <= days <= 4 else 'дней')}")
+    return ", ".join(parts)
+
+
+def _get_active_marriage(user_id: int) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        '''SELECT * FROM marriages
+           WHERE status = 'active' AND (user1_id = ? OR user2_id = ?)
+           ORDER BY married_at DESC LIMIT 1''',
+        (user_id, user_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _create_marriage(u1: int, u2: int, by: int, married_at_str: str = None) -> int:
+    """Создать активный брак. Возвращает id или 0 если кто-то уже в браке."""
+    if _get_active_marriage(u1) or _get_active_marriage(u2):
+        return 0
+    a, b = sorted([u1, u2])
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''INSERT INTO marriages (user1_id, user2_id, married_at, married_by, status)
+           VALUES (?, ?, ?, ?, 'active')''',
+        (a, b, married_at_str or now_msk_str(), by),
+    )
+    mid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return mid
+
+
+def _divorce_marriage(marriage_id: int, by: int) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE marriages SET status = 'divorced', divorced_at = ?, divorced_by = ?
+           WHERE id = ? AND status = 'active' ''',
+        (now_msk_str(), by, marriage_id),
+    )
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def _set_marriage_date(marriage_id: int, new_at_str: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE marriages SET married_at = ? WHERE id = ?', (new_at_str, marriage_id))
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def _parse_marriage_date(s: str) -> str:
+    """Парсит дату из «ДД.ММ.ГГГГ», «ГГГГ-ММ-ДД» или «ДД.ММ.ГГГГ ЧЧ:ММ».
+    Возвращает строку в формате БД ('YYYY-MM-DD HH:MM:SS') или пусто."""
+    s = s.strip()
+    formats = [
+        "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d/%m/%Y", "%d-%m-%Y",
+    ]
+    for f in formats:
+        try:
+            dt = datetime.strptime(s, f)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return ""
+
+
+def _format_marriage_card(m: dict, *, header: str = "💍 ПАРА") -> str:
+    u1 = get_user_data(m['user1_id'])
+    u2 = get_user_data(m['user2_id'])
+    n1 = u1['nick'] if u1 else f"id {m['user1_id']}"
+    n2 = u2['nick'] if u2 else f"id {m['user2_id']}"
+    married_at = m['married_at']
+    try:
+        dt = datetime.strptime(married_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+        duration = _format_marriage_duration(now_msk() - dt)
+        date_view = dt.strftime("%d.%m.%Y")
+    except Exception:
+        duration = "—"
+        date_view = married_at
+    status_line = ""
+    if m['status'] == 'divorced':
+        try:
+            ddt = datetime.strptime(m['divorced_at'], "%Y-%m-%d %H:%M:%S")
+            status_line = f"\n💔 Разведены: {ddt.strftime('%d.%m.%Y')}"
+        except Exception:
+            status_line = "\n💔 Разведены"
+    return (
+        f"{header} #{m['id']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"💕 {n1} ❤️ {n2}\n"
+        f"📅 В браке с: {date_view}\n"
+        f"⏳ Стаж: {duration}"
+        + status_line
+    )
+
+
+async def _resolve_two_targets(update, context, args, *, expect_reply=False):
+    """
+    Возвращает кортеж (uid1, uid2) для команд женитьбы.
+    Источники:
+      - reply на сообщение → один из таргетов; второй ищется в args
+      - args содержит два упоминания/ника → оба
+    None в любом из значений — не нашли.
+    """
+    reply_uid = None
+    if _is_real_reply(update.message):
+        reply_uid = update.message.reply_to_message.from_user.id
+    
+    arg_uids = []
+    for raw in args:
+        uid = extract_user_id(update, context, raw)
+        if isinstance(uid, str) and uid.startswith('@'):
+            uid = await get_target_id(update, context, uid)
+        if uid in (None, -1):
+            continue
+        if uid not in arg_uids:
+            arg_uids.append(uid)
+    
+    if reply_uid:
+        # reply + хотя бы один аргумент
+        if arg_uids:
+            partner = next((u for u in arg_uids if u != reply_uid), None)
+            return reply_uid, partner
+        return reply_uid, None
+    
+    # Без reply — оба из args
+    if len(arg_uids) >= 2:
+        return arg_uids[0], arg_uids[1]
+    if len(arg_uids) == 1:
+        return arg_uids[0], None
+    return None, None
+
+
+def _can_manage_marriages(user_id: int) -> bool:
+    """Кто может женить/разводить. 4+ ранг или спецдоступ."""
+    ud = get_user_data(user_id)
+    if not ud:
+        return False
+    return ud.get('rank', 0) >= 4 or has_special_access(user_id)
+
+
+async def amarry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Поженить двоих. Доступно с 4 ранга или со спецдоступом.
+    
+    /amarry @u1 @u2           — оба явно
+    /amarry @u2  (reply на u1) — reply задаёт первого
+    """
+    user_id = update.effective_user.id
+    if not _can_manage_marriages(user_id):
+        await update.message.reply_text("❌ Поженить может только с 4 ранга или со спецдоступом.")
+        return
+    
+    # В конфе — только в игровом топике
+    if not _is_in_games_topic(update):
+        await _handle_topic_violation(update, context, kind='wedding')
+        return
+    
+    u1, u2 = await _resolve_two_targets(update, context, context.args or [])
+    if not u1 or not u2:
+        await update.message.reply_text(
+            "❌ Использование: /amarry @user1 @user2 (или ответом + @user2)"
+        )
+        return
+    if u1 == u2:
+        await update.message.reply_text("❌ С собой жениться нельзя.")
+        return
+    
+    d1 = get_user_data(u1)
+    d2 = get_user_data(u2)
+    if not d1 or not d2:
+        await update.message.reply_text("❌ Один из пользователей не зарегистрирован.")
+        return
+    
+    # Проверка — не в браке ли уже
+    m1 = _get_active_marriage(u1)
+    m2 = _get_active_marriage(u2)
+    if m1 or m2:
+        msgs = []
+        if m1:
+            other_id = m1['user2_id'] if m1['user1_id'] == u1 else m1['user1_id']
+            other = get_user_data(other_id)
+            msgs.append(f"• {d1['nick']} уже в браке с {other['nick'] if other else other_id}")
+        if m2:
+            other_id = m2['user2_id'] if m2['user1_id'] == u2 else m2['user1_id']
+            other = get_user_data(other_id)
+            msgs.append(f"• {d2['nick']} уже в браке с {other['nick'] if other else other_id}")
+        await update.message.reply_text("❌ Не получилось:\n" + "\n".join(msgs))
+        return
+    
+    mid = _create_marriage(u1, u2, user_id)
+    if not mid:
+        await update.message.reply_text("❌ Не получилось зарегистрировать брак.")
+        return
+    
+    log_action(user_id, 'marry', None, f"#{mid}: {d1['nick']} + {d2['nick']}")
+    
+    issuer = get_user_data(user_id)
+    issuer_nick = issuer['nick'] if issuer else f"id {user_id}"
+    await update.message.reply_text(
+        "💍 ОБЪЯВЛЯЮ ВАС МУЖЕМ И ЖЕНОЙ!\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"💕 {d1['nick']} ❤️ {d2['nick']}\n"
+        f"📅 Дата брака: {now_msk_str('%d.%m.%Y')}\n"
+        f"👮 Расписал: {issuer_nick}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"🎉 Совет да любовь! Карточка пары: #{mid}"
+    )
+
+
+async def adivorce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Развести пару. Указываете одного из супругов — найдём активный брак.
+    
+    /adivorce @user     — по упоминанию
+    /adivorce  (reply)  — по реплаю
+    """
+    user_id = update.effective_user.id
+    if not _can_manage_marriages(user_id):
+        await update.message.reply_text("❌ Развести может только с 4 ранга или со спецдоступом.")
+        return
+    
+    if not _is_in_games_topic(update):
+        await _handle_topic_violation(update, context, kind='wedding')
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Использование: /adivorce @user (или reply).")
+        return
+    
+    m = _get_active_marriage(target_id)
+    if not m:
+        td = get_user_data(target_id)
+        await update.message.reply_text(f"ℹ️ {(td['nick'] if td else 'Этот пользователь')} не в активном браке.")
+        return
+    
+    d1 = get_user_data(m['user1_id'])
+    d2 = get_user_data(m['user2_id'])
+    n1 = d1['nick'] if d1 else f"id {m['user1_id']}"
+    n2 = d2['nick'] if d2 else f"id {m['user2_id']}"
+    
+    if not _divorce_marriage(m['id'], user_id):
+        await update.message.reply_text("❌ Не удалось развести.")
+        return
+    
+    log_action(user_id, 'divorce', None, f"#{m['id']}: {n1} + {n2}")
+    
+    try:
+        dt = datetime.strptime(m['married_at'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+        stage = _format_marriage_duration(now_msk() - dt)
+    except Exception:
+        stage = "—"
+    
+    await update.message.reply_text(
+        "💔 РАЗВЕДЕНЫ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{n1} ✖️ {n2}\n"
+        f"⏳ Прожили в браке: {stage}\n"
+        f"📅 {now_msk_str('%d.%m.%Y')}"
+    )
+
+
+async def awedding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Показать карточку пары.
+    
+    /awedding          — свою
+    /awedding @user    — чужую
+    """
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    target_id = user_id
+    if context.args:
+        t = extract_user_id(update, context, context.args[0])
+        if isinstance(t, str) and t.startswith('@'):
+            t = await get_target_id(update, context, t)
+        if t not in (None, -1):
+            target_id = t
+    elif _is_real_reply(update.message):
+        target_id = update.message.reply_to_message.from_user.id
+    
+    m = _get_active_marriage(target_id)
+    if not m:
+        td = get_user_data(target_id)
+        name = td['nick'] if td else f"id {target_id}"
+        await update.message.reply_text(f"💔 {name} сейчас не в браке.")
+        return
+    
+    await update.message.reply_text(_format_marriage_card(m))
+
+
+async def aweddings_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список всех активных пар, отсортирован по стажу (старше — выше)."""
+    if not get_user_data(update.effective_user.id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM marriages WHERE status = 'active' ORDER BY married_at ASC")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    
+    if not rows:
+        await update.message.reply_text(
+            "💍 ПАРЫ\n━━━━━━━━━━━━━━━━━\nАктивных браков пока нет."
+        )
+        return
+    
+    lines = ["💍 АКТИВНЫЕ ПАРЫ", "━━━━━━━━━━━━━━━━━"]
+    for m in rows:
+        u1 = get_user_data(m['user1_id'])
+        u2 = get_user_data(m['user2_id'])
+        n1 = u1['nick'] if u1 else f"id {m['user1_id']}"
+        n2 = u2['nick'] if u2 else f"id {m['user2_id']}"
+        try:
+            dt = datetime.strptime(m['married_at'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+            stage = _format_marriage_duration(now_msk() - dt)
+            d = dt.strftime("%d.%m.%Y")
+        except Exception:
+            stage, d = "—", m['married_at']
+        lines.append(f"💕 #{m['id']} {n1} ❤️ {n2}\n   📅 {d} · ⏳ {stage}")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append(f"Всего: {len(rows)}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def awedding_setdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Изменить дату брака. Принимаются форматы ДД.ММ.ГГГГ или ГГГГ-ММ-ДД (можно с временем).
+    
+    /awedding_setdate @user ДД.ММ.ГГГГ
+    /awedding_setdate #<id> ДД.ММ.ГГГГ
+    """
+    user_id = update.effective_user.id
+    if not _can_manage_marriages(user_id):
+        await update.message.reply_text("❌ Изменить дату может только с 4 ранга или со спецдоступом.")
+        return
+    
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "❌ Использование:\n"
+            "/awedding_setdate @user ДД.ММ.ГГГГ\n"
+            "или /awedding_setdate #ID_пары ДД.ММ.ГГГГ"
+        )
+        return
+    
+    target_arg = args[0]
+    date_arg = ' '.join(args[1:])
+    
+    m = None
+    if target_arg.startswith('#'):
+        try:
+            mid = int(target_arg[1:])
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом после #.")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM marriages WHERE id = ?", (mid,))
+        row = c.fetchone()
+        conn.close()
+        m = dict(row) if row else None
+    else:
+        target_id = extract_user_id(update, context, target_arg)
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id in (None, -1):
+            await update.message.reply_text("❌ Пользователь не найден.")
+            return
+        m = _get_active_marriage(target_id)
+    
+    if not m:
+        await update.message.reply_text("❌ Пара не найдена.")
+        return
+    
+    new_at = _parse_marriage_date(date_arg)
+    if not new_at:
+        await update.message.reply_text(
+            "❌ Не понял дату. Поддерживаются: ДД.ММ.ГГГГ, ДД.ММ.ГГГГ ЧЧ:ММ, ГГГГ-ММ-ДД."
+        )
+        return
+    
+    if not _set_marriage_date(m['id'], new_at):
+        await update.message.reply_text("❌ Не удалось обновить.")
+        return
+    
+    log_action(user_id, 'marriage_setdate', None, f"#{m['id']}: → {new_at}")
+    
+    # Перечитываем для свежей карточки
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM marriages WHERE id = ?", (m['id'],))
+    fresh = dict(c.fetchone())
+    conn.close()
+    
+    await update.message.reply_text(
+        "✅ Дата брака обновлена\n" + _format_marriage_card(fresh)
+    )
+
+
+async def wedding_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Текстовый триггер пар:
+      «поженить пару @u1 @u2»  — /amarry
+      «развести пару @user»    — /adivorce
+      «наша пара» / «моя пара» — /awedding (свою)
+      «пара @user»             — /awedding @user
+      «пары» / «список пар»    — /aweddings_list
+      «стаж» / «стаж брака»    — стаж своего брака (=awedding)
+    """
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    parts = text.split()
+    if not parts:
+        return
+    
+    first = parts[0].lower()
+    
+    # «поженить пару …»
+    if first == "поженить" and len(parts) >= 2 and parts[1].lower() == "пару":
+        context.args = parts[2:]
+        await amarry(update, context)
+        return
+    
+    # «развести пару …»
+    if first == "развести" and len(parts) >= 2 and parts[1].lower() == "пару":
+        context.args = parts[2:]
+        await adivorce(update, context)
+        return
+    
+    # «список пар»
+    if first == "список" and len(parts) >= 2 and parts[1].lower() == "пар":
+        await aweddings_list(update, context)
+        return
+    
+    # «пары» (одно слово)
+    if first == "пары" and len(parts) == 1:
+        await aweddings_list(update, context)
+        return
+    
+    # «наша пара» / «моя пара»
+    if first in ("наша", "моя") and len(parts) >= 2 and parts[1].lower() == "пара":
+        context.args = parts[2:]  # обычно пусто, но вдруг @user — пусть awedding разберётся
+        await awedding(update, context)
+        return
+    
+    # «пара @user» (одно слово + опционально @user)
+    if first == "пара":
+        context.args = parts[1:]
+        await awedding(update, context)
+        return
+    
+    # «стаж» / «стаж брака»
+    if first == "стаж":
+        # Это просмотр своего брака
+        context.args = []
+        await awedding(update, context)
+        return
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -11144,6 +11699,8 @@ def main():
         'areloadarticles': areloadarticles,
         'aduel': aduel, 'aduel_stats': aduel_stats,
         'acubes': acubes, 'acubes_stats': acubes_stats,
+        'amarry': amarry, 'adivorce': adivorce, 'awedding': awedding,
+        'aweddings_list': aweddings_list, 'awedding_setdate': awedding_setdate,
         'achangelog': achangelog, 'achangelog_list': achangelog_list,
         'achangelog_add': achangelog_add, 'achangelog_draft': achangelog_draft,
         'achangelog_publish': achangelog_publish, 'achangelog_delete': achangelog_delete,
@@ -11289,6 +11846,8 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, duel_trigger_router), group=4)
     # «кубы ...» / «кто кубы» — текст-триггер, эквивалент /acubes. Тоже отдельная группа.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cube_trigger_router), group=5)
+    # «поженить пару» / «наша пара» / «пары» / «стаж» — текст-триггеры
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wedding_trigger_router), group=6)
     
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
