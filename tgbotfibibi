@@ -1842,136 +1842,206 @@ async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Справка по командам"""
+    """
+    Справка по командам. Каждая секция — раскрываемая цитата (blockquote expandable),
+    юзер может свернуть/развернуть по клику.
+    """
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
-
+    
+    # esc — экранирование HTML в служебных символах (`<user>` → `&lt;user&gt;`)
+    def esc(s: str) -> str:
+        return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    
     sections = []
-
+    
+    # ─── Для всех ───
     sections.append(
-        "👥 ДЛЯ ВСЕХ\n"
-        "├ /start — главное меню\n"
-        "├ /ainfo — краткая информация о вас\n"
-        "├ /aprofile — полный профиль\n"
-        "├ /astats — статистика бота\n"
-        "├ /aawards — ваши награды\n"
-        "├ /anick <имя> — поиск по нику\n"
-        "├ /asearch <жетон> — поиск по жетону\n"
-        "├ /find — руководящий состав\n"
-        "├ /awarns — ваши предупреждения\n"
-        "├ /aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
-        "├ /aukrating [day/week/month/all] — топ преступников\n"
-        "├ /aduel <@user> — вызвать на дуэль 🔫\n"
-        "├ /aduel_stats [@user] — статистика дуэлей\n"
-        "├ /acubes [@user] — кубы 🎲 (без аргумента — открытый вызов)\n"
-        "├ /acubes_stats [@user] — статистика кубов\n"
-        "├ /amarry @user1 @user2 — поженить пару 💍\n"
-        "├ /adivorce @user — развести пару 💔\n"
-        "├ /awedding [@user] — карточка пары\n"
-        "├ /aweddings_list — все пары\n"
-        "├ /anote @user <текст> — оставить пометку 📝\n"
-        "├ /anotes @user — посмотреть все пометки\n"
-        "├ /achangelog [id] — обновления бота\n"
-        "├ /achangelog_list — список обновлений\n"
-        "├ /aidea_submit <текст> — предложить идею для улучшения бота\n"
-        "├ /aideas [status] — список идей\n"
-        "├ /aidea_info <id> — детально про идею\n"
-        "├ /areport — подать жалобу\n"
-        "├ /check_gban — проверить ЧС\n"
-        "├ /aperms — ваши индивидуальные доступы\n"
-        "└ /amood — настроение конференции"
+        "👥 <b>ДЛЯ ВСЕХ</b>\n"
+        "<blockquote expandable>"
+        + esc(
+            "/start — главное меню\n"
+            "/ainfo — краткая информация о вас\n"
+            "/aprofile — полный профиль\n"
+            "/astats — статистика бота\n"
+            "/aawards — ваши награды\n"
+            "/anick <имя> — поиск по нику\n"
+            "/asearch <жетон> — поиск по жетону\n"
+            "/find — руководящий состав\n"
+            "/awarns — ваши предупреждения\n"
+            "/aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
+            "/aukrating [day/week/month/all] — топ преступников\n"
+            "/aduel <@user> — вызвать на дуэль 🔫\n"
+            "/aduel_stats [@user] — статистика дуэлей\n"
+            "/acubes [@user] — кубы 🎲 (без аргумента — открытый вызов)\n"
+            "/acubes_stats [@user] — статистика кубов\n"
+            "/amarry @user1 @user2 — поженить пару 💍\n"
+            "/adivorce @user — развести пару 💔\n"
+            "/awedding [@user] — карточка пары\n"
+            "/aweddings_list — все пары\n"
+            "/achangelog [id] — обновления бота\n"
+            "/achangelog_list — список обновлений\n"
+            "/aidea_submit <текст> — предложить идею для улучшения бота\n"
+            "/aideas [status] — список идей\n"
+            "/aidea_info <id> — детально про идею\n"
+            "/areport — подать жалобу\n"
+            "/check_gban — проверить ЧС\n"
+            "/aperms — ваши индивидуальные доступы\n"
+            "/amood — настроение конференции"
+        )
+        + "</blockquote>"
     )
-
+    
+    # ─── 4+ ранг ───
     if rank >= 4:
         sections.append(
-            "🎖 ПОДПОЛКОВНИК (4+)\n"
-            "├ /areports — список жалоб\n"
-            "├ /areport_info <id> — карточка жалобы\n"
-            "├ /arequests — заявки на смену ранга/отдела\n"
-            "├ /arequest_info <id> — карточка заявки\n"
-            "├ /ahistory <user> — история пользователя\n"
-            "├ /atag <user(s)> <текст> — тегнуть людей\n"
-            "├ /atagdept <номер> <текст> — тегнуть отдел\n"
-            "└ /acallsign — смена позывного"
+            "🎖 <b>ПОДПОЛКОВНИК (4+)</b>\n"
+            "<blockquote expandable>"
+            + esc(
+                "/areports — список жалоб\n"
+                "/areport_info <id> — карточка жалобы\n"
+                "/arequests — заявки на смену ранга/отдела\n"
+                "/arequest_info <id> — карточка заявки\n"
+                "/ahistory <user> — история пользователя\n"
+                "/atag <user(s)> <текст> — тегнуть людей\n"
+                "/atagdept <номер> <текст> — тегнуть отдел\n"
+                "/acallsign — смена позывного\n"
+                "/apunish — выдать выговор (форма в личке) ⚖️\n"
+                "/anote @user <текст> — оставить пометку 📝\n"
+                "/anotes @user — посмотреть все пометки\n"
+                "/anote_del <id> — удалить свою пометку\n"
+                "/anote_edit <id> <текст> — редактировать\n"
+                "/anote_pin <id> — закрепить пометку 📌"
+            )
+            + "</blockquote>"
         )
-
+    
+    # ─── 5+ ранг ───
     if rank >= 5:
         sections.append(
-            "🛡 ПОЛКОВНИК (5+)\n"
-            "├ /akick <user> [причина]\n"
-            "├ /aban <user> [длительность] [причина]\n"
-            "│   длительность: 30m | 2h | 7d | 1w (опц.)\n"
-            "├ /aunban <user>\n"
-            "├ /awarn <user> <причина>\n"
-            "├ /aunwarn <user>\n"
-            "├ /aunwarnall <user>\n"
-            "├ /asetrank <user> <0-7>\n"
-            "├ /asetdept <user> <номер>\n"
-            "├ /ablock <user> — отключить от бота\n"
-            "├ /aunblock <user> — подключить к боту\n"
-            "├ /ablocklist — список отключённых\n"
-            "├ /aaudit [@user] — журнал действий\n"
-            "├ /aadmins — список администрации\n"
-            "├ /auserlist — все участники\n"
-            "├ /awho <user> — чужой профиль\n"
-            "├ /abroadcast <текст> — рассылка\n"
-            "├ /adepartment add/remove/rename/list/find\n"
-            "└ /asetalldept <номер>"
+            "🛡 <b>ПОЛКОВНИК (5+)</b>\n"
+            "<blockquote expandable>"
+            + esc(
+                "/akick <user> [причина]\n"
+                "/aban <user> [длительность] [причина]\n"
+                "    длительность: 30m | 2h | 7d | 1w\n"
+                "/aunban <user>\n"
+                "/amute <user> [длительность] [причина] — мут 🤐\n"
+                "    (только в конференции; по умолчанию 30m)\n"
+                "/aunmute <user> — снять мут\n"
+                "/awarn <user> <причина>\n"
+                "/aunwarn <user>\n"
+                "/aunwarnall <user>\n"
+                "/asetrank <user> <0-7>\n"
+                "/asetdept <user> <номер>\n"
+                "/ablock <user> — отключить от бота\n"
+                "/aunblock <user> — подключить к боту\n"
+                "/ablocklist — список отключённых\n"
+                "/aaudit [@user] — журнал действий\n"
+                "/aadmins — список администрации\n"
+                "/auserlist — все участники\n"
+                "/awho <user> — чужой профиль\n"
+                "/abroadcast <текст> — рассылка\n"
+                "/adepartment add/remove/rename/list/find\n"
+                "/asetalldept <номер>"
+            )
+            + "</blockquote>"
         )
-
+    
+    # ─── 6 ранг ───
     if rank >= 6:
         sections.append(
-            "🌟 ГЕНЕРАЛ (6)\n"
-            "├ /asettoken <user> <52****>\n"
-            "├ /aregister <user> <ник> <позывной>\n"
-            "├ /aforcereg <user> <ник> <позывной> <жетон>\n"
-            "└ /achangelog <текст>"
+            "🌟 <b>ГЕНЕРАЛ (6)</b>\n"
+            "<blockquote expandable>"
+            + esc(
+                "/asettoken <user> <52****>\n"
+                "/aregister <user> <ник> <позывной>\n"
+                "/aforcereg <user> <ник> <позывной> <жетон>\n"
+                "/achangelog_add <текст> — создать changelog (черновик)\n"
+                "/achangelog_draft — собрать черновик из audit_log\n"
+                "/achangelog_publish [id] — опубликовать\n"
+                "/achangelog_delete <id>"
+            )
+            + "</blockquote>"
         )
-
+    
+    # ─── 7 ранг ───
     if rank >= 7:
         sections.append(
-            "⚜️ СЛЕДЯЩИЙ ЗА ФСБ (7)\n"
-            "├ /aspecial <user> — переключить спецдопуск\n"
-            "└ /aspeciallist — у кого спецдопуск"
+            "⚜️ <b>СЛЕДЯЩИЙ ЗА ФСБ (7)</b>\n"
+            "<blockquote expandable>"
+            + esc(
+                "/aspecial <user> — переключить спецдопуск\n"
+                "/aspeciallist — у кого спецдопуск"
+            )
+            + "</blockquote>"
         )
-
+    
+    # ─── Спецдопуск ───
     if has_special_access(user_id):
         sections.append(
-            "🔐 СПЕЦДОПУСК\n"
-            "├ /awhois <id>\n"
-            "├ /asetnick <user> <ник>\n"
-            "├ /gban <user> <причина>\n"
-            "├ /ungban <user>\n"
-            "├ /gban_list\n"
-            "├ /acheckall — запустить проверку ранга/отдела сейчас\n"
-            "├ /agrant <user> <cmd> — выдать доступ\n"
-            "├ /arevoke <user> <cmd> — отозвать доступ\n"
-            "├ /agrantlist <cmd> — кому выдан доступ\n"
-            "└ /agrantcmds — список грантуемых команд"
+            "🔐 <b>СПЕЦДОПУСК</b>\n"
+            "<blockquote expandable>"
+            + esc(
+                "/awhois <id>\n"
+                "/asetnick <user> <ник>\n"
+                "/gban <user> <причина>\n"
+                "/ungban <user>\n"
+                "/gban_list\n"
+                "/acheckall — запустить проверку ранга/отдела сейчас\n"
+                "/agrant <user> <cmd> — выдать доступ\n"
+                "/arevoke <user> <cmd> — отозвать доступ\n"
+                "/agrantlist <cmd> — кому выдан доступ\n"
+                "/agrantcmds — список грантуемых команд\n"
+                "/afindsetup — настроить видимость отделов в /find\n"
+                "/adept_list — все отделы\n"
+                "/adept_rename <id> <имя>\n"
+                "/adept_move <id> <порядок>\n"
+                "/adept_group_add <название>\n"
+                "/adept_group_del <id>\n"
+                "/adept_group_assign <dept_id> <group_id|0>\n"
+                "/adept_apply_template confirm — применить дефолтный шаблон\n"
+                "/aideas_start [текст] — запустить опрос идей\n"
+                "/aidea_to_changelog <id> — идея → черновик changelog"
+            )
+            + "</blockquote>"
         )
-
+    
+    # ─── Главный админ ───
     if is_main_admin(user_id):
         sections.append(
-            "👑 РАЗРАБОТЧИК\n"
-            "├ /asetadmin <user>\n"
-            "├ /aunsetadmin <user>\n"
-            "├ /aadminlist\n"
-            "├ /areset_user <user>\n"
-            "├ /adelete_user <user>\n"
-            "├ /abackup\n"
-            "├ /aglobal_unban\n"
-            "├ /asetallrank <0-7>\n"
-            "├ /agrant <user> <cmd> [cmd2 ...]\n"
-            "├ /arevoke <user> <cmd> | all\n"
-            "├ /agrantlist <cmd>\n"
-            "└ /agrantcmds"
+            "👑 <b>РАЗРАБОТЧИК</b>\n"
+            "<blockquote expandable>"
+            + esc(
+                "/asetadmin <user>\n"
+                "/aunsetadmin <user>\n"
+                "/aadminlist\n"
+                "/areset_user <user>\n"
+                "/adelete_user <user>\n"
+                "/abackup\n"
+                "/aglobal_unban\n"
+                "/asetallrank <0-7>\n"
+                "/apermsmenu — интерактивное меню доступов 🎫\n"
+                "/agrant <user> <cmd> [cmd2 ...]\n"
+                "/arevoke <user> <cmd> | all\n"
+                "/agrantlist <cmd>\n"
+                "/agrantcmds\n"
+                "/awedding_setdate <user|#id> ДД.ММ.ГГГГ"
+            )
+            + "</blockquote>"
         )
-
-    header = "📚 СПРАВКА ПО КОМАНДАМ\n━━━━━━━━━━━━━━━━━\n"
-    body = "\n\n".join(sections)
-    footer = "\n━━━━━━━━━━━━━━━━━\n💡 <user> — это @username, ID, ник, позывной или ответ на сообщение."
-    await update.message.reply_text(header + body + footer)
+    
+    text = "🤖 <b>СПРАВКА ПО КОМАНДАМ</b>\n" + "\n".join(sections)
+    if len(text) > 4000:
+        # Разбить по секциям чтоб уместиться. Простой вариант — два сообщения.
+        halfway = len(sections) // 2
+        first = "🤖 <b>СПРАВКА ПО КОМАНДАМ</b>\n" + "\n".join(sections[:halfway])
+        second = "\n".join(sections[halfway:])
+        await update.message.reply_text(first, parse_mode='HTML')
+        await update.message.reply_text(second, parse_mode='HTML')
+        return
+    await update.message.reply_text(text, parse_mode='HTML')
 
 async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подробный профиль"""
@@ -5724,6 +5794,179 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context, target_id,
         f"📢 Ваш отдел изменён!\n📁 Новый отдел: {new_dept}\n👮 Изменил: {issuer_name}",
     )
+
+async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Мут в конференции: запрещает отправлять сообщения на указанный срок.
+    Работает только в самой конференции (в Telegram мутить пользователя можно
+    только внутри группы, где он состоит).
+    
+    /amute @user 30m [причина]
+    /amute (reply) 30m [причина]
+    
+    Формат длительности: 30m | 2h | 7d | 1w. По умолчанию — 30 минут.
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'ban', 'amute'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    
+    # Мутить можно только в самой конференции — это ограничение Telegram
+    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+        await update.message.reply_text(
+            "❌ Мутить можно только внутри конференции. Напишите команду там."
+        )
+        return
+    
+    target_id = extract_user_id(update, context)
+    args = list(context.args or [])
+    if not target_id and args:
+        target_id = extract_user_id(update, context, args[0])
+        args = args[1:]
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Использование: /amute @user [длительность] [причина]")
+        return
+    
+    if target_id == user_id:
+        await update.message.reply_text("❌ Мутить себя не стоит.")
+        return
+    if is_main_admin(target_id):
+        await update.message.reply_text("❌ Главного админа мутить нельзя.")
+        return
+    
+    # Длительность и причина
+    duration = None
+    if args:
+        duration = parse_duration(args[0])
+        if duration:
+            args = args[1:]
+    if not duration:
+        duration = timedelta(minutes=30)  # дефолт
+    
+    reason = ' '.join(args).strip() or "—"
+    until_utc = datetime.now(timezone.utc) + duration
+    
+    # Применяем ограничения
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=CONFERENCE_CHAT_ID,
+            user_id=target_id,
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+            ),
+            until_date=until_utc,
+        )
+    except Exception as e:
+        logger.warning(f"amute failed for {target_id}: {e}")
+        await update.message.reply_text(
+            f"❌ Не удалось замутить: {e}\n"
+            "Проверьте что у бота есть право «Ограничивать пользователей»."
+        )
+        return
+    
+    td = get_user_data(target_id)
+    target_nick = td['nick'] if td else f"id {target_id}"
+    issuer_nick = get_admin_nick(user_id)
+    duration_view = format_duration(duration)
+    until_view = (now_msk() + duration).strftime("%d.%m.%Y %H:%M")
+    
+    log_action(user_id, 'mute', target_id, f"{duration_view}: {reason}")
+    
+    await update.message.reply_text(
+        "🤐 МУТ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {target_nick}\n"
+        f"⏳ Длительность: {duration_view}\n"
+        f"🕐 До: {until_view} МСК\n"
+        f"📝 Причина: {reason}\n"
+        f"👮 Замутил: {issuer_nick}"
+    )
+    # DM жертве (если бот с ней в ЛС)
+    await notify_user(
+        context, target_id,
+        f"🤐 Вам выдан мут в конференции\n"
+        f"⏳ На: {duration_view}\n"
+        f"📝 Причина: {reason}\n"
+        f"👮 Замутил: {issuer_nick}",
+    )
+
+
+async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Снять мут в конференции.
+    /aunmute @user   (или reply)
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'ban', 'aunmute'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+        await update.message.reply_text("❌ Работает только внутри конференции.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Использование: /aunmute @user (или reply).")
+        return
+    
+    # Восстанавливаем стандартные права участника чата
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=CONFERENCE_CHAT_ID,
+            user_id=target_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_change_info=False,
+                can_invite_users=True,
+                can_pin_messages=False,
+                can_manage_topics=False,
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"aunmute failed for {target_id}: {e}")
+        await update.message.reply_text(f"❌ Не удалось снять мут: {e}")
+        return
+    
+    td = get_user_data(target_id)
+    target_nick = td['nick'] if td else f"id {target_id}"
+    issuer_nick = get_admin_nick(user_id)
+    log_action(user_id, 'unmute', target_id, "")
+    
+    await update.message.reply_text(
+        "🔊 МУТ СНЯТ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {target_nick}\n"
+        f"👮 Снял: {issuer_nick}"
+    )
+    await notify_user(
+        context, target_id,
+        f"🔊 С вас снят мут в конференции.\n👮 Снял: {issuer_nick}",
+    )
+
 
 async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Разбан"""
@@ -11993,7 +12236,7 @@ def main():
     commands = {
         'start': start, 'ainfo': ainfo, 'ahelp': ahelp, 'aprofile': aprofile,
         'astats': astats, 'aawards': aawards, 'anick': anick, 'asearch': asearch,
-        'akick': akick, 'aban': aban, 'aunban': aunban, 'awarn': awarn,
+        'akick': akick, 'aban': aban, 'aunban': aunban, 'amute': amute, 'aunmute': aunmute, 'awarn': awarn,
         'awarns': awarns, 'awarnlist': awarns, 'aunwarn': aunwarn, 'aunwarnall': aunwarnall,
         'asetrank': asetrank, 'asetdept': asetdept, 'asettoken': asettoken,
         'aadmins': aadmins, 'auserlist': auserlist, 'awho': awhoprofile,
