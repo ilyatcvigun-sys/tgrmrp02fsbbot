@@ -981,6 +981,24 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Пометки на пользователей — досье модератора.
+    # Видны только тем, кто может /anotes (модераторам 4+).
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,          -- на кого пометка
+            author_id INTEGER NOT NULL,         -- кто оставил
+            text TEXT NOT NULL,
+            pinned INTEGER DEFAULT 0,           -- закреплён наверху
+            created_at TEXT DEFAULT '',
+            updated_at TEXT
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_notes_user ON user_notes(user_id, pinned DESC, id DESC)')
+    except sqlite3.OperationalError:
+        pass
+    
     # Публикации о выданных наказаниях (НЕ выдают реальный варн, только публикация).
     # media_files — JSON-список вложений как в reports.
     c.execute('''
@@ -1852,6 +1870,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "├ /adivorce @user — развести пару 💔\n"
         "├ /awedding [@user] — карточка пары\n"
         "├ /aweddings_list — все пары\n"
+        "├ /anote @user <текст> — оставить пометку 📝\n"
+        "├ /anotes @user — посмотреть все пометки\n"
         "├ /achangelog [id] — обновления бота\n"
         "├ /achangelog_list — список обновлений\n"
         "├ /aidea_submit <текст> — предложить идею для улучшения бота\n"
@@ -5495,12 +5515,23 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     award_count = len(awards) if awards else 0
     special_text = "🔐 Спецдопуск: Да\n" if has_special_access(target_id) else ""
     
+    # Пометки — короткая сводка (счётчик и закреплённая). Полный список — /anotes.
+    notes_line = ""
+    if _notes_can_read(user_id):
+        notes = _notes_get_all(target_id)
+        if notes:
+            pinned = [n for n in notes if n['pinned']]
+            notes_line = f"📝 Пометок: {len(notes)}"
+            if pinned:
+                notes_line += f" (📌 {len(pinned)})"
+            notes_line += " — /anotes @user\n"
+    
     await update.message.reply_text(
         f"👤 ПРОФИЛЬ\n\n"
         f"🎮 Ник: {user_data['nick']}\n📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['department']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
-        f"🏅 Наград: {award_count}\n{special_text}🆔 ID: {user_data['user_id']}\n"
+        f"🏅 Наград: {award_count}\n{special_text}{notes_line}🆔 ID: {user_data['user_id']}\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
 
@@ -11586,6 +11617,299 @@ async def awedding_setdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============ ПОМЕТКИ НА ПОЛЬЗОВАТЕЛЕЙ ============
+# «Досье модератора»: заметки о конкретных юзерах, видны только модераторам с 4+ рангом
+# (или со спецдоступом). Полезно чтобы сохранять контекст: «этот часто нарушает, но
+# исправляется» / «пытался пропушить через ЛС» / «оперативник, свой» и т.п.
+
+
+def _notes_can_read(user_id: int) -> bool:
+    """Кто видит пометки — 4+ ранг, спецдоступ или индивидуальный грант."""
+    ud = get_user_data(user_id)
+    if not ud:
+        return False
+    return (ud.get('rank', 0) >= 4
+            or has_special_access(user_id)
+            or has_permission(user_id, 'warn', 'anotes'))
+
+
+def _notes_get_all(user_id: int) -> list:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        '''SELECT * FROM user_notes WHERE user_id = ?
+           ORDER BY pinned DESC, id DESC''',
+        (user_id,),
+    )
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+
+def _notes_get(note_id: int) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM user_notes WHERE id = ?', (note_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _notes_add(user_id: int, author_id: int, text: str) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''INSERT INTO user_notes (user_id, author_id, text, created_at)
+           VALUES (?, ?, ?, ?)''',
+        (user_id, author_id, text, now_msk_str()),
+    )
+    nid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return nid
+
+
+def _notes_delete(note_id: int) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM user_notes WHERE id = ?', (note_id,))
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def _notes_edit(note_id: int, new_text: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'UPDATE user_notes SET text = ?, updated_at = ? WHERE id = ?',
+        (new_text, now_msk_str(), note_id),
+    )
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
+
+
+def _notes_toggle_pin(note_id: int) -> int:
+    """Переключает pinned. Возвращает новое значение (0/1) или -1 если не найдено."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT pinned FROM user_notes WHERE id = ?', (note_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return -1
+    new = 0 if row[0] else 1
+    c.execute('UPDATE user_notes SET pinned = ? WHERE id = ?', (new, note_id))
+    conn.commit()
+    conn.close()
+    return new
+
+
+def _format_notes_block(user_id: int, target_nick: str) -> str:
+    notes = _notes_get_all(user_id)
+    if not notes:
+        return f"📝 ПОМЕТКИ на «{target_nick}»\n━━━━━━━━━━━━━━━━━\nПометок нет."
+    
+    pinned_cnt = sum(1 for n in notes if n['pinned'])
+    lines = [f"📝 ПОМЕТКИ на «{target_nick}»", "━━━━━━━━━━━━━━━━━"]
+    for n in notes:
+        author = get_user_data(n['author_id'])
+        a_name = author['nick'] if author else f"id {n['author_id']}"
+        pin = "📌 " if n['pinned'] else ""
+        edited = " (ред.)" if n.get('updated_at') else ""
+        lines.append(f"{pin}#{n['id']} · {a_name} · {n['created_at']}{edited}")
+        lines.append(n['text'])
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append(f"Всего: {len(notes)}" + (f" (📌 закреплено: {pinned_cnt})" if pinned_cnt else ""))
+    lines.append("Управление: /anote_del <id> · /anote_edit <id> <текст> · /anote_pin <id>")
+    return "\n".join(lines)
+
+
+async def anote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Добавить пометку на юзера.
+    
+    /anote @user <текст>
+    /anote (reply) <текст>
+    """
+    user_id = update.effective_user.id
+    if not _notes_can_read(user_id):
+        await update.message.reply_text("❌ Пометки доступны с 4 ранга, со спецдоступом или с грантом.")
+        return
+    
+    args = list(context.args or [])
+    if not args and not _is_real_reply(update.message):
+        await update.message.reply_text(
+            "❌ Использование: /anote @user <текст пометки>\n"
+            "Или: (reply на юзера) /anote <текст пометки>"
+        )
+        return
+    
+    # Определяем цель
+    target_id = None
+    text_start = 0
+    if _is_real_reply(update.message):
+        target_id = update.message.reply_to_message.from_user.id
+    else:
+        first = args[0]
+        target_id = extract_user_id(update, context, first)
+        if isinstance(target_id, str) and target_id.startswith('@'):
+            target_id = await get_target_id(update, context, target_id)
+        if target_id in (None, -1):
+            await update.message.reply_text("❌ Пользователь не найден.")
+            return
+        text_start = 1
+    
+    note_text = ' '.join(args[text_start:]).strip()
+    if not note_text:
+        await update.message.reply_text("❌ Текст пометки пустой.")
+        return
+    if len(note_text) > 1000:
+        await update.message.reply_text("❌ Слишком длинно (макс 1000 символов).")
+        return
+    
+    td = get_user_data(target_id)
+    if not td:
+        await update.message.reply_text("❌ Целевой пользователь не зарегистрирован.")
+        return
+    
+    nid = _notes_add(target_id, user_id, note_text)
+    log_action(user_id, 'note_added', target_id, f"#{nid}: {note_text[:100]}")
+    
+    await update.message.reply_text(
+        f"✅ Пометка #{nid} на «{td['nick']}» сохранена."
+    )
+
+
+async def anotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Показать все пометки на юзере.
+    
+    /anotes @user
+    /anotes (reply)
+    """
+    user_id = update.effective_user.id
+    if not _notes_can_read(user_id):
+        await update.message.reply_text("❌ Пометки доступны с 4 ранга, со спецдоступом или с грантом.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Использование: /anotes @user (или reply).")
+        return
+    
+    td = get_user_data(target_id)
+    target_nick = td['nick'] if td else f"id {target_id}"
+    
+    text = _format_notes_block(target_id, target_nick)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def anote_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/anote_del <id>. Удалить свою пометку (главный админ — любую)."""
+    user_id = update.effective_user.id
+    if not _notes_can_read(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /anote_del <id>")
+        return
+    try:
+        nid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+    
+    n = _notes_get(nid)
+    if not n:
+        await update.message.reply_text("❌ Пометка не найдена.")
+        return
+    if n['author_id'] != user_id and not is_main_admin(user_id):
+        await update.message.reply_text("❌ Удалить свою пометку может только автор (или главный админ).")
+        return
+    
+    _notes_delete(nid)
+    log_action(user_id, 'note_deleted', n['user_id'], f"#{nid}: {n['text'][:100]}")
+    await update.message.reply_text(f"🗑 Пометка #{nid} удалена.")
+
+
+async def anote_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/anote_edit <id> <новый текст>. Редактировать свою пометку (главный админ — любую)."""
+    user_id = update.effective_user.id
+    if not _notes_can_read(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    args = list(context.args or [])
+    if len(args) < 2:
+        await update.message.reply_text("❌ Использование: /anote_edit <id> <новый текст>")
+        return
+    try:
+        nid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+    new_text = ' '.join(args[1:]).strip()
+    if not new_text:
+        await update.message.reply_text("❌ Новый текст пустой.")
+        return
+    if len(new_text) > 1000:
+        await update.message.reply_text("❌ Слишком длинно (макс 1000).")
+        return
+    
+    n = _notes_get(nid)
+    if not n:
+        await update.message.reply_text("❌ Пометка не найдена.")
+        return
+    if n['author_id'] != user_id and not is_main_admin(user_id):
+        await update.message.reply_text("❌ Редактировать может только автор (или главный админ).")
+        return
+    
+    _notes_edit(nid, new_text)
+    log_action(user_id, 'note_edited', n['user_id'], f"#{nid}: {new_text[:100]}")
+    await update.message.reply_text(f"✅ Пометка #{nid} обновлена.")
+
+
+async def anote_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/anote_pin <id>. Переключить закрепление (📌)."""
+    user_id = update.effective_user.id
+    if not _notes_can_read(user_id):
+        await update.message.reply_text("❌ Нет прав.")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /anote_pin <id>")
+        return
+    try:
+        nid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+    
+    n = _notes_get(nid)
+    if not n:
+        await update.message.reply_text("❌ Пометка не найдена.")
+        return
+    
+    new = _notes_toggle_pin(nid)
+    if new == -1:
+        await update.message.reply_text("❌ Ошибка обновления.")
+        return
+    log_action(user_id, 'note_pinned' if new else 'note_unpinned', n['user_id'], f"#{nid}")
+    label = "📌 закреплена" if new else "открепена"
+    await update.message.reply_text(f"✅ Пометка #{nid} {label}.")
+
+
 async def wedding_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Текстовый триггер пар:
@@ -11701,6 +12025,8 @@ def main():
         'acubes': acubes, 'acubes_stats': acubes_stats,
         'amarry': amarry, 'adivorce': adivorce, 'awedding': awedding,
         'aweddings_list': aweddings_list, 'awedding_setdate': awedding_setdate,
+        'anote': anote, 'anotes': anotes, 'anote_del': anote_del,
+        'anote_edit': anote_edit, 'anote_pin': anote_pin,
         'achangelog': achangelog, 'achangelog_list': achangelog_list,
         'achangelog_add': achangelog_add, 'achangelog_draft': achangelog_draft,
         'achangelog_publish': achangelog_publish, 'achangelog_delete': achangelog_delete,
