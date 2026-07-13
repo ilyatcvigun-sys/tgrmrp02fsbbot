@@ -1283,23 +1283,24 @@ def get_warn_list(user_id: int = None) -> list:
 
 def parse_duration(s: str):
     """
-    Парсит длительность вида '30m', '2h', '7d', '1w'. Возвращает timedelta или None.
-    Регистр игнорируется. Без суффикса — None (юзер не передал длительность).
+    Парсит длительность: '30m', '2h', '7d', '1w' и русские варианты
+    '30м'/'30мин', '2ч'/'2часа', '7д'/'7дн'/'7дней', '1н'/'1нед'.
+    Возвращает timedelta или None. Регистр игнорируется.
     """
     if not s:
         return None
-    m = re.match(r'^(\d+)([mhdw])$', s.strip().lower())
+    m = re.match(r'^(\d+)\s*([a-zа-яё]+)$', s.strip().lower())
     if not m:
         return None
     n = int(m.group(1))
     unit = m.group(2)
-    if unit == 'm':
+    if unit in ('m', 'min', 'м', 'мин', 'минут', 'минуты', 'минута'):
         return timedelta(minutes=n)
-    if unit == 'h':
+    if unit in ('h', 'ч', 'час', 'часа', 'часов'):
         return timedelta(hours=n)
-    if unit == 'd':
+    if unit in ('d', 'д', 'дн', 'день', 'дня', 'дней'):
         return timedelta(days=n)
-    if unit == 'w':
+    if unit in ('w', 'н', 'нед', 'неделя', 'недели', 'недель', 'неделю'):
         return timedelta(weeks=n)
     return None
 
@@ -5839,11 +5840,38 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Длительность и причина
     duration = None
     if args:
-        duration = parse_duration(args[0])
-        if duration:
-            args = args[1:]
+        first = args[0].strip()
+        # Двухсловная форма: «30 минут», «2 часа», «7 дней», «1 неделя»
+        if first.isdigit() and len(args) >= 2:
+            combined = parse_duration(f"{first} {args[1].strip()}")
+            if combined:
+                duration = combined
+                args = args[2:]
+        if duration is None:
+            if first.isdigit():
+                # Голое число — трактуем как минуты
+                duration = timedelta(minutes=int(first))
+                args = args[1:]
+            else:
+                duration = parse_duration(first)
+                if duration:
+                    args = args[1:]
+                elif re.match(r'^\d', first):
+                    # Начинается с цифры, но не распозналось («2часика», «30 m» и т.п.)
+                    await update.message.reply_text(
+                        f"❌ Не понял длительность «{first}».\n"
+                        "Форматы: 30m / 30м / 30 минут / 2h / 2ч / 2 часа / 7d / 7 дней / 1w / 1 неделя, либо просто число (минуты)."
+                    )
+                    return
     if not duration:
         duration = timedelta(minutes=30)  # дефолт
+    
+    # Лимиты Telegram: until_date < 30 сек или > 366 дней = мут навсегда.
+    # Ограничиваем диапазон, чтобы не замутить кого-то навечно случайно.
+    if duration < timedelta(minutes=1):
+        duration = timedelta(minutes=1)
+    if duration > timedelta(days=365):
+        duration = timedelta(days=365)
     
     reason = ' '.join(args).strip() or "—"
     until_utc = datetime.now(timezone.utc) + duration
