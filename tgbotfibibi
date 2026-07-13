@@ -70,6 +70,9 @@ DB_FILE = str(DATA_DIR / "conference.db")
 
 VERDICT_TOPIC_ID = 40224
 CONFERENCE_CHAT_ID = -1003389197905
+# Приватная группа-лог личной переписки с ботом (только владелец + бот).
+# Сюда зеркалируются ВСЕ сообщения, которые пользователи пишут боту в ЛС.
+PM_LOG_CHAT_ID = -5560646647
 # Топик, в котором разрешены игры (кубы, моя статья).
 # В других топиках конференции эти команды наказываются — см. _handle_topic_violation.
 GAMES_ALLOWED_TOPIC_ID = 52562
@@ -2568,13 +2571,23 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
         return
     
-    # Первый оставшийся аргумент может быть длительностью
+    # Первый оставшийся аргумент может быть длительностью.
+    # Поддерживается и двухсловная форма: «7 дней», «2 часа», «1 неделя».
+    # Голое число БЕЗ единицы в /aban длительностью НЕ считается (в отличие от
+    # /amute) — чтобы причина вида «3 варна» не превращалась в бан на 3 минуты.
     duration_td = None
     if args:
-        d = parse_duration(args[0])
-        if d is not None:
-            duration_td = d
-            args = args[1:]
+        first = args[0].strip()
+        if first.isdigit() and len(args) >= 2:
+            combined = parse_duration(f"{first} {args[1].strip()}")
+            if combined:
+                duration_td = combined
+                args = args[2:]
+        if duration_td is None:
+            d = parse_duration(first)
+            if d is not None:
+                duration_td = d
+                args = args[1:]
     reason = ' '.join(args).strip() if args else "Без причины"
     
     banned_until_str = None
@@ -7905,6 +7918,148 @@ async def track_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.debug(f"track_username error: {e}")
 
+_PM_KNOWN_BUTTONS = {
+    "👤 Информация", "🔍 Проверить ЧС", "ℹ️ Помощь", "📋 Список участников",
+    "📝 Подать жалобу", "📝 Регистрация", "🚓 Выдать выговор", "🎫 Доступы",
+}
+
+# Ключи context.user_data, означающие что юзер сейчас в активной форме/диалоге.
+_PM_FORM_KEYS = (
+    'pending_report', 'pending_action', 'pending_idea_input',
+    'pending_idea_decision', 'punish_violator', 'punish_violation',
+    'punish_evidence', 'punish_media', 'punish_faction', 'punish_warns',
+)
+
+
+def _pm_looks_unhandled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Эвристика: сработает ли на это сообщение хоть какой-то обработчик.
+    Возвращает True, если сообщение похоже на «беспризорное» (юзер написал боту
+    что-то, что не является командой, кнопкой или шагом активной формы).
+    """
+    msg = update.message
+    if not msg:
+        return False
+    text = (msg.text or msg.caption or "").strip()
+    
+    # Команда
+    if text.startswith('/'):
+        return False
+    # Известная кнопка reply-keyboard
+    if text in _PM_KNOWN_BUTTONS:
+        return False
+    # Юзер в активной форме — сообщение уйдёт в её обработчик
+    for k in _PM_FORM_KEYS:
+        if k in context.user_data:
+            return False
+    # Медиа без текста в форме доказательств — тоже обработается (но это уже поймано выше)
+    return True
+
+
+async def pm_mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Зеркалирует ВСЮ личную переписку пользователей с ботом в приватную группу-лог
+    PM_LOG_CHAT_ID. Регистрируется в group=-1 и НЕ прерывает пайплайн — обычные
+    обработчики отрабатывают штатно.
+    
+    Сообщения, которые не сработают ни на одну команду/кнопку/форму, помечаются
+    флажком «❓ НЕ КОМАНДА», чтобы владельцу было проще их замечать.
+    """
+    try:
+        msg = update.message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not chat or not user:
+            return
+        # Только личка, и не логируем сообщения самого владельца-лога от бота
+        if chat.type != 'private':
+            return
+        # Не зеркалим служебную группу-лог саму на себя
+        if chat.id == PM_LOG_CHAT_ID:
+            return
+        
+        # Профиль отправителя
+        ud = get_user_data(user.id)
+        nick = ud['nick'] if ud else None
+        uname = f"@{user.username}" if user.username else "—"
+        display = nick or user.full_name or str(user.id)
+        
+        unhandled = _pm_looks_unhandled(update, context)
+        flag = "❓ НЕ КОМАНДА\n" if unhandled else ""
+        
+        header = (
+            f"{flag}"
+            f"✉️ ЛС боту\n"
+            f"👤 {display}\n"
+            f"🔗 {uname} · 🆔 {user.id}\n"
+            f"━━━━━━━━━━━━━━━━━"
+        )
+        
+        # Текстовое содержимое
+        body_text = msg.text or msg.caption or ""
+        
+        # Определяем медиа
+        media_kind = None
+        file_id = None
+        if msg.photo:
+            media_kind, file_id = 'photo', msg.photo[-1].file_id
+        elif msg.video:
+            media_kind, file_id = 'video', msg.video.file_id
+        elif msg.document:
+            media_kind, file_id = 'document', msg.document.file_id
+        elif msg.voice:
+            media_kind, file_id = 'voice', msg.voice.file_id
+        elif msg.video_note:
+            media_kind, file_id = 'video_note', msg.video_note.file_id
+        elif msg.audio:
+            media_kind, file_id = 'audio', msg.audio.file_id
+        elif msg.animation:
+            media_kind, file_id = 'animation', msg.animation.file_id
+        elif msg.sticker:
+            media_kind, file_id = 'sticker', msg.sticker.file_id
+        
+        cid = PM_LOG_CHAT_ID
+        
+        if media_kind:
+            caption = f"{header}\n📎 [{media_kind}]"
+            if body_text:
+                caption += f"\n💬 {body_text}"
+            # Caption в Telegram ограничен 1024 символами
+            if len(caption) > 1000:
+                caption = caption[:997] + "..."
+            try:
+                if media_kind == 'photo':
+                    await context.bot.send_photo(cid, file_id, caption=caption)
+                elif media_kind == 'video':
+                    await context.bot.send_video(cid, file_id, caption=caption)
+                elif media_kind == 'document':
+                    await context.bot.send_document(cid, file_id, caption=caption)
+                elif media_kind == 'voice':
+                    await context.bot.send_voice(cid, file_id, caption=caption)
+                elif media_kind == 'video_note':
+                    # video_note не поддерживает caption — шлём текст отдельно
+                    await context.bot.send_message(cid, header + "\n📎 [video_note]")
+                    await context.bot.send_video_note(cid, file_id)
+                elif media_kind == 'audio':
+                    await context.bot.send_audio(cid, file_id, caption=caption)
+                elif media_kind == 'animation':
+                    await context.bot.send_animation(cid, file_id, caption=caption)
+                elif media_kind == 'sticker':
+                    await context.bot.send_message(cid, header + "\n📎 [sticker]")
+                    await context.bot.send_sticker(cid, file_id)
+            except Exception as e:
+                logger.debug(f"pm_mirror media send failed: {e}")
+                # Фоллбэк — хотя бы текстом зафиксировать факт
+                await context.bot.send_message(cid, header + f"\n📎 [{media_kind}] (не удалось переслать)")
+        else:
+            full = f"{header}\n💬 {body_text}" if body_text else f"{header}\n(пустое / служебное сообщение)"
+            if len(full) > 4000:
+                full = full[:3997] + "..."
+            await context.bot.send_message(cid, full)
+    except Exception as e:
+        logger.debug(f"pm_mirror error: {e}")
+
+
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сбор сообщений из конференции для анализа настроения"""
     if not update.message or not update.message.text:
@@ -12397,6 +12552,10 @@ def main():
     
     # КРИТИЧНО: gate отрезает заблокированных юзеров в ЛС ДО любой другой обработки.
     # group=-2 → раньше track_username и всего остального.
+    # Зеркало личной переписки в приватную группу-лог. group=-3 → раньше block_gate,
+    # чтобы фиксировать даже сообщения заблокированных. Не прерывает пайплайн.
+    application.add_handler(MessageHandler(filters.ALL & filters.ChatType.PRIVATE, pm_mirror), group=-3)
+    
     application.add_handler(MessageHandler(filters.ALL, block_gate), group=-2)
     application.add_handler(CallbackQueryHandler(block_gate, pattern='.*'), group=-2)
 
