@@ -8060,6 +8060,118 @@ async def pm_mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.debug(f"pm_mirror error: {e}")
 
 
+async def pm_log_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ответ от имени бота через лог-группу: владелец отвечает (reply) на зеркальное
+    сообщение в PM_LOG_CHAT_ID — бот доставляет содержимое ответа тому пользователю
+    в личку. ID получателя парсится из шапки зеркала («🆔 …»).
+    
+    Поддерживаются текст и медиа (фото/видео/документ/голосовое/gif) с подписью.
+    Доступ определяется членством в лог-группе (там только владелец и бот).
+    """
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    rtm = msg.reply_to_message
+    # Отвечать нужно именно на сообщение бота-зеркала
+    if not rtm.from_user or rtm.from_user.id != context.bot.id:
+        return
+    
+    # Парсим ID получателя из шапки зеркала
+    source = rtm.text or rtm.caption or ""
+    m = re.search(r'🆔 (\d+)', source)
+    if not m:
+        await msg.reply_text("❌ Не нашёл 🆔 в сообщении — отвечать можно только на зеркальные сообщения.")
+        return
+    target_id = int(m.group(1))
+    
+    text = (msg.text or msg.caption or "").strip()
+    
+    sent_ok = False
+    try:
+        if msg.photo:
+            await context.bot.send_photo(target_id, msg.photo[-1].file_id, caption=text or None)
+            sent_ok = True
+        elif msg.video:
+            await context.bot.send_video(target_id, msg.video.file_id, caption=text or None)
+            sent_ok = True
+        elif msg.document:
+            await context.bot.send_document(target_id, msg.document.file_id, caption=text or None)
+            sent_ok = True
+        elif msg.voice:
+            await context.bot.send_voice(target_id, msg.voice.file_id, caption=text or None)
+            sent_ok = True
+        elif msg.animation:
+            await context.bot.send_animation(target_id, msg.animation.file_id, caption=text or None)
+            sent_ok = True
+        elif msg.sticker:
+            await context.bot.send_sticker(target_id, msg.sticker.file_id)
+            sent_ok = True
+        elif text:
+            await context.bot.send_message(target_id, text)
+            sent_ok = True
+        else:
+            await msg.reply_text("❌ Пустой ответ — нечего отправлять.")
+            return
+    except Exception as e:
+        logger.debug(f"pm_log_reply to {target_id}: {e}")
+        await msg.reply_text(
+            f"❌ Не удалось доставить (юзер {target_id}): {e}\n"
+            "Скорее всего он не открывал ЛС с ботом или заблокировал его."
+        )
+        return
+    
+    if sent_ok:
+        td = get_user_data(target_id)
+        name = td['nick'] if td else str(target_id)
+        log_action(update.effective_user.id, 'pm_reply_sent', target_id, (text or '[media]')[:120])
+        await msg.reply_text(f"✅ Доставлено: {name}")
+
+
+async def apm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Написать пользователю в личку от имени бота. Только главный админ.
+    
+    /apm <user> <текст>
+    /apm (reply в лог-группе не нужен — это для произвольных сообщений)
+    """
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return
+    
+    args = list(context.args or [])
+    if len(args) < 2:
+        await update.message.reply_text("❌ Использование: /apm <user> <текст>")
+        return
+    
+    target_id = extract_user_id(update, context, args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    
+    text = ' '.join(args[1:]).strip()
+    if not text:
+        await update.message.reply_text("❌ Пустой текст.")
+        return
+    
+    try:
+        await context.bot.send_message(chat_id=target_id, text=text)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не удалось доставить: {e}\n"
+            "Юзер не открывал ЛС с ботом или заблокировал его."
+        )
+        return
+    
+    td = get_user_data(target_id)
+    name = td['nick'] if td else str(target_id)
+    log_action(user_id, 'pm_sent', target_id, text[:120])
+    await update.message.reply_text(f"✅ Доставлено: {name}")
+
+
 async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сбор сообщений из конференции для анализа настроения"""
     if not update.message or not update.message.text:
@@ -12433,6 +12545,7 @@ def main():
         'adepartment': adepartment, 'asetalldept': asetalldept,
         'atest': atest, 'find': find, 
         'afindsetup': afindsetup,
+        'apm': apm,
         'adept_list': adept_list, 'adept_rename': adept_rename, 'adept_move': adept_move,
         'adept_group_add': adept_group_add, 'adept_group_del': adept_group_del,
         'adept_group_assign': adept_group_assign, 'adept_apply_template': adept_apply_template,
@@ -12555,6 +12668,11 @@ def main():
     # Зеркало личной переписки в приватную группу-лог. group=-3 → раньше block_gate,
     # чтобы фиксировать даже сообщения заблокированных. Не прерывает пайплайн.
     application.add_handler(MessageHandler(filters.ALL & filters.ChatType.PRIVATE, pm_mirror), group=-3)
+    # Ответы от имени бота: reply на зеркальное сообщение в лог-группе → доставка юзеру.
+    application.add_handler(
+        MessageHandler(filters.Chat(chat_id=PM_LOG_CHAT_ID) & filters.REPLY & ~filters.COMMAND, pm_log_reply),
+        group=0,
+    )
     
     application.add_handler(MessageHandler(filters.ALL, block_gate), group=-2)
     application.add_handler(CallbackQueryHandler(block_gate, pattern='.*'), group=-2)
