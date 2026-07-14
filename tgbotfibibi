@@ -4804,6 +4804,24 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
         await notify_user(context, target_id,
                          f"✅ Вас зарегистрировал {get_admin_nick(user_id)}!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
+        # Уведомление в лог-группу
+        try:
+            uname_view = f"@{tg_uname}" if tg_uname else "—"
+            await context.bot.send_message(
+                chat_id=PM_LOG_CHAT_ID,
+                text=(
+                    "🆕 НОВАЯ РЕГИСТРАЦИЯ (через /aregister)\n"
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"🎮 Ник: {game_nick}\n"
+                    f"📻 Позывной: {callsign}\n"
+                    f"🎫 Жетон: {token}\n"
+                    f"🔗 {uname_view} · 🆔 {target_id}\n"
+                    f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
+                    f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"aregister log notify failed: {e}")
     else:
         await update.message.reply_text("❌ Ошибка.")
 
@@ -4858,6 +4876,24 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_token = add_user(target_id, game_nick, callsign, token, tg_username=tg_uname)
     if new_token:
         await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {new_token}")
+        # Уведомление в лог-группу
+        try:
+            uname_view = f"@{tg_uname}" if tg_uname else "—"
+            await context.bot.send_message(
+                chat_id=PM_LOG_CHAT_ID,
+                text=(
+                    "🆕 РЕГИСТРАЦИЯ (через /aforcereg)\n"
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"🎮 Ник: {game_nick}\n"
+                    f"📻 Позывной: {callsign}\n"
+                    f"🎫 Жетон: {new_token}\n"
+                    f"🔗 {uname_view} · 🆔 {target_id}\n"
+                    f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
+                    f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"aforcereg log notify failed: {e}")
     else:
         await update.message.reply_text("❌ Ошибка.")
 
@@ -7549,6 +7585,25 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(
         f"✅ Готово!\n\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}"
     )
+    
+    # Уведомление в лог-группу о новой регистрации
+    try:
+        uname = f"@{tg_username}" if tg_username else "—"
+        await context.bot.send_message(
+            chat_id=PM_LOG_CHAT_ID,
+            text=(
+                "🆕 НОВАЯ РЕГИСТРАЦИЯ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"🎮 Ник: {context.user_data['game_nick']}\n"
+                f"📻 Позывной: {callsign}\n"
+                f"🎫 Жетон: {token}\n"
+                f"🔗 {uname} · 🆔 {user_id}\n"
+                f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
+            ),
+        )
+    except Exception as e:
+        logger.debug(f"registration log notify failed: {e}")
+    
     await start(update, context)
     return ConversationHandler.END
 
