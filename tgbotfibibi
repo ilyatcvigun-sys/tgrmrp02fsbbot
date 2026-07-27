@@ -1950,6 +1950,10 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/amute <user> [длительность] [причина] — мут 🤐\n"
                 "    (только в конференции; по умолчанию 30m)\n"
                 "/aunmute <user> — снять мут\n"
+                "/aaward <user> <тип> <название> — выдать награду 🏅\n"
+                "    типы: медаль, орден, грамота, благодарность, знак\n"
+                "/aawards_of <user> — награды пользователя\n"
+                "/aaward_del <номер> — снять награду\n"
                 "/awarn <user> <причина>\n"
                 "/aunwarn <user>\n"
                 "/aunwarnall <user>\n"
@@ -2014,6 +2018,7 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/arevoke <user> <cmd> — отозвать доступ\n"
                 "/agrantlist <cmd> — кому выдан доступ\n"
                 "/agrantcmds — список грантуемых команд\n"
+                "/atgadmins — список администраторов конференции\n"
                 "/afindsetup — настроить видимость отделов в /find\n"
                 "/adept_list — все отделы\n"
                 "/adept_rename <id> <имя>\n"
@@ -2043,6 +2048,8 @@ async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "/aglobal_unban\n"
                 "/asetallrank <0-7>\n"
                 "/apermsmenu — интерактивное меню доступов 🎫\n"
+                "/atgadmin <user> [должность] — назначить админом ТГ 👑\n"
+                "/atgunadmin <user> — снять админа ТГ\n"
                 "/agrant <user> <cmd> [cmd2 ...]\n"
                 "/arevoke <user> <cmd> | all\n"
                 "/agrantlist <cmd>\n"
@@ -2096,6 +2103,217 @@ async def astats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚫 Забанено: {stats['banned']}\n"
         f"🌟 Генералов: {stats['generals']}"
     )
+
+# ============ ВЫДАЧА НАГРАД ============
+# Типы наград. Ключ используется в команде, значение — как показывается.
+AWARD_TYPES = {
+    'медаль':     '🥇 Медаль',
+    'орден':      '🎖 Орден',
+    'грамота':    '📜 Грамота',
+    'благодарность': '🤝 Благодарность',
+    'знак':       '⭐ Знак отличия',
+}
+
+
+def _award_delete(award_id: int) -> dict:
+    """Удаляет награду по id. Возвращает удалённую запись или None."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM awards WHERE id = ?', (award_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+    data = dict(row)
+    c.execute('DELETE FROM awards WHERE id = ?', (award_id,))
+    conn.commit()
+    conn.close()
+    return data
+
+
+async def aaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Выдать награду.
+    
+    /aaward @user <тип> <название>
+    /aaward (reply) <тип> <название>
+    
+    Типы: медаль, орден, грамота, благодарность, знак.
+    Если тип не указан — по умолчанию «медаль».
+    
+    Пример: /aaward @sokol орден За отвагу при задержании
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'aaward'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга или со спецдоступом.")
+        return
+    
+    args = list(context.args or [])
+    target_id = extract_user_id(update, context)
+    if not target_id and args:
+        target_id = extract_user_id(update, context, args[0])
+        args = args[1:]
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        types_line = ', '.join(AWARD_TYPES.keys())
+        await update.message.reply_text(
+            "❌ Использование: /aaward <@user> <тип> <название>\n"
+            f"Типы: {types_line}\n\n"
+            "Пример: /aaward @sokol орден За отвагу при задержании"
+        )
+        return
+    
+    td = get_user_data(target_id)
+    if not td:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+        return
+    
+    # Первый оставшийся аргумент может быть типом награды
+    award_type = 'медаль'
+    if args and args[0].lower() in AWARD_TYPES:
+        award_type = args[0].lower()
+        args = args[1:]
+    
+    award_name = ' '.join(args).strip()
+    if not award_name:
+        types_line = ', '.join(AWARD_TYPES.keys())
+        await update.message.reply_text(
+            "❌ Не указано название награды.\n"
+            f"Формат: /aaward @user <тип> <название>\n"
+            f"Типы: {types_line}"
+        )
+        return
+    if len(award_name) > 200:
+        await update.message.reply_text("❌ Название слишком длинное (макс 200 символов).")
+        return
+    
+    type_view = AWARD_TYPES[award_type]
+    add_award(target_id, award_name, type_view, user_id)
+    log_action(user_id, 'award', target_id, f"{type_view}: {award_name}")
+    
+    issuer = get_admin_nick(user_id)
+    await update.message.reply_text(
+        "🏅 НАГРАДА ВЫДАНА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {td['nick']}\n"
+        f"{type_view}\n"
+        f"📜 {award_name}\n"
+        f"👮 Наградил: {issuer}\n"
+        f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
+    )
+    await notify_user(
+        context, target_id,
+        "🏅 ВАС НАГРАДИЛИ!\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{type_view}\n"
+        f"📜 {award_name}\n"
+        f"👮 Наградил: {issuer}\n\n"
+        "Посмотреть все награды: /aawards"
+    )
+
+
+async def aawards_of(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Награды другого пользователя (с номерами, чтобы можно было снять).
+    /aawards_of @user   (или reply)
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'aawards_of'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга или со спецдоступом.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Использование: /aawards_of @user (или reply).")
+        return
+    
+    td = get_user_data(target_id)
+    name = td['nick'] if td else f"id {target_id}"
+    
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        'SELECT id, award_name, award_type, date, issued_by FROM awards '
+        'WHERE user_id = ? ORDER BY id DESC',
+        (target_id,),
+    )
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    
+    if not rows:
+        await update.message.reply_text(f"🏅 У «{name}» пока нет наград.")
+        return
+    
+    lines = [f"🏅 НАГРАДЫ: {name}", "━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        issuer = get_user_data(r['issued_by'])
+        iname = issuer['nick'] if issuer else (str(r['issued_by']) if r['issued_by'] else '—')
+        lines.append(f"#{r['id']} {r['award_type']}")
+        lines.append(f"   📜 {r['award_name']}")
+        lines.append(f"   📅 {r['date']} · 👮 {iname}")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append(f"Всего: {len(rows)}")
+    lines.append("Снять: /aaward_del <номер>")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
+
+async def aaward_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Снять (удалить) награду по её номеру.
+    /aaward_del <номер>
+    Номер виден в /aawards_of @user.
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'aaward_del'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга или со спецдоступом.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Использование: /aaward_del <номер>\n"
+            "Номер награды можно посмотреть в /aawards_of @user"
+        )
+        return
+    try:
+        award_id = int(context.args[0].lstrip('#'))
+    except ValueError:
+        await update.message.reply_text("❌ Номер должен быть числом.")
+        return
+    
+    data = _award_delete(award_id)
+    if not data:
+        await update.message.reply_text("❌ Награда с таким номером не найдена.")
+        return
+    
+    td = get_user_data(data['user_id'])
+    name = td['nick'] if td else f"id {data['user_id']}"
+    log_action(user_id, 'award_removed', data['user_id'],
+               f"#{award_id} {data['award_type']}: {data['award_name']}")
+    
+    await update.message.reply_text(
+        "🗑 НАГРАДА СНЯТА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {name}\n"
+        f"{data['award_type']}\n"
+        f"📜 {data['award_name']}\n"
+        f"👮 Снял: {get_admin_nick(user_id)}"
+    )
+    await notify_user(
+        context, data['user_id'],
+        f"🗑 У вас снята награда: {data['award_name']}\n"
+        f"👮 Снял: {get_admin_nick(user_id)}"
+    )
+
 
 async def aawards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Награды"""
@@ -4820,24 +5038,18 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
         await notify_user(context, target_id,
                          f"✅ Вас зарегистрировал {get_admin_nick(user_id)}!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
-        # Уведомление в лог-группу
-        try:
-            uname_view = f"@{tg_uname}" if tg_uname else "—"
-            await context.bot.send_message(
-                chat_id=PM_LOG_CHAT_ID,
-                text=(
-                    "🆕 НОВАЯ РЕГИСТРАЦИЯ (через /aregister)\n"
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"🎮 Ник: {game_nick}\n"
-                    f"📻 Позывной: {callsign}\n"
-                    f"🎫 Жетон: {token}\n"
-                    f"🔗 {uname_view} · 🆔 {target_id}\n"
-                    f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
-                    f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
-                ),
-            )
-        except Exception as e:
-            logger.debug(f"aregister log notify failed: {e}")
+        # Уведомление в лог-группу и генералам (6+)
+        uname_view = f"@{tg_uname}" if tg_uname else "—"
+        await notify_new_registration(context, (
+            "🆕 НОВАЯ РЕГИСТРАЦИЯ (через /aregister)\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"🎮 Ник: {game_nick}\n"
+            f"📻 Позывной: {callsign}\n"
+            f"🎫 Жетон: {token}\n"
+            f"🔗 {uname_view} · 🆔 {target_id}\n"
+            f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
+            f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
+        ))
     else:
         await update.message.reply_text("❌ Ошибка.")
 
@@ -4892,24 +5104,18 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_token = add_user(target_id, game_nick, callsign, token, tg_username=tg_uname)
     if new_token:
         await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {new_token}")
-        # Уведомление в лог-группу
-        try:
-            uname_view = f"@{tg_uname}" if tg_uname else "—"
-            await context.bot.send_message(
-                chat_id=PM_LOG_CHAT_ID,
-                text=(
-                    "🆕 РЕГИСТРАЦИЯ (через /aforcereg)\n"
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"🎮 Ник: {game_nick}\n"
-                    f"📻 Позывной: {callsign}\n"
-                    f"🎫 Жетон: {new_token}\n"
-                    f"🔗 {uname_view} · 🆔 {target_id}\n"
-                    f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
-                    f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
-                ),
-            )
-        except Exception as e:
-            logger.debug(f"aforcereg log notify failed: {e}")
+        # Уведомление в лог-группу и генералам (6+)
+        uname_view = f"@{tg_uname}" if tg_uname else "—"
+        await notify_new_registration(context, (
+            "🆕 РЕГИСТРАЦИЯ (через /aforcereg)\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"🎮 Ник: {game_nick}\n"
+            f"📻 Позывной: {callsign}\n"
+            f"🎫 Жетон: {new_token}\n"
+            f"🔗 {uname_view} · 🆔 {target_id}\n"
+            f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
+            f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
+        ))
     else:
         await update.message.reply_text("❌ Ошибка.")
 
@@ -6168,6 +6374,203 @@ async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(bans) > 20:
         text += f"\n…и ещё {len(bans) - 20}."
     await update.message.reply_text(text)
+
+# ============ УПРАВЛЕНИЕ АДМИНАМИ TELEGRAM ============
+# Назначение и снятие администраторов самой конференции (не рангов бота).
+# Доступ только у главного админа — это выдача реальных прав в чате.
+#
+# Ограничения Telegram, о которых важно знать:
+#   • у бота должно быть право «Назначение администраторов» (can_promote_members);
+#   • бот может выдать только те права, которые есть у него самого;
+#   • снять права бот может только с тех, кого назначал сам.
+
+async def atgadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Назначить пользователя администратором конференции.
+    
+    /atgadmin @user [должность]
+    /atgadmin (reply) [должность]
+    
+    Должность — подпись до 16 символов, видна в списке участников.
+    """
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return
+    
+    args = list(context.args or [])
+    target_id = extract_user_id(update, context)
+    if not target_id and args:
+        target_id = extract_user_id(update, context, args[0])
+        args = args[1:]
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text(
+            "❌ Использование: /atgadmin @user [должность]\n"
+            "Или ответом на сообщение: /atgadmin [должность]"
+        )
+        return
+    
+    title = ' '.join(args).strip()[:16]
+    
+    try:
+        await context.bot.promote_chat_member(
+            chat_id=CONFERENCE_CHAT_ID,
+            user_id=target_id,
+            can_manage_chat=True,
+            can_delete_messages=True,
+            can_restrict_members=True,
+            can_invite_users=True,
+            can_pin_messages=True,
+            can_manage_topics=True,
+            can_manage_video_chats=True,
+            # Право назначать других админов сознательно НЕ выдаём —
+            # иначе назначенный сможет раздавать права дальше.
+            can_promote_members=False,
+            can_change_info=False,
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не удалось назначить: {e}\n\n"
+            "Проверьте, что у бота есть право «Назначение администраторов» "
+            "и что пользователь состоит в конференции."
+        )
+        return
+    
+    # Должность — отдельным запросом, её отсутствие не критично
+    title_note = ""
+    if title:
+        try:
+            await context.bot.set_chat_administrator_custom_title(
+                chat_id=CONFERENCE_CHAT_ID, user_id=target_id, custom_title=title
+            )
+            title_note = f"\n🏷 Должность: {title}"
+        except Exception as e:
+            logger.debug(f"set custom title failed: {e}")
+            title_note = "\n⚠️ Должность установить не удалось"
+    
+    td = get_user_data(target_id)
+    name = td['nick'] if td else f"id {target_id}"
+    log_action(user_id, 'tg_admin_promote', target_id, title or '')
+    
+    await update.message.reply_text(
+        "👑 НАЗНАЧЕН АДМИНИСТРАТОРОМ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {name}{title_note}\n"
+        f"👮 Назначил: {get_admin_nick(user_id)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Права: удаление сообщений, ограничение участников,\n"
+        "приглашение, закрепление, управление темами."
+    )
+    await notify_user(
+        context, target_id,
+        f"👑 Вам выданы права администратора конференции.\n"
+        f"👮 Назначил: {get_admin_nick(user_id)}"
+    )
+
+
+async def atgunadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Снять права администратора конференции.
+    /atgunadmin @user   (или reply)
+    """
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Команда доступна только главному админу.")
+        return
+    
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Использование: /atgunadmin @user (или reply).")
+        return
+    
+    if is_main_admin(target_id):
+        await update.message.reply_text("❌ Нельзя снять права с главного админа.")
+        return
+    
+    try:
+        # Снятие прав = выдача пустого набора
+        await context.bot.promote_chat_member(
+            chat_id=CONFERENCE_CHAT_ID,
+            user_id=target_id,
+            can_manage_chat=False,
+            can_delete_messages=False,
+            can_restrict_members=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_topics=False,
+            can_manage_video_chats=False,
+            can_promote_members=False,
+            can_change_info=False,
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не удалось снять права: {e}\n\n"
+            "Telegram разрешает снимать права только с тех администраторов, "
+            "которых назначил сам бот. Назначенных вручную через Telegram "
+            "нужно снимать тоже вручную."
+        )
+        return
+    
+    td = get_user_data(target_id)
+    name = td['nick'] if td else f"id {target_id}"
+    log_action(user_id, 'tg_admin_demote', target_id, '')
+    
+    await update.message.reply_text(
+        "🚫 ПРАВА АДМИНИСТРАТОРА СНЯТЫ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {name}\n"
+        f"👮 Снял: {get_admin_nick(user_id)}"
+    )
+    await notify_user(
+        context, target_id,
+        f"🚫 С вас сняты права администратора конференции.\n"
+        f"👮 Снял: {get_admin_nick(user_id)}"
+    )
+
+
+async def atgadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список администраторов конференции (по данным Telegram, не по рангам бота)."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'gban', 'atgadmins'):
+        await update.message.reply_text("❌ Команда доступна со спецдоступом.")
+        return
+    
+    try:
+        admins = await context.bot.get_chat_administrators(CONFERENCE_CHAT_ID)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось получить список: {e}")
+        return
+    
+    lines = ["👑 АДМИНИСТРАТОРЫ КОНФЕРЕНЦИИ", "━━━━━━━━━━━━━━━━━"]
+    for m in admins:
+        u = m.user
+        if u.is_bot:
+            continue
+        ud = get_user_data(u.id)
+        name = ud['nick'] if ud else (u.full_name or str(u.id))
+        role = "создатель" if m.status == 'creator' else "админ"
+        title = getattr(m, 'custom_title', None)
+        line = f"• {name} — {role}"
+        if title:
+            line += f" ({title})"
+        if u.username:
+            line += f"\n  @{u.username}"
+        lines.append(line)
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("Назначить: /atgadmin @user [должность]")
+    lines.append("Снять: /atgunadmin @user")
+    
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await update.message.reply_text(text)
+
 
 async def aadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список администрации"""
@@ -7589,6 +7992,36 @@ async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Шаг 2/2 — Позывной:")
     return CALLSIGN
 
+async def notify_new_registration(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    Рассылает уведомление о новой регистрации:
+      • в лог-группу PM_LOG_CHAT_ID,
+      • в личку всем пользователям 6 ранга и выше.
+    Ошибки доставки не мешают друг другу и не ломают саму регистрацию.
+    """
+    try:
+        await context.bot.send_message(chat_id=PM_LOG_CHAT_ID, text=text)
+    except Exception as e:
+        logger.debug(f"registration notify → лог-группа: {e}")
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM users WHERE rank >= 6 AND bot_blocked = "Нет"')
+        recipients = [r[0] for r in c.fetchall()]
+        conn.close()
+    except Exception as e:
+        logger.debug(f"registration notify → выборка получателей: {e}")
+        return
+
+    for uid in recipients:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+        except Exception as e:
+            logger.debug(f"registration notify → {uid}: {e}")
+        await asyncio.sleep(0.05)
+
+
 async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Завершение регистрации"""
     callsign = update.message.text
@@ -7602,23 +8035,17 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
         f"✅ Готово!\n\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}"
     )
     
-    # Уведомление в лог-группу о новой регистрации
-    try:
-        uname = f"@{tg_username}" if tg_username else "—"
-        await context.bot.send_message(
-            chat_id=PM_LOG_CHAT_ID,
-            text=(
-                "🆕 НОВАЯ РЕГИСТРАЦИЯ\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"🎮 Ник: {context.user_data['game_nick']}\n"
-                f"📻 Позывной: {callsign}\n"
-                f"🎫 Жетон: {token}\n"
-                f"🔗 {uname} · 🆔 {user_id}\n"
-                f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
-            ),
-        )
-    except Exception as e:
-        logger.debug(f"registration log notify failed: {e}")
+    # Уведомление в лог-группу и генералам (6+)
+    uname = f"@{tg_username}" if tg_username else "—"
+    await notify_new_registration(context, (
+        "🆕 НОВАЯ РЕГИСТРАЦИЯ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"🎮 Ник: {context.user_data['game_nick']}\n"
+        f"📻 Позывной: {callsign}\n"
+        f"🎫 Жетон: {token}\n"
+        f"🔗 {uname} · 🆔 {user_id}\n"
+        f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
+    ))
     
     await start(update, context)
     return ConversationHandler.END
@@ -11145,55 +11572,52 @@ async def aidea_to_changelog(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-async def changelog_startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
+async def startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Однократно при старте бота: если со времени последнего опубликованного changelog
-    появились новые типы action — DM главному админу с предложением сделать новый.
+    Однократно через несколько секунд после старта: сообщает владельцу, что бот
+    поднялся. Полезно, чтобы видеть перезапуски (в том числе аварийные, когда
+    хостинг сам перезапустил контейнер).
+    Отправляется в лог-группу, а если она недоступна — в ЛС главному админу.
     """
-    since_at = _changelog_get_last_published_at()
-    new_actions = _changelog_get_new_actions_since(since_at)
-    if not new_actions:
-        return
-    
-    # Главный админ — возьмём из ADMIN_IDS
     try:
-        admin_ids = list(ADMIN_IDS) if isinstance(ADMIN_IDS, (list, set, tuple)) else ([ADMIN_IDS] if ADMIN_IDS else [])
+        admin_ids = list(ADMIN_IDS) if isinstance(ADMIN_IDS, (list, set, tuple)) else [ADMIN_IDS]
     except NameError:
         admin_ids = []
-    if not admin_ids:
-        return
-    
-    lines = [
-        "📰 НАПОМИНАНИЕ ПРО CHANGELOG",
-        "━━━━━━━━━━━━━━━━━",
-        f"С момента последнего обновления ({since_at or 'никогда'}) появились новые типы активности.",
-        "Возможно, стоит опубликовать новый changelog.",
-        "",
-    ]
-    described = []
-    for action, first_at, count in new_actions[:15]:
-        feature = _ACTION_TO_FEATURE.get(action, f"`{action}` (новый тип)")
-        described.append(f"  • {feature} (впервые {first_at})")
-    if described:
-        lines.append("🎯 Что замечено:")
-        lines.extend(described)
-        if len(new_actions) > 15:
-            lines.append(f"  …и ещё {len(new_actions) - 15}")
-    lines.append("")
-    lines.append("💡 Команды:")
-    lines.append("  /achangelog_draft — собрать полный черновик")
-    lines.append("  /achangelog_add — создать changelog вручную")
-    lines.append("  /achangelog_list — все обновления")
-    
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3997] + "..."
-    
-    for admin_id in admin_ids:
-        try:
-            await context.bot.send_message(chat_id=admin_id, text=text)
-        except Exception as e:
-            logger.debug(f"changelog notify {admin_id}: {e}")
+
+    # Немного статистики, чтобы сразу видеть, что база на месте
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM users')
+        users_n = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM reports WHERE status = 'pending'")
+        pending_n = c.fetchone()[0]
+        conn.close()
+        db_line = f"👥 Пользователей: {users_n}\n📨 Жалоб в ожидании: {pending_n}"
+    except Exception as e:
+        logger.debug(f"startup stats failed: {e}")
+        db_line = "⚠️ Не удалось прочитать статистику из базы"
+
+    text = (
+        "🟢 БОТ ЗАПУЩЕН\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {now_msk_str('%d.%m.%Y %H:%M:%S')} МСК\n"
+        f"{db_line}"
+    )
+
+    sent = False
+    try:
+        await context.bot.send_message(chat_id=PM_LOG_CHAT_ID, text=text)
+        sent = True
+    except Exception as e:
+        logger.debug(f"startup notify to log group failed: {e}")
+
+    if not sent:
+        for admin_id in admin_ids:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=text)
+            except Exception as e:
+                logger.debug(f"startup notify to {admin_id}: {e}")
 
 
 # ============ ВЫДАЧА НАКАЗАНИЯ (/apunish) ============
@@ -12640,6 +13064,8 @@ def main():
         'atest': atest, 'find': find, 
         'afindsetup': afindsetup,
         'apm': apm,
+        'atgadmin': atgadmin, 'atgunadmin': atgunadmin, 'atgadmins': atgadmins,
+        'aaward': aaward, 'aawards_of': aawards_of, 'aaward_del': aaward_del,
         'adept_list': adept_list, 'adept_rename': adept_rename, 'adept_move': adept_move,
         'adept_group_add': adept_group_add, 'adept_group_del': adept_group_del,
         'adept_group_assign': adept_group_assign, 'adept_apply_template': adept_apply_template,
@@ -12833,9 +13259,8 @@ def main():
         time=time(hour=22, minute=0, tzinfo=MSK),
         days=(6,),
     )
-    # Стартовое напоминание: через 30 сек после запуска, если есть новые типы action
-    # с момента последнего опубликованного changelog — DM главному админу.
-    application.job_queue.run_once(changelog_startup_notify_job, when=30)
+    # Уведомление о старте бота — через 5 секунд после запуска.
+    application.job_queue.run_once(startup_notify_job, when=5)
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
