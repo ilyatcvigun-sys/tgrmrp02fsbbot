@@ -4,7 +4,12 @@ import asyncio
 from datetime import datetime, timedelta, time, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop
-import sqlite3
+# ВАЖНО: бот работает на PostgreSQL. Модуль db_pg — слой совместимости,
+# который повторяет API sqlite3 (connect / Row / OperationalError /
+# IntegrityError) и на лету переводит запросы в диалект PostgreSQL.
+# Благодаря этому весь остальной код остался без изменений.
+# Строка подключения берётся из переменной окружения DATABASE_URL.
+import db_pg as sqlite3
 import os
 from pathlib import Path
 import openai
@@ -61,6 +66,17 @@ PERMS_USER = 30
 
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 ADMIN_IDS = [8026911824]
+
+# ── Подключение к PostgreSQL ──────────────────────────────────────────
+# Предпочтительно задать переменную окружения DATABASE_URL в панели хостинга —
+# тогда пароль не хранится в коде. Если такой возможности нет, впишите строку
+# подключения сюда (она будет использована как запасной вариант).
+DATABASE_URL = os.environ.get("DATABASE_URL") or (
+    "postgresql://bothost_db_3259092c25db:"
+    "I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw"
+    "@node1.pghost.ru:15631/bothost_db_3259092c25db"
+)
+os.environ["DATABASE_URL"] = DATABASE_URL   # чтобы увидели db_pg и миграция
 
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -8826,7 +8842,7 @@ def _get_article_top(since: datetime = None, limit: int = 10) -> list:
                 '''SELECT article_num, article_name, COUNT(*) as cnt
                    FROM article_history
                    WHERE user_id = ? AND given_at >= ?
-                   GROUP BY article_num
+                   GROUP BY article_num, article_name
                    ORDER BY cnt DESC
                    LIMIT 3''',
                 (uid, since_str),
@@ -8836,7 +8852,7 @@ def _get_article_top(since: datetime = None, limit: int = 10) -> list:
                 '''SELECT article_num, article_name, COUNT(*) as cnt
                    FROM article_history
                    WHERE user_id = ?
-                   GROUP BY article_num
+                   GROUP BY article_num, article_name
                    ORDER BY cnt DESC
                    LIMIT 3''',
                 (uid,),
@@ -9089,12 +9105,12 @@ def _duel_apply_shot(duel_id: int, hit: bool, shooter_is_p1: bool):
     if shooter_is_p1:
         # Сбрасываем прицел стрелявшему; снимаем HP противнику если попал
         if hit:
-            c.execute('UPDATE duels SET p1_aim = 0, p2_hp = MAX(0, p2_hp - 1) WHERE id = ?', (duel_id,))
+            c.execute('UPDATE duels SET p1_aim = 0, p2_hp = GREATEST(0, p2_hp - 1) WHERE id = ?', (duel_id,))
         else:
             c.execute('UPDATE duels SET p1_aim = 0 WHERE id = ?', (duel_id,))
     else:
         if hit:
-            c.execute('UPDATE duels SET p2_aim = 0, p1_hp = MAX(0, p1_hp - 1) WHERE id = ?', (duel_id,))
+            c.execute('UPDATE duels SET p2_aim = 0, p1_hp = GREATEST(0, p1_hp - 1) WHERE id = ?', (duel_id,))
         else:
             c.execute('UPDATE duels SET p2_aim = 0 WHERE id = ?', (duel_id,))
     conn.commit()
@@ -10156,7 +10172,7 @@ def _changelog_get_new_actions_since(since_at: str) -> list:
             '''SELECT action, MIN(created_at) as first_at, COUNT(*) as cnt
                FROM audit_log
                GROUP BY action
-               HAVING first_at > ?
+               HAVING MIN(created_at) > ?
                ORDER BY first_at''',
             (since_at,),
         )
@@ -12567,6 +12583,29 @@ async def wedding_trigger_router(update: Update, context: ContextTypes.DEFAULT_T
 # ============ ЗАПУСК ============
 
 def main():
+    # Пул соединений к PostgreSQL поднимаем до любых обращений к БД.
+    # Если DATABASE_URL не задан или база недоступна — падаем сразу с внятной
+    # ошибкой, а не посреди работы на первом же запросе пользователя.
+    try:
+        sqlite3.init_pool()
+    except Exception as e:
+        logger.critical(f"Не удалось подключиться к PostgreSQL: {e}")
+        raise SystemExit(
+            "\nБот не запущен: нет подключения к базе.\n"
+            "Проверьте переменную DATABASE_URL (или строку подключения в начале файла).\n"
+        )
+    
+    # Разовый автоперенос данных из старой SQLite-базы.
+    # Нужен для хостингов без консоли: при первом запуске данные переезжают
+    # сами, при последующих — функция видит, что база уже заполнена, и молчит.
+    try:
+        from migrate_to_pg import auto_migrate_if_needed
+        auto_migrate_if_needed(DB_FILE)
+    except ImportError:
+        logger.info("migrate_to_pg.py не найден — автоперенос пропущен")
+    except Exception as e:
+        logger.error(f"Автоперенос не выполнен: {e}")
+    
     init_database()
     reload_blocked_users()
     application = Application.builder().token(BOT_TOKEN).build()
