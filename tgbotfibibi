@@ -16,7 +16,6 @@ import openai
 import json
 import re
 
-
 # === Часовой пояс ===
 # os.environ['TZ'] без time.tzset() не действует, и в Docker системное время — UTC.
 # Поэтому работаем явно через zoneinfo: все datetime.now(MSK).
@@ -72,9 +71,10 @@ ADMIN_IDS = [8026911824]
 # Предпочтительно задать переменную окружения DATABASE_URL в панели хостинга —
 # тогда пароль не хранится в коде. Если такой возможности нет, впишите строку
 # подключения сюда (она будет использована как запасной вариант).
-DATABASE_URL='postgresql://bothost_db_3259092c25db:I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw@node1.pghost.ru:15631/bothost_db_3259092c25db'
 DATABASE_URL = os.environ.get("DATABASE_URL") or (
-    "postgresql://bothost_db_3259092c25db:I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw@node1.pghost.ru:15631/bothost_db_3259092c25db"
+    "postgresql://bothost_db_3259092c25db:"
+    "I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw"
+    "@node1.pghost.ru:15631/bothost_db_3259092c25db"
 )
 os.environ["DATABASE_URL"] = DATABASE_URL   # чтобы увидели db_pg и миграция
 
@@ -12587,7 +12587,7 @@ def main():
     # Если DATABASE_URL не задан или база недоступна — падаем сразу с внятной
     # ошибкой, а не посреди работы на первом же запросе пользователя.
     try:
-        sqlite3.init_pool()
+        sqlite3.init_pool(DATABASE_URL)
     except Exception as e:
         logger.critical(f"Не удалось подключиться к PostgreSQL: {e}")
         raise SystemExit(
@@ -12600,7 +12600,7 @@ def main():
     # сами, при последующих — функция видит, что база уже заполнена, и молчит.
     try:
         from migrate_to_pg import auto_migrate_if_needed
-        auto_migrate_if_needed(DB_FILE)
+        auto_migrate_if_needed(DB_FILE, DATABASE_URL)
     except ImportError:
         logger.info("migrate_to_pg.py не найден — автоперенос пропущен")
     except Exception as e:
