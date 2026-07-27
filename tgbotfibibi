@@ -15,7 +15,6 @@ from pathlib import Path
 import openai
 import json
 import re
-export DATABASE_URL='postgresql://bothost_db_3259092c25db:I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw@node1.pghost.ru:15631/bothost_db_3259092c25db'
 
 # === Часовой пояс ===
 # os.environ['TZ'] без time.tzset() не действует, и в Docker системное время — UTC.
