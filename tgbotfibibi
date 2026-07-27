@@ -1861,214 +1861,316 @@ async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{flags_line}"
     )
 
+# ============ СПРАВКА ПО КОМАНДАМ (/ahelp) ============
+# Единый реестр команд. Из него строятся и меню разделов, и их содержимое.
+# При добавлении новой команды достаточно дописать сюда одну строку.
+#
+# Формат: (команда, аргументы, описание, уровень доступа)
+#   уровень: 0 — все, 4/5/6/7 — минимальный ранг,
+#            'spec' — спецдоступ, 'main' — главный админ
+
+HELP_SECTIONS = [
+    ("profile", "👤", "Профиль", [
+        ("start",      "",                      "главное меню", 0),
+        ("ainfo",      "",                      "краткая информация о вас", 0),
+        ("aprofile",   "",                      "полный профиль", 0),
+        ("aawards",    "",                      "ваши награды", 0),
+        ("aperms",     "",                      "ваши индивидуальные доступы", 0),
+        ("awarns",     "",                      "ваши предупреждения", 0),
+        ("astats",     "",                      "статистика бота", 0),
+        ("ahelp",      "",                      "эта справка", 0),
+        ("cancel",     "",                      "прервать начатую форму", 0),
+        ("acallsign",  "<новый позывной>",      "сменить себе позывной", 0),
+        ("awho",       "<user>",                "профиль другого пользователя", 5),
+        ("awhois",     "<id>",                  "полная информация по ID", "spec"),
+    ]),
+
+    ("search", "🔍", "Поиск и состав", [
+        ("find",       "",                      "руководящий состав", 0),
+        ("anick",      "<имя>",                 "поиск по нику", 0),
+        ("asearch",    "<жетон>",               "поиск по жетону", 0),
+        ("check_gban", "<user>",                "проверить, есть ли в ЧС", 0),
+        ("auserlist",  "",                      "все участники", 5),
+        ("aadmins",    "",                      "администрация по рангам бота", 5),
+        ("atgadmins",  "",                      "администраторы конференции", "spec"),
+        ("aadminlist", "",                      "список главных админов", "main"),
+        ("gban_list",  "",                      "список глобального ЧС", "spec"),
+    ]),
+
+    ("games", "🎮", "Игры и развлечения", [
+        ("acubes",       "[@user]",             "кубы; без аргумента — открытый вызов", 0),
+        ("acubes_stats", "[@user]",             "статистика кубов", 0),
+        ("aduel",        "<@user>",             "вызвать на дуэль", 0),
+        ("aduel_stats",  "[@user]",             "статистика дуэлей", 0),
+        ("aukrating",    "[day|week|month|all]", "топ преступников по статьям УК", 0),
+        ("aunwarngame",  "",                    "сыграть за снятие предупреждения (КД 14 дней)", 0),
+        ("amood",        "",                    "настроение конференции", 0),
+        ("awedding",     "[@user]",             "карточка пары", 0),
+        ("aweddings_list", "",                  "все пары", 0),
+        ("amarry",       "@user1 @user2",       "поженить пару", 4),
+        ("adivorce",     "@user",               "развести пару", 4),
+        ("awedding_setdate", "<user|#id> <дата>", "изменить дату брака", 4),
+        ("areloadarticles", "",                 "перечитать базу статей УК", "main"),
+        ("amooddebug",   "",                    "диагностика анализа настроения", "main"),
+    ]),
+
+    ("reports", "📨", "Жалобы и выговоры", [
+        ("areport",      "",                    "подать жалобу", 0),
+        ("areports",     "",                    "список жалоб", 4),
+        ("areport_info", "<id>",                "карточка жалобы", 4),
+        ("apunish",      "",                    "выдать выговор (форма в личке)", 4),
+        ("arequests",    "",                    "заявки на смену ранга и отдела", 4),
+        ("arequest_info", "<id>",               "карточка заявки", 4),
+        ("acheckall",    "",                    "запустить проверку рангов сейчас", "spec"),
+    ]),
+
+    ("moderation", "🛡", "Модерация", [
+        ("awarn",       "<user> <причина>",     "выдать предупреждение", 5),
+        ("aunwarn",     "<user>",               "снять одно предупреждение", 5),
+        ("aunwarnall",  "<user>",               "снять все предупреждения", 5),
+        ("awarnlist",   "[user]",               "предупреждения пользователя", 5),
+        ("amute",       "<user> [срок] [причина]", "мут; срок 30m · 2ч · 7 дней · число = минуты", 5),
+        ("aunmute",     "<user>",               "снять мут", 5),
+        ("akick",       "<user> [причина]",     "кик из конференции", 5),
+        ("aban",        "<user> [срок] [причина]", "бан; без срока — бессрочно", 5),
+        ("aunban",      "<user>",               "разбан", 5),
+        ("ablock",      "<user>",               "отключить пользователя от бота", 5),
+        ("aunblock",    "<user>",               "подключить обратно", 5),
+        ("ablocklist",  "",                     "список отключённых", 5),
+        ("aaudit",      "[@user]",              "журнал действий", 5),
+        ("ahistory",    "<user>",               "история пользователя", 4),
+        ("gban",        "<user> <причина>",     "глобальный ЧС (тихо)", "spec"),
+        ("ungban",      "<user>",               "снять глобальный ЧС", "spec"),
+        ("aglobal_unban", "",                   "снять все баны разом", "main"),
+    ]),
+
+    ("awards", "🏅", "Награды и пометки", [
+        ("aaward",      "<user> <тип> <название>", "выдать награду; типы: медаль, орден, грамота, благодарность, знак", 5),
+        ("aawards_of",  "<user>",               "награды пользователя с номерами", 5),
+        ("aaward_del",  "<номер>",              "снять награду", 5),
+        ("anote",       "<user> <текст>",       "оставить пометку на пользователе", 4),
+        ("anotes",      "<user>",               "посмотреть пометки", 4),
+        ("anote_edit",  "<id> <текст>",         "изменить свою пометку", 4),
+        ("anote_pin",   "<id>",                 "закрепить или открепить пометку", 4),
+        ("anote_del",   "<id>",                 "удалить свою пометку", 4),
+    ]),
+
+    ("staff", "👥", "Ранги, отделы, состав", [
+        ("asetrank",    "<user> <0-7>",         "изменить ранг", 5),
+        ("asetdept",    "<user> <номер>",       "изменить отдел", 5),
+        ("atag",        "<user(s)> <текст>",    "тегнуть людей", 4),
+        ("atagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
+        ("adepartment", "add|remove|rename|list|find", "управление отделами", 5),
+        ("asetalldept", "<номер>",              "перевести всех в отдел", 5),
+        ("asetallrank", "<0-7>",                "выставить всем ранг", "main"),
+        ("aregister",   "<user> <ник> <позывной>", "зарегистрировать пользователя", 6),
+        ("aforcereg",   "<user> <ник> <позывной> <жетон>", "перерегистрировать", 6),
+        ("asettoken",   "<user> <52****>",      "изменить жетон", 6),
+        ("asetnick",    "<user> <ник>",         "изменить ник", "spec"),
+        ("aspecial",    "<user>",               "переключить спецдопуск", 7),
+        ("aspeciallist", "",                    "у кого есть спецдопуск", 7),
+        ("areset_user", "<user>",               "сбросить пользователя", "main"),
+        ("adelete_user", "<user>",              "удалить пользователя", "main"),
+        ("adept_list",  "",                     "все отделы с номерами и порядком", "spec"),
+        ("adept_rename", "<id> <имя>",          "переименовать отдел", "spec"),
+        ("adept_move",  "<id> <порядок>",       "изменить порядок отдела", "spec"),
+        ("adept_group_add", "<название>",       "создать группу отделов", "spec"),
+        ("adept_group_del", "<id>",             "удалить группу", "spec"),
+        ("adept_group_assign", "<dept_id> <group_id|0>", "привязать отдел к группе", "spec"),
+        ("adept_apply_template", "confirm",     "применить шаблон отделов", "spec"),
+        ("afindsetup",  "",                     "настроить видимость отделов в /find", "main"),
+    ]),
+
+    ("system", "⚙️", "Система", [
+        ("apoll_create", "<кандидат> <описание>", "создать голосование", "spec"),
+        ("apolls",      "",                     "активные голосования", "spec"),
+        ("apoll_info",  "<id>",                 "результаты голосования", "spec"),
+        ("apoll_close", "<id>",                 "закрыть голосование", "spec"),
+        ("avote",       "<id> <за|против>",     "проголосовать", 0),
+        ("aidea_submit", "<текст>",             "предложить идею по улучшению бота", 0),
+        ("aideas",      "[статус]",             "список идей", 0),
+        ("aidea_info",  "<id>",                 "подробно об идее", 0),
+        ("aideas_start", "[текст]",             "запустить опрос идей", "spec"),
+        ("aidea_to_changelog", "<id>",          "идея → черновик обновления", "spec"),
+        ("achangelog",  "[id]",                 "обновления бота", 0),
+        ("achangelog_list", "",                 "список обновлений", 0),
+        ("achangelog_add", "<текст>",           "создать черновик обновления", "spec"),
+        ("achangelog_draft", "",                "собрать черновик из журнала", "spec"),
+        ("achangelog_publish", "[id]",          "опубликовать обновление", "spec"),
+        ("achangelog_delete", "<id>",           "удалить обновление", "spec"),
+        ("abroadcast",  "<текст>",              "рассылка всем", 5),
+        ("apm",         "<user> <текст>",       "написать пользователю от имени бота", "main"),
+        ("atgadmin",    "<user> [должность]",   "назначить админом конференции", "main"),
+        ("atgunadmin",  "<user>",               "снять админа конференции", "main"),
+        ("asetadmin",   "<user>",               "добавить главного админа", "main"),
+        ("aunsetadmin", "<user>",               "убрать главного админа", "main"),
+        ("agrant",      "<user> <cmd> [...]",   "выдать доступ к команде", "spec"),
+        ("arevoke",     "<user> <cmd>|all",     "отозвать доступ", "spec"),
+        ("agrantlist",  "<cmd>",                "кому выдан доступ", "spec"),
+        ("agrantcmds",  "",                     "какие команды можно выдавать", "spec"),
+        ("apermsmenu",  "",                     "меню настройки доступов кнопками", "main"),
+        ("abackup",     "",                     "выгрузка списка пользователей", "main"),
+        ("aadd",        "",                     "служебная команда", "main"),
+        ("atest",       "",                     "проверка связи", "main"),
+        ("atestwelcome", "",                    "проверить приветствие новичка", "main"),
+    ]),
+]
+
+
+def _help_can_see(user_id: int, rank: int, level) -> bool:
+    """Доступна ли команда этому пользователю (нужно ли показывать её в справке)."""
+    if level == "main":
+        return is_main_admin(user_id)
+    if level == "spec":
+        return has_special_access(user_id) or is_main_admin(user_id)
+    return rank >= level
+
+
+def _help_visible_sections(user_id: int, rank: int):
+    """Разделы с доступными пользователю командами. Пустые разделы отбрасываются."""
+    out = []
+    for key, emoji, title, cmds in HELP_SECTIONS:
+        visible = [c for c in cmds if _help_can_see(user_id, rank, c[3])]
+        if visible:
+            out.append((key, emoji, title, visible))
+    return out
+
+
+def _help_menu_markup(sections) -> InlineKeyboardMarkup:
+    """Кнопки разделов — по две в ряд."""
+    rows, row = [], []
+    for key, emoji, title, cmds in sections:
+        row.append(InlineKeyboardButton(f"{emoji} {title} · {len(cmds)}",
+                                        callback_data=f"help:sec:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def _help_header(user_id: int, user_data: dict, sections) -> str:
+    """Шапка: кто вы, ранг и сколько команд доступно."""
+    total_available = sum(len(c) for _, _, _, c in sections)
+    total_all = sum(len(c) for _, _, _, c in HELP_SECTIONS)
+    
+    if user_data:
+        name = user_data['nick']
+        callsign = user_data.get('callsign')
+        who = f"{name}" + (f" ({callsign})" if callsign else "")
+        rank_name = RANKS.get(user_data['rank'], RANKS[0])['name']
+    else:
+        who = "не зарегистрирован"
+        rank_name = RANKS[0]['name']
+    
+    extra = ""
+    if is_main_admin(user_id):
+        extra = " · 👑 разработчик"
+    elif has_special_access(user_id):
+        extra = " · 🔐 спецдоступ"
+    
+    # Склонение: 1 команда, 2-4 команды, 5+ команд
+    def _plural(n: int) -> str:
+        if 11 <= n % 100 <= 14:
+            return "команд"
+        last = n % 10
+        if last == 1:
+            return "команда"
+        if 2 <= last <= 4:
+            return "команды"
+        return "команд"
+    
+    counter = (f"доступно {total_available} {_plural(total_available)}"
+               if total_available == total_all
+               else f"доступно {total_available} из {total_all}")
+    
+    # В названии ранга уже есть эмодзи, свой не добавляем
+    return (
+        "🤖 СПРАВКА ПО КОМАНДАМ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {who}\n"
+        f"{rank_name}{extra} · {counter}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Выберите раздел:"
+    )
+
+
+def _help_section_text(emoji: str, title: str, cmds: list) -> str:
+    """Содержимое одного раздела."""
+    lines = [f"{emoji} {title.upper()}", "━━━━━━━━━━━━━━━━━"]
+    for name, args, desc, level in cmds:
+        sig = f"/{name}" + (f" {args}" if args else "")
+        lines.append(sig)
+        lines.append(f"   {desc}")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("💡 <user> — @username, ID, ник, позывной или ответ на сообщение")
+    return "\n".join(lines)
+
+
 async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Справка по командам. Каждая секция — раскрываемая цитата (blockquote expandable),
-    юзер может свернуть/развернуть по клику.
-    """
+    """Справка по командам: меню разделов с кнопками."""
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
     
-    # esc — экранирование HTML в служебных символах (`<user>` → `&lt;user&gt;`)
-    def esc(s: str) -> str:
-        return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    
-    sections = []
-    
-    # ─── Для всех ───
-    sections.append(
-        "👥 <b>ДЛЯ ВСЕХ</b>\n"
-        "<blockquote expandable>"
-        + esc(
-            "/start — главное меню\n"
-            "/ainfo — краткая информация о вас\n"
-            "/aprofile — полный профиль\n"
-            "/astats — статистика бота\n"
-            "/aawards — ваши награды\n"
-            "/anick <имя> — поиск по нику\n"
-            "/asearch <жетон> — поиск по жетону\n"
-            "/find — руководящий состав\n"
-            "/awarns — ваши предупреждения\n"
-            "/aunwarngame — сыграть с ботом за снятие предупреждения (КД 14 дней)\n"
-            "/aukrating [day/week/month/all] — топ преступников\n"
-            "/aduel <@user> — вызвать на дуэль 🔫\n"
-            "/aduel_stats [@user] — статистика дуэлей\n"
-            "/acubes [@user] — кубы 🎲 (без аргумента — открытый вызов)\n"
-            "/acubes_stats [@user] — статистика кубов\n"
-            "/amarry @user1 @user2 — поженить пару 💍\n"
-            "/adivorce @user — развести пару 💔\n"
-            "/awedding [@user] — карточка пары\n"
-            "/aweddings_list — все пары\n"
-            "/achangelog [id] — обновления бота\n"
-            "/achangelog_list — список обновлений\n"
-            "/aidea_submit <текст> — предложить идею для улучшения бота\n"
-            "/aideas [status] — список идей\n"
-            "/aidea_info <id> — детально про идею\n"
-            "/areport — подать жалобу\n"
-            "/check_gban — проверить ЧС\n"
-            "/aperms — ваши индивидуальные доступы\n"
-            "/amood — настроение конференции"
-        )
-        + "</blockquote>"
-    )
-    
-    # ─── 4+ ранг ───
-    if rank >= 4:
-        sections.append(
-            "🎖 <b>ПОДПОЛКОВНИК (4+)</b>\n"
-            "<blockquote expandable>"
-            + esc(
-                "/areports — список жалоб\n"
-                "/areport_info <id> — карточка жалобы\n"
-                "/arequests — заявки на смену ранга/отдела\n"
-                "/arequest_info <id> — карточка заявки\n"
-                "/ahistory <user> — история пользователя\n"
-                "/atag <user(s)> <текст> — тегнуть людей\n"
-                "/atagdept <номер> <текст> — тегнуть отдел\n"
-                "/acallsign — смена позывного\n"
-                "/apunish — выдать выговор (форма в личке) ⚖️\n"
-                "/anote @user <текст> — оставить пометку 📝\n"
-                "/anotes @user — посмотреть все пометки\n"
-                "/anote_del <id> — удалить свою пометку\n"
-                "/anote_edit <id> <текст> — редактировать\n"
-                "/anote_pin <id> — закрепить пометку 📌"
-            )
-            + "</blockquote>"
-        )
-    
-    # ─── 5+ ранг ───
-    if rank >= 5:
-        sections.append(
-            "🛡 <b>ПОЛКОВНИК (5+)</b>\n"
-            "<blockquote expandable>"
-            + esc(
-                "/akick <user> [причина]\n"
-                "/aban <user> [длительность] [причина]\n"
-                "    длительность: 30m | 2h | 7d | 1w\n"
-                "/aunban <user>\n"
-                "/amute <user> [длительность] [причина] — мут 🤐\n"
-                "    (только в конференции; по умолчанию 30m)\n"
-                "/aunmute <user> — снять мут\n"
-                "/aaward <user> <тип> <название> — выдать награду 🏅\n"
-                "    типы: медаль, орден, грамота, благодарность, знак\n"
-                "/aawards_of <user> — награды пользователя\n"
-                "/aaward_del <номер> — снять награду\n"
-                "/awarn <user> <причина>\n"
-                "/aunwarn <user>\n"
-                "/aunwarnall <user>\n"
-                "/asetrank <user> <0-7>\n"
-                "/asetdept <user> <номер>\n"
-                "/ablock <user> — отключить от бота\n"
-                "/aunblock <user> — подключить к боту\n"
-                "/ablocklist — список отключённых\n"
-                "/aaudit [@user] — журнал действий\n"
-                "/aadmins — список администрации\n"
-                "/auserlist — все участники\n"
-                "/awho <user> — чужой профиль\n"
-                "/abroadcast <текст> — рассылка\n"
-                "/adepartment add/remove/rename/list/find\n"
-                "/asetalldept <номер>"
-            )
-            + "</blockquote>"
-        )
-    
-    # ─── 6 ранг ───
-    if rank >= 6:
-        sections.append(
-            "🌟 <b>ГЕНЕРАЛ (6)</b>\n"
-            "<blockquote expandable>"
-            + esc(
-                "/asettoken <user> <52****>\n"
-                "/aregister <user> <ник> <позывной>\n"
-                "/aforcereg <user> <ник> <позывной> <жетон>\n"
-                "/achangelog_add <текст> — создать changelog (черновик)\n"
-                "/achangelog_draft — собрать черновик из audit_log\n"
-                "/achangelog_publish [id] — опубликовать\n"
-                "/achangelog_delete <id>"
-            )
-            + "</blockquote>"
-        )
-    
-    # ─── 7 ранг ───
-    if rank >= 7:
-        sections.append(
-            "⚜️ <b>СЛЕДЯЩИЙ ЗА ФСБ (7)</b>\n"
-            "<blockquote expandable>"
-            + esc(
-                "/aspecial <user> — переключить спецдопуск\n"
-                "/aspeciallist — у кого спецдопуск"
-            )
-            + "</blockquote>"
-        )
-    
-    # ─── Спецдопуск ───
-    if has_special_access(user_id):
-        sections.append(
-            "🔐 <b>СПЕЦДОПУСК</b>\n"
-            "<blockquote expandable>"
-            + esc(
-                "/awhois <id>\n"
-                "/asetnick <user> <ник>\n"
-                "/gban <user> <причина>\n"
-                "/ungban <user>\n"
-                "/gban_list\n"
-                "/acheckall — запустить проверку ранга/отдела сейчас\n"
-                "/agrant <user> <cmd> — выдать доступ\n"
-                "/arevoke <user> <cmd> — отозвать доступ\n"
-                "/agrantlist <cmd> — кому выдан доступ\n"
-                "/agrantcmds — список грантуемых команд\n"
-                "/atgadmins — список администраторов конференции\n"
-                "/afindsetup — настроить видимость отделов в /find\n"
-                "/adept_list — все отделы\n"
-                "/adept_rename <id> <имя>\n"
-                "/adept_move <id> <порядок>\n"
-                "/adept_group_add <название>\n"
-                "/adept_group_del <id>\n"
-                "/adept_group_assign <dept_id> <group_id|0>\n"
-                "/adept_apply_template confirm — применить дефолтный шаблон\n"
-                "/aideas_start [текст] — запустить опрос идей\n"
-                "/aidea_to_changelog <id> — идея → черновик changelog"
-            )
-            + "</blockquote>"
-        )
-    
-    # ─── Главный админ ───
-    if is_main_admin(user_id):
-        sections.append(
-            "👑 <b>РАЗРАБОТЧИК</b>\n"
-            "<blockquote expandable>"
-            + esc(
-                "/asetadmin <user>\n"
-                "/aunsetadmin <user>\n"
-                "/aadminlist\n"
-                "/areset_user <user>\n"
-                "/adelete_user <user>\n"
-                "/abackup\n"
-                "/aglobal_unban\n"
-                "/asetallrank <0-7>\n"
-                "/apermsmenu — интерактивное меню доступов 🎫\n"
-                "/atgadmin <user> [должность] — назначить админом ТГ 👑\n"
-                "/atgunadmin <user> — снять админа ТГ\n"
-                "/agrant <user> <cmd> [cmd2 ...]\n"
-                "/arevoke <user> <cmd> | all\n"
-                "/agrantlist <cmd>\n"
-                "/agrantcmds\n"
-                "/awedding_setdate <user|#id> ДД.ММ.ГГГГ"
-            )
-            + "</blockquote>"
-        )
-    
-    text = "🤖 <b>СПРАВКА ПО КОМАНДАМ</b>\n" + "\n".join(sections)
-    if len(text) > 4000:
-        # Разбить по секциям чтоб уместиться. Простой вариант — два сообщения.
-        halfway = len(sections) // 2
-        first = "🤖 <b>СПРАВКА ПО КОМАНДАМ</b>\n" + "\n".join(sections[:halfway])
-        second = "\n".join(sections[halfway:])
-        await update.message.reply_text(first, parse_mode='HTML')
-        await update.message.reply_text(second, parse_mode='HTML')
+    sections = _help_visible_sections(user_id, rank)
+    if not sections:
+        await update.message.reply_text("❌ Нет доступных команд.")
         return
-    await update.message.reply_text(text, parse_mode='HTML')
+    
+    await update.message.reply_text(
+        _help_header(user_id, user_data, sections),
+        reply_markup=_help_menu_markup(sections),
+    )
+
+
+async def ahelp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключение между меню и разделами. callback_data: help:sec:<key> | help:menu"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_data = get_user_data(user_id)
+    rank = user_data['rank'] if user_data else 0
+    sections = _help_visible_sections(user_id, rank)
+    
+    parts = (query.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    
+    if action == "menu":
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                _help_header(user_id, user_data, sections),
+                reply_markup=_help_menu_markup(sections),
+            )
+        except Exception:
+            pass
+        return
+    
+    if action == "sec" and len(parts) > 2:
+        key = parts[2]
+        found = next((s for s in sections if s[0] == key), None)
+        if not found:
+            await query.answer("Раздел недоступен.", show_alert=True)
+            return
+        _, emoji, title, cmds = found
+        await query.answer()
+        text = _help_section_text(emoji, title, cmds)
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+        try:
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("← Все разделы", callback_data="help:menu")]]
+                ),
+            )
+        except Exception:
+            pass
+        return
+    
+    await query.answer()
+
 
 async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подробный профиль"""
@@ -11605,19 +11707,18 @@ async def startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
         f"{db_line}"
     )
 
-    sent = False
+    # Шлём и в лог-группу, и в личку главному админу — независимо друг от друга,
+    # чтобы недоступность одного канала не отменяла доставку по второму.
     try:
         await context.bot.send_message(chat_id=PM_LOG_CHAT_ID, text=text)
-        sent = True
     except Exception as e:
         logger.debug(f"startup notify to log group failed: {e}")
 
-    if not sent:
-        for admin_id in admin_ids:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=text)
-            except Exception as e:
-                logger.debug(f"startup notify to {admin_id}: {e}")
+    for admin_id in admin_ids:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as e:
+            logger.debug(f"startup notify to {admin_id}: {e}")
 
 
 # ============ ВЫДАЧА НАКАЗАНИЯ (/apunish) ============
@@ -13057,7 +13158,8 @@ def main():
         'ablock': ablock, 'aunblock': aunblock, 'amood': amood,
         'aspecial': aspecial, 'awhois': awhois, 'abroadcast': abroadcast,
         'abackup': abackup, 'aregister': aregister, 'aforcereg': aforcereg,
-        'aadminlist': aadminlist, 'areset_user': areset_user, 'adelete_user': adelete_user,
+        'aadminlist': aadminlist, 'asetadmin': asetadmin, 'aunsetadmin': aunsetadmin,
+        'areset_user': areset_user, 'adelete_user': adelete_user,
         'asetnick': asetnick, 'aglobal_unban': aglobal_unban, 'asetallrank': asetallrank,
         'areport_info': areport_info, 'aspeciallist': aspeciallist,
         'adepartment': adepartment, 'asetalldept': asetalldept,
@@ -13222,6 +13324,8 @@ def main():
     application.add_handler(CallbackQueryHandler(cube_callback, pattern=r'^cube:'))
     # Настройка видимости отделов в /find
     application.add_handler(CallbackQueryHandler(afindsetup_callback, pattern=r'^findsetup:'))
+    # Справка: переключение разделов кнопками
+    application.add_handler(CallbackQueryHandler(ahelp_callback, pattern=r'^help:'))
     # Идеи: ответы юзеров и решения админов
     application.add_handler(CallbackQueryHandler(idea_callback, pattern=r'^idea:'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
