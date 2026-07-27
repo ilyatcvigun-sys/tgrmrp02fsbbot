@@ -51,11 +51,14 @@ def init_pool(dsn: str = None, min_size: int = 1, max_size: int = 10):
     global _pool
     if _pool is not None:
         return _pool
-    dsn = dsn or DATABASE_URL
+    # ВАЖНО: читаем переменную окружения именно СЕЙЧАС, а не при импорте модуля.
+    # bot.py импортирует db_pg в самом начале файла, а строку подключения
+    # выставляет ниже — если брать значение на момент импорта, оно будет пустым.
+    dsn = dsn or os.environ.get("DATABASE_URL", "").strip() or DATABASE_URL
     if not dsn:
         raise RuntimeError(
-            "Не задана строка подключения. Установите переменную окружения DATABASE_URL, "
-            "например: export DATABASE_URL='postgresql://user:pass@host:port/dbname'"
+            "Не задана строка подключения. Укажите её в переменной DATABASE_URL "
+            "в начале bot.py или в переменных окружения панели хостинга."
         )
     _pool = ConnectionPool(
         dsn,
