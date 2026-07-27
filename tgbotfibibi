@@ -72,9 +72,7 @@ ADMIN_IDS = [8026911824]
 # тогда пароль не хранится в коде. Если такой возможности нет, впишите строку
 # подключения сюда (она будет использована как запасной вариант).
 DATABASE_URL = os.environ.get("DATABASE_URL") or (
-    "postgresql://bothost_db_3259092c25db:"
-    "I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw"
-    "@node1.pghost.ru:15631/bothost_db_3259092c25db"
+    "postgresql://bothost_db_3259092c25db:I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw@node1.pghost.ru:15631/bothost_db_3259092c25db"
 )
 os.environ["DATABASE_URL"] = DATABASE_URL   # чтобы увидели db_pg и миграция
 
