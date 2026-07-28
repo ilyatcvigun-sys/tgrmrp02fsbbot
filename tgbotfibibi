@@ -2000,7 +2000,7 @@ HELP_SECTIONS = [
         ("achangelog_delete", "<id>",           "удалить обновление", "spec"),
         ("abroadcast",  "<текст>",              "рассылка всем", 5),
         ("apm",         "<user> <текст>",       "написать пользователю от имени бота", "main"),
-        ("atgadmin",    "<user> [должность]",   "назначить админом конференции", "main"),
+        ("atgadmin",    "<user> [должность]",   "назначить админом конференции (меню прав кнопками)", "main"),
         ("atgunadmin",  "<user>",               "снять админа конференции", "main"),
         ("asetadmin",   "<user>",               "добавить главного админа", "main"),
         ("aunsetadmin", "<user>",               "убрать главного админа", "main"),
@@ -6486,20 +6486,67 @@ async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   • бот может выдать только те права, которые есть у него самого;
 #   • снять права бот может только с тех, кого назначал сам.
 
+# Права TG-администратора, которые можно выдавать точечно через меню /atgadmin.
+# can_promote_members сознательно не выдаём и не показываем в меню —
+# иначе назначенный сможет раздавать права дальше (см. CLAUDE.md).
+TG_ADMIN_PERMS = [
+    ('can_delete_messages',   'Удаление сообщений'),
+    ('can_restrict_members',  'Ограничение участников'),
+    ('can_invite_users',      'Приглашение по ссылке'),
+    ('can_pin_messages',      'Закрепление сообщений'),
+    ('can_manage_topics',     'Управление темами'),
+    ('can_manage_chat',       'Управление чатом'),
+    ('can_manage_video_chats', 'Управление видеочатами'),
+    ('can_change_info',       'Изменение инфо чата'),
+]
+# Дефолт повторяет прежний жёсткий набор прав (всё, кроме can_change_info).
+TG_ADMIN_PERMS_DEFAULT_MASK = (1 << (len(TG_ADMIN_PERMS) - 1)) - 1
+
+
+def _tgadmin_kb(target_id: int, mask: int, title: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора прав: галочка на строку + Применить/Отмена."""
+    rows = []
+    for idx, (key, label) in enumerate(TG_ADMIN_PERMS):
+        marker = "✅" if mask & (1 << idx) else "⬜"
+        rows.append([InlineKeyboardButton(
+            f"{marker} {label}",
+            callback_data=f"atga:tog:{target_id}:{mask}:{idx}:{title}"
+        )])
+    rows.append([
+        InlineKeyboardButton("✅ Применить", callback_data=f"atga:apply:{target_id}:{mask}:{title}"),
+        InlineKeyboardButton("✖️ Отмена", callback_data=f"atga:cancel:{target_id}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _tgadmin_text(target_id: int, title: str) -> str:
+    td = get_user_data(target_id)
+    name = td['nick'] if td else f"id {target_id}"
+    title_line = f"\n🏷 Должность: {title}" if title else ""
+    return (
+        "👑 НАЗНАЧЕНИЕ АДМИНИСТРАТОРОМ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {name}{title_line}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Выберите права и нажмите «Применить».\n"
+        "✅ — выдаётся  ⬜ — не выдаётся"
+    )
+
+
 async def atgadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Назначить пользователя администратором конференции.
-    
+    Открыть меню назначения администратора конференции с выбором прав кнопками.
+
     /atgadmin @user [должность]
     /atgadmin (reply) [должность]
-    
+
     Должность — подпись до 16 символов, видна в списке участников.
     """
     user_id = update.effective_user.id
     if not is_main_admin(user_id):
         await update.message.reply_text("❌ Команда доступна только главному админу.")
         return
-    
+
     args = list(context.args or [])
     target_id = extract_user_id(update, context)
     if not target_id and args:
@@ -6513,63 +6560,130 @@ async def atgadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Или ответом на сообщение: /atgadmin [должность]"
         )
         return
-    
-    title = ' '.join(args).strip()[:16]
-    
-    try:
-        await context.bot.promote_chat_member(
-            chat_id=CONFERENCE_CHAT_ID,
-            user_id=target_id,
-            can_manage_chat=True,
-            can_delete_messages=True,
-            can_restrict_members=True,
-            can_invite_users=True,
-            can_pin_messages=True,
-            can_manage_topics=True,
-            can_manage_video_chats=True,
-            # Право назначать других админов сознательно НЕ выдаём —
-            # иначе назначенный сможет раздавать права дальше.
-            can_promote_members=False,
-            can_change_info=False,
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Не удалось назначить: {e}\n\n"
-            "Проверьте, что у бота есть право «Назначение администраторов» "
-            "и что пользователь состоит в конференции."
+
+    title = ' '.join(args).strip()[:16].replace(':', '')
+
+    await update.message.reply_text(
+        _tgadmin_text(target_id, title),
+        reply_markup=_tgadmin_kb(target_id, TG_ADMIN_PERMS_DEFAULT_MASK, title),
+    )
+
+
+async def atgadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопки меню /atgadmin. Паттерны:
+      atga:tog:<target_id>:<mask>:<idx>:<title>  — переключить бит права
+      atga:apply:<target_id>:<mask>:<title>      — назначить с выбранными правами
+      atga:cancel:<target_id>                    — отменить
+    """
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_main_admin(user_id):
+        await query.answer("❌ Нет прав.", show_alert=True)
+        return
+
+    parts = (query.data or "").split(":", 5)
+    if len(parts) < 3:
+        await query.answer()
+        return
+    action = parts[1]
+
+    if action == 'cancel':
+        await query.answer("Отменено.")
+        try:
+            await query.edit_message_text("✖️ Назначение отменено.")
+        except Exception:
+            pass
+        return
+
+    if action == 'tog' and len(parts) >= 6:
+        try:
+            target_id = int(parts[2])
+            mask = int(parts[3])
+            idx = int(parts[4])
+        except ValueError:
+            await query.answer()
+            return
+        title = parts[5]
+        if 0 <= idx < len(TG_ADMIN_PERMS):
+            mask ^= (1 << idx)
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                _tgadmin_text(target_id, title),
+                reply_markup=_tgadmin_kb(target_id, mask, title),
+            )
+        except Exception:
+            pass
+        return
+
+    if action == 'apply' and len(parts) >= 5:
+        try:
+            target_id = int(parts[2])
+            mask = int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        title = parts[4] if len(parts) > 4 else ""
+
+        perms = {key: bool(mask & (1 << idx)) for idx, (key, _label) in enumerate(TG_ADMIN_PERMS)}
+        try:
+            await context.bot.promote_chat_member(
+                chat_id=CONFERENCE_CHAT_ID,
+                user_id=target_id,
+                can_promote_members=False,
+                **perms,
+            )
+        except Exception as e:
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    f"❌ Не удалось назначить: {e}\n\n"
+                    "Проверьте, что у бота есть право «Назначение администраторов» "
+                    "и что пользователь состоит в конференции."
+                )
+            except Exception:
+                pass
+            return
+
+        # Должность — отдельным запросом, её отсутствие не критично
+        title_note = ""
+        if title:
+            try:
+                await context.bot.set_chat_administrator_custom_title(
+                    chat_id=CONFERENCE_CHAT_ID, user_id=target_id, custom_title=title
+                )
+                title_note = f"\n🏷 Должность: {title}"
+            except Exception as e:
+                logger.debug(f"set custom title failed: {e}")
+                title_note = "\n⚠️ Должность установить не удалось"
+
+        td = get_user_data(target_id)
+        name = td['nick'] if td else f"id {target_id}"
+        granted_labels = [label for idx, (key, label) in enumerate(TG_ADMIN_PERMS) if mask & (1 << idx)]
+        rights_line = ", ".join(granted_labels) if granted_labels else "без прав"
+        log_action(user_id, 'tg_admin_promote', target_id, title or '')
+
+        await query.answer("Назначен.")
+        try:
+            await query.edit_message_text(
+                "👑 НАЗНАЧЕН АДМИНИСТРАТОРОМ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {name}{title_note}\n"
+                f"👮 Назначил: {get_admin_nick(user_id)}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"Права: {rights_line}."
+            )
+        except Exception:
+            pass
+        await notify_user(
+            context, target_id,
+            f"👑 Вам выданы права администратора конференции.\n"
+            f"👮 Назначил: {get_admin_nick(user_id)}"
         )
         return
-    
-    # Должность — отдельным запросом, её отсутствие не критично
-    title_note = ""
-    if title:
-        try:
-            await context.bot.set_chat_administrator_custom_title(
-                chat_id=CONFERENCE_CHAT_ID, user_id=target_id, custom_title=title
-            )
-            title_note = f"\n🏷 Должность: {title}"
-        except Exception as e:
-            logger.debug(f"set custom title failed: {e}")
-            title_note = "\n⚠️ Должность установить не удалось"
-    
-    td = get_user_data(target_id)
-    name = td['nick'] if td else f"id {target_id}"
-    log_action(user_id, 'tg_admin_promote', target_id, title or '')
-    
-    await update.message.reply_text(
-        "👑 НАЗНАЧЕН АДМИНИСТРАТОРОМ\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"👤 {name}{title_note}\n"
-        f"👮 Назначил: {get_admin_nick(user_id)}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "Права: удаление сообщений, ограничение участников,\n"
-        "приглашение, закрепление, управление темами."
-    )
-    await notify_user(
-        context, target_id,
-        f"👑 Вам выданы права администратора конференции.\n"
-        f"👮 Назначил: {get_admin_nick(user_id)}"
-    )
+
+    await query.answer()
 
 
 async def atgunadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13284,6 +13398,7 @@ def main():
     )
     application.add_handler(perms_menu_handler)
     application.add_handler(CallbackQueryHandler(apermsmenu_callback, pattern=r'^perms:'))
+    application.add_handler(CallbackQueryHandler(atgadmin_callback, pattern=r'^atga:'))
     
     # КРИТИЧНО: gate отрезает заблокированных юзеров в ЛС ДО любой другой обработки.
     # group=-2 → раньше track_username и всего остального.
