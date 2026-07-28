@@ -6407,6 +6407,537 @@ async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============ ТЕКСТОВЫЕ ТРИГГЕРЫ МОДЕРАЦИИ ============
+# Типовые модераторские действия словом вместо слэш-команды: «повысить»,
+# «поменять отдел», «мут», «бан», «кик», «варн», «ты кто» — ответом на
+# сообщение пользователя (или с явным @user/ником). Работает только в
+# конференции. Право проверяется как у настоящей команды; без прав триггер
+# МОЛЧИТ — иначе любой обычный участник получал бы "❌ нет прав" от бытового
+# слова в чате (эти слова — обычная лексика игроков, не только команда).
+# Если значения (ранга/отдела/длительности) не хватает — показываются кнопки;
+# если оно уже указано текстом — вызывается настоящая команда напрямую.
+
+_WTRIG_DURATIONS = [
+    ("30 минут", 30), ("1 час", 60), ("3 часа", 180),
+    ("12 часов", 720), ("1 день", 1440), ("7 дней", 10080),
+]
+
+
+def _wtrig_value_tokens(update: Update, tail: list) -> list:
+    """Хвост после отделения триггер-слова: при реальном reply весь хвост — значение,
+    иначе первый токен хвоста — цель, значение начинается со второго."""
+    if _is_real_reply(update.message):
+        return tail
+    return tail[1:] if tail else []
+
+
+async def _wtrig_resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE, tail: list):
+    """Определяет цель триггера: reply или первый токен хвоста (@user/ник/ID)."""
+    target_id = extract_user_id(update, context)
+    if not target_id and tail:
+        target_id = extract_user_id(update, context, tail[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        return None
+    return target_id
+
+
+def _wtrig_rank_kb(target_id: int, current: int, direction: int):
+    """Кнопки рангов: выше текущего (direction>0) или ниже (direction<0). None — некуда."""
+    candidates = list(range(current + 1, 8)) if direction > 0 else list(range(0, current))
+    if not candidates:
+        return None
+    rows, row = [], []
+    for r in candidates:
+        row.append(InlineKeyboardButton(RANKS[r]['name'], callback_data=f"wtrig:rank:{target_id}:{r}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="wtrig:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _wtrig_dept_kb(target_id: int) -> InlineKeyboardMarkup:
+    depts = get_departments()
+    rows = [[InlineKeyboardButton(d, callback_data=f"wtrig:dept:{target_id}:{i}")]
+            for i, d in enumerate(depts)]
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="wtrig:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _wtrig_duration_kb(target_id: int, action: str, permanent: bool = False) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for label, minutes in _WTRIG_DURATIONS:
+        row.append(InlineKeyboardButton(label, callback_data=f"wtrig:{action}:{target_id}:{minutes}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if permanent:
+        rows.append([InlineKeyboardButton("♾️ Навсегда", callback_data=f"wtrig:{action}:{target_id}:0")])
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="wtrig:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _wtrig_confirm_kb(confirm_callback_data: str) -> InlineKeyboardMarkup:
+    """Кнопка «точно?» для необратимых действий (кик/бан) без указанной причины текстом."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да", callback_data=confirm_callback_data),
+        InlineKeyboardButton("✖️ Отмена", callback_data="wtrig:cancel"),
+    ]])
+
+
+async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Текстовые триггеры быстрых модераторских действий (см. секцию выше).
+
+      «повысить» / «понизить» [@user] [ранг]              → /asetrank
+      «поменять отдел» / «сменить отдел» [@user] [номер]  → /asetdept
+      «мут» [@user] [длительность] [причина]               → /amute
+      «бан» [@user] [длительность] [причина]                → /aban
+      «кик» [@user] [причина]                                → /akick
+      «варн» [@user] [причина]                               → /awarn
+      «ты кто» [@user]                                       → /awho
+    """
+    if not update.message or not update.message.text:
+        return
+    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+        return
+    parts = update.message.text.strip().split()
+    if not parts:
+        return
+    first = parts[0].lower()
+    user_id = update.effective_user.id
+
+    if first == "ты" and len(parts) >= 2 and parts[1].lower() == "кто":
+        if not has_permission(user_id, 'manage_ranks', 'awho'):
+            return
+        context.args = parts[2:]
+        await awhoprofile(update, context)
+        return
+
+    if first in ("поменять", "сменить") and len(parts) >= 2 and parts[1].lower() == "отдел":
+        if not has_permission(user_id, 'manage_ranks', 'asetdept'):
+            return
+        tail = parts[2:]
+        if _wtrig_value_tokens(update, tail):
+            context.args = tail
+            await asetdept(update, context)
+            return
+        target_id = await _wtrig_resolve_target(update, context, tail)
+        if target_id is None:
+            await update.message.reply_text("❌ Не удалось найти пользователя.")
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+            return
+        await update.message.reply_text(
+            f"📁 Выберите отдел для {target_data['nick']}:",
+            reply_markup=_wtrig_dept_kb(target_id),
+        )
+        return
+
+    if first in ("повысить", "понизить"):
+        if not has_permission(user_id, 'manage_ranks', 'asetrank'):
+            return
+        tail = parts[1:]
+        if _wtrig_value_tokens(update, tail):
+            context.args = tail
+            await asetrank(update, context)
+            return
+        target_id = await _wtrig_resolve_target(update, context, tail)
+        if target_id is None:
+            await update.message.reply_text("❌ Не удалось найти пользователя.")
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+            return
+        direction = 1 if first == "повысить" else -1
+        kb = _wtrig_rank_kb(target_id, target_data['rank'], direction)
+        if kb is None:
+            await update.message.reply_text(f"❌ У {target_data['nick']} уже крайний ранг в эту сторону.")
+            return
+        await update.message.reply_text(
+            f"⭐ {target_data['nick']} — текущий ранг {RANKS[target_data['rank']]['name']}. Выберите новый:",
+            reply_markup=kb,
+        )
+        return
+
+    if first == "мут":
+        if not has_permission(user_id, 'ban', 'amute'):
+            return
+        tail = parts[1:]
+        if _wtrig_value_tokens(update, tail):
+            context.args = tail
+            await amute(update, context)
+            return
+        target_id = await _wtrig_resolve_target(update, context, tail)
+        if target_id is None:
+            await update.message.reply_text("❌ Не удалось найти пользователя.")
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+            return
+        await update.message.reply_text(
+            f"🤐 На сколько замутить {target_data['nick']}?",
+            reply_markup=_wtrig_duration_kb(target_id, "mute"),
+        )
+        return
+
+    if first == "бан":
+        if not has_permission(user_id, 'ban', 'aban'):
+            return
+        tail = parts[1:]
+        if _wtrig_value_tokens(update, tail):
+            context.args = tail
+            await aban(update, context)
+            return
+        target_id = await _wtrig_resolve_target(update, context, tail)
+        if target_id is None:
+            await update.message.reply_text("❌ Не удалось найти пользователя.")
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+            return
+        await update.message.reply_text(
+            f"🚫 На сколько забанить {target_data['nick']}?",
+            reply_markup=_wtrig_duration_kb(target_id, "banpick", permanent=True),
+        )
+        return
+
+    if first == "кик":
+        if not has_permission(user_id, 'kick', 'akick'):
+            return
+        tail = parts[1:]
+        if _wtrig_value_tokens(update, tail):
+            # Причина указана текстом — это уже осознанное действие, как /akick
+            context.args = tail
+            await akick(update, context)
+            return
+        # Голое слово без причины — подтверждение, чтобы не кикнуть по шутке в реплае
+        target_id = await _wtrig_resolve_target(update, context, tail)
+        if target_id is None:
+            await update.message.reply_text("❌ Не удалось найти пользователя.")
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+            return
+        await update.message.reply_text(
+            f"👢 Точно кикнуть {target_data['nick']}?",
+            reply_markup=_wtrig_confirm_kb(f"wtrig:kickconfirm:{target_id}"),
+        )
+        return
+
+    if first == "варн":
+        if not has_permission(user_id, 'warn', 'awarn'):
+            return
+        context.args = parts[1:]
+        await awarn(update, context)
+        return
+
+
+async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопки словесных триггеров. callback_data:
+      wtrig:rank:<target_id>:<new_rank>
+      wtrig:dept:<target_id>:<dept_idx>
+      wtrig:mute:<target_id>:<minutes>
+      wtrig:ban:<target_id>:<minutes|0=навсегда>
+      wtrig:cancel
+    """
+    query = update.callback_query
+    user_id = query.from_user.id
+    parts = (query.data or "").split(":")
+    if len(parts) < 2:
+        await query.answer()
+        return
+    action = parts[1]
+
+    if action == 'cancel':
+        await query.answer("Отменено.")
+        try:
+            await query.edit_message_text("✖️ Отменено.")
+        except Exception:
+            pass
+        return
+
+    if action == 'rank' and len(parts) >= 4:
+        if not has_permission(user_id, 'manage_ranks', 'asetrank'):
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        try:
+            target_id, new_rank = int(parts[2]), int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await query.answer("❌ Пользователь не найден.", show_alert=True)
+            return
+        if is_user_blocked(target_id):
+            await query.answer("❌ Пользователь отключён от бота.", show_alert=True)
+            return
+        if not update_user_rank(target_id, new_rank):
+            await query.answer("❌ Не удалось обновить ранг.", show_alert=True)
+            return
+        log_action(user_id, 'rank_change', target_id,
+                   f"{target_data['rank']} → {new_rank} ({RANKS[new_rank]['name']})")
+        issuer_name = get_admin_nick(user_id)
+        await query.answer("Готово.")
+        try:
+            await query.edit_message_text(
+                "⭐ ИЗМЕНЕНИЕ РАНГА\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+                f"⭐ Новый ранг: {RANKS[new_rank]['name']}\n"
+                f"👮 Изменил: {issuer_name}"
+            )
+        except Exception:
+            pass
+        await notify_user(
+            context, target_id,
+            f"📢 Ваш ранг изменён!\n⭐ Новый ранг: {RANKS[new_rank]['name']}\n👮 Изменил: {issuer_name}",
+        )
+        return
+
+    if action == 'dept' and len(parts) >= 4:
+        if not has_permission(user_id, 'manage_ranks', 'asetdept'):
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        try:
+            target_id, dept_idx = int(parts[2]), int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        depts = get_departments()
+        if dept_idx < 0 or dept_idx >= len(depts):
+            await query.answer("❌ Отдел не найден.", show_alert=True)
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await query.answer("❌ Пользователь не найден.", show_alert=True)
+            return
+        new_dept = depts[dept_idx]
+        if not update_user_department(target_id, new_dept):
+            await query.answer("❌ Не удалось обновить отдел.", show_alert=True)
+            return
+        log_action(user_id, 'dept_change', target_id, f"{target_data['department']} → {new_dept}")
+        issuer_name = get_admin_nick(user_id)
+        await query.answer("Готово.")
+        try:
+            await query.edit_message_text(
+                "📁 ИЗМЕНЕНИЕ ОТДЕЛА\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+                f"📁 Новый отдел: {new_dept}\n"
+                f"👮 Изменил: {issuer_name}"
+            )
+        except Exception:
+            pass
+        await notify_user(
+            context, target_id,
+            f"📢 Ваш отдел изменён!\n📁 Новый отдел: {new_dept}\n👮 Изменил: {issuer_name}",
+        )
+        return
+
+    if action == 'mute' and len(parts) >= 4:
+        if not has_permission(user_id, 'ban', 'amute'):
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        try:
+            target_id, minutes = int(parts[2]), int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        duration = timedelta(minutes=max(1, minutes))
+        until_utc = datetime.now(timezone.utc) + duration
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=CONFERENCE_CHAT_ID,
+                user_id=target_id,
+                permissions=ChatPermissions(
+                    can_send_messages=False, can_send_audios=False, can_send_documents=False,
+                    can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
+                    can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                ),
+                until_date=until_utc,
+            )
+        except Exception as e:
+            await query.answer()
+            try:
+                await query.edit_message_text(f"❌ Не удалось замутить: {e}")
+            except Exception:
+                pass
+            return
+        td = get_user_data(target_id)
+        target_nick = td['nick'] if td else f"id {target_id}"
+        issuer_nick = get_admin_nick(user_id)
+        duration_view = format_duration(duration)
+        until_view = (now_msk() + duration).strftime("%d.%m.%Y %H:%M")
+        log_action(user_id, 'mute', target_id, f"{duration_view}: —")
+        await query.answer("Готово.")
+        try:
+            await query.edit_message_text(
+                "🤐 МУТ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {target_nick}\n"
+                f"⏳ Длительность: {duration_view}\n"
+                f"🕐 До: {until_view} МСК\n"
+                f"👮 Замутил: {issuer_nick}"
+            )
+        except Exception:
+            pass
+        await notify_user(
+            context, target_id,
+            f"🤐 Вам выдан мут в конференции\n⏳ На: {duration_view}\n👮 Замутил: {issuer_nick}",
+        )
+        return
+
+    if action == 'kickconfirm' and len(parts) >= 3:
+        if not has_permission(user_id, 'kick', 'akick'):
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await query.answer("❌ Пользователь не найден.", show_alert=True)
+            return
+        target_name = target_data['callsign']
+        target_nick = target_data['nick']
+
+        await send_action_message(update, context, target_id, "kick", "")
+        if not await kick_user_from_chat(update, context, target_id):
+            await query.answer()
+            try:
+                await query.edit_message_text("❌ Не удалось кикнуть.")
+            except Exception:
+                pass
+            return
+
+        log_action(user_id, 'kick', target_id, '')
+        disconnected = disconnect_user_from_bot(target_id)
+        if disconnected:
+            log_action(None, 'auto_disconnect_kick', target_id, f"кикнут админом id={user_id}")
+        issuer_name = get_admin_nick(user_id)
+        await query.answer("Готово.")
+        try:
+            await query.edit_message_text(
+                "👢 ПОЛЬЗОВАТЕЛЬ КИКНУТ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {target_nick} ({target_name})\n"
+                f"👮 Кикнул: {issuer_name}"
+                + ("\n━━━━━━━━━━━━━━━━━\n🚫 Авто-отключён от бота, ранг и отдел сняты."
+                   if disconnected else "")
+            )
+        except Exception:
+            pass
+        return
+
+    if action == 'banpick' and len(parts) >= 4:
+        # Промежуточный шаг: срок уже выбран кнопкой, но бан ещё не применён —
+        # просим подтверждение, чтобы случайное «бан» в реплае не банило по-настоящему.
+        if not has_permission(user_id, 'ban', 'aban'):
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        try:
+            target_id, minutes = int(parts[2]), int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await query.answer("❌ Пользователь не найден.", show_alert=True)
+            return
+        label = "навсегда" if minutes <= 0 else format_duration(timedelta(minutes=minutes))
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                f"🚫 Точно забанить {target_data['nick']} — {label}?",
+                reply_markup=_wtrig_confirm_kb(f"wtrig:banconfirm:{target_id}:{minutes}"),
+            )
+        except Exception:
+            pass
+        return
+
+    if action == 'banconfirm' and len(parts) >= 4:
+        if not has_permission(user_id, 'ban', 'aban'):
+            await query.answer("❌ Нет прав.", show_alert=True)
+            return
+        try:
+            target_id, minutes = int(parts[2]), int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        banned_until_str = None
+        duration_label = "бессрочно"
+        if minutes > 0:
+            duration_td = timedelta(minutes=minutes)
+            banned_until_dt = now_msk() + duration_td
+            banned_until_str = banned_until_dt.strftime("%Y-%m-%d %H:%M:%S")
+            duration_label = format_duration(duration_td) + f" (до {banned_until_str})"
+
+        target_data = get_user_data(target_id)
+        if not target_data:
+            await query.answer("❌ Пользователь не найден.", show_alert=True)
+            return
+        target_name = target_data['callsign']
+        target_nick = target_data['nick']
+
+        await send_action_message(update, context, target_id, "ban", "")
+        if not await ban_user_in_chat(update, context, target_id):
+            await query.answer()
+            try:
+                await query.edit_message_text("❌ Не удалось забанить.")
+            except Exception:
+                pass
+            return
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            '''UPDATE users SET ban_status = "Да", ban_reason = ?, ban_date = ?, banned_until = ?
+               WHERE user_id = ?''',
+            ("Без причины", now_msk_str(), banned_until_str, target_id),
+        )
+        conn.commit()
+        conn.close()
+
+        log_action(user_id, 'ban', target_id, f"{duration_label} — Без причины")
+        issuer_name = get_admin_nick(user_id)
+        await query.answer("Готово.")
+        try:
+            await query.edit_message_text(
+                "🚫 БАН\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"👤 {target_nick} ({target_name})\n"
+                f"⏰ Срок: {duration_label}\n"
+                f"👮 Забанил: {issuer_name}"
+            )
+        except Exception:
+            pass
+        await notify_user(
+            context, target_id,
+            f"🚫 Вы забанены\n⏰ Срок: {duration_label}\n👮 Забанил: {issuer_name}",
+        )
+        return
+
+    await query.answer()
+
+
 async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Разбан"""
     user_id = update.effective_user.id
@@ -13499,7 +14030,11 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cube_trigger_router), group=5)
     # «поженить пару» / «наша пара» / «пары» / «стаж» — текст-триггеры
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wedding_trigger_router), group=6)
-    
+    # «повысить»/«понизить»/«поменять отдел»/«мут»/«бан»/«кик»/«варн»/«ты кто» —
+    # текстовые триггеры модерации. Отдельная группа по той же причине.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, word_trigger_router), group=7)
+    application.add_handler(CallbackQueryHandler(word_trigger_callback, pattern=r'^wtrig:'))
+
     application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
     application.job_queue.run_repeating(expire_warnings_job, interval=3600, first=30)
