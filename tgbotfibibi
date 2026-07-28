@@ -711,7 +711,15 @@ def init_database():
             closed_at TEXT DEFAULT ''
         )
     ''')
-    
+
+    # Миграция: message_id объявления в топике голосований — чтобы редактировать
+    # тот же пост (обновлять счётчик), а не слать новое сообщение на каждый голос.
+    try:
+        c.execute('ALTER TABLE polls ADD COLUMN topic_message_id INTEGER')
+        logger.info("polls.topic_message_id: миграция применена")
+    except sqlite3.OperationalError:
+        pass
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS poll_votes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8852,19 +8860,39 @@ def _poll_dm_text(poll_id: int, candidate: str, description: str) -> str:
     )
 
 
-async def _poll_announce_tally(context: ContextTypes.DEFAULT_TYPE, poll_id: int):
-    """Анонимный апдейт счётчиков в топик конфы — без имени проголосовавшего."""
+def _poll_topic_text(poll: dict) -> str:
+    """Текст сообщения-объявления в топике — то же сообщение редактируется на
+    каждый голос (счётчик), чтобы не плодить новые сообщения на каждый клик."""
+    status_line = "🟢 Идёт голосование" if poll['status'] == 'active' else "🔴 Голосование закрыто"
+    return (
+        f"🗳 ГОЛОСОВАНИЕ #{poll['id']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 Кандидат: {poll['candidate']}\n"
+        f"📝 {poll['description']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👮 Создал: {poll['creator_nick']}\n"
+        f"📅 {poll['created_at']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📊 Да: {poll['yes']} | Нет: {poll['no']} | Возд: {poll['abstain']}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"🔒 Голосование анонимное — {status_line.lower()}."
+    )
+
+
+async def _poll_update_topic_tally(context: ContextTypes.DEFAULT_TYPE, poll_id: int):
+    """
+    Обновляет счётчик прямо в сообщении-объявлении в топике (редактирует то же
+    сообщение), вместо того чтобы слать новое сообщение на каждый голос.
+    """
     poll = get_poll_by_id(poll_id)
-    if not poll:
+    if not poll or not poll.get('topic_message_id'):
         return
     try:
-        await context.bot.send_message(
+        await context.bot.edit_message_text(
             chat_id=CONFERENCE_CHAT_ID,
-            text=(
-                f"🗳 Голос принят по #{poll_id}\n"
-                f"📊 Да: {poll['yes']} | Нет: {poll['no']} | Возд: {poll['abstain']}"
-            ),
-            message_thread_id=POLL_TOPIC_ID,
+            message_id=poll['topic_message_id'],
+            text=_poll_topic_text(poll),
+            reply_markup=_poll_vote_kb(poll_id) if poll['status'] == 'active' else None,
         )
     except Exception:
         pass
@@ -8946,8 +8974,15 @@ def get_poll_by_id(poll_id: int) -> dict:
         return {"id": row[0], "candidate": row[1], "description": row[2], "additions": row[3],
                 "creator_id": row[4], "creator_nick": row[5], "status": row[6],
                 "yes": row[7], "no": row[8], "abstain": row[9],
-                "created_at": row[10], "closed_at": row[11]}
+                "created_at": row[10], "closed_at": row[11],
+                "topic_message_id": row[12] if len(row) > 12 else None}
     return None
+
+def set_poll_topic_message(poll_id: int, message_id: int):
+    """Запоминает message_id объявления в топике — чтобы редактировать его же на каждый голос."""
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute('UPDATE polls SET topic_message_id = ? WHERE id = ?', (message_id, poll_id))
+    conn.commit(); conn.close()
 
 def close_poll(poll_id: int) -> dict:
     conn = sqlite3.connect(DB_FILE); c = conn.cursor()
@@ -8987,22 +9022,17 @@ async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll_id = create_poll(candidate_nick, description, user_id)
     creator_nick = get_admin_nick(user_id)
 
-    # === В КОНФЕРЕНЦИЮ (топик) — только объявление, голосование анонимное и идёт в ЛС ===
-    conf_text = (
-        f"🗳 НОВОЕ ГОЛОСОВАНИЕ #{poll_id}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"👤 Кандидат: {candidate_nick}\n"
-        f"📝 {description}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"👮 Создал: {creator_nick}\n"
-        f"📅 {now_msk_str('%Y-%m-%d %H:%M')}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "🔒 Голосование анонимное, разослано всем в ЛС."
-    )
+    # === В КОНФЕРЕНЦИЮ (топик) — одно сообщение с кнопками, которое дальше
+    # РЕДАКТИРУЕТСЯ на каждый голос (счётчик), а не плодит новые сообщения ===
+    poll = get_poll_by_id(poll_id)
+    conf_text = _poll_topic_text(poll)
+    kb = _poll_vote_kb(poll_id)
     try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=conf_text, message_thread_id=POLL_TOPIC_ID)
+        msg = await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=conf_text,
+                                              message_thread_id=POLL_TOPIC_ID, reply_markup=kb)
     except:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=conf_text)
+        msg = await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=conf_text, reply_markup=kb)
+    set_poll_topic_message(poll_id, msg.message_id)
 
     # === В ЛС ВСЕМ — кнопки вместо текстовой команды с ID ===
     conn = sqlite3.connect(DB_FILE); c = conn.cursor()
@@ -9047,14 +9077,15 @@ async def avote(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Голос принят: {_POLL_VOTE_LABELS[vote_en]}\n"
             f"📊 Да:{poll['yes']} Нет:{poll['no']} Возд:{poll['abstain']}"
         )
-        await _poll_announce_tally(context, poll_id)
+        await _poll_update_topic_tally(context, poll_id)
         await _poll_log_vote(context, poll_id, user_id, vote_en, reason)
     else: await update.message.reply_text(f"❌ {message}")
 
 
 async def poll_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Кнопки голосования из ЛС-сообщения /apoll_create.
+    Кнопки голосования — работают и под сообщением в ЛС, и прямо под
+    объявлением в топике конфы (callback_data одинаковый в обоих местах).
     callback_data: poll:vote:<poll_id>:<yes|no|abstain>
     """
     query = update.callback_query
@@ -9083,17 +9114,23 @@ async def poll_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer(f"❌ {message}", show_alert=True)
         return
 
-    await query.answer("✅ Голос учтён, спасибо!")
-    try:
-        base_text = query.message.text or ""
-        await query.edit_message_text(
-            base_text + f"\n\n━━━━━━━━━━━━━━━━━\n🔒 Ваш голос: {_POLL_VOTE_LABELS[vote_en]}",
-            reply_markup=None,
-        )
-    except Exception:
-        pass
+    await query.answer(f"✅ Голос учтён: {_POLL_VOTE_LABELS[vote_en]}", show_alert=True)
 
-    await _poll_announce_tally(context, poll_id)
+    # Личное ЛС-сообщение — можно подтвердить именно этому юзеру и убрать кнопки.
+    # Общее сообщение в топике трогать текстом нельзя (его видят все) — там
+    # обновится только агрегат счётчика через _poll_update_topic_tally ниже.
+    if query.message and query.message.chat_id != CONFERENCE_CHAT_ID:
+        try:
+            base_text = query.message.text or ""
+            await query.edit_message_text(
+                base_text + f"\n\n━━━━━━━━━━━━━━━━━\n🔒 Ваш голос: {_POLL_VOTE_LABELS[vote_en]}",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    await _poll_update_topic_tally(context, poll_id)
+    await _poll_log_vote(context, poll_id, user_id, vote_en)
     await _poll_log_vote(context, poll_id, user_id, vote_en)
 
 
@@ -9144,7 +9181,10 @@ async def apoll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     closed = close_poll(poll_id)
     total = closed['yes'] + closed['no'] + closed['abstain']
     result = "✅ ПРИНЯТО" if closed['yes'] > closed['no'] else "❌ ОТКЛОНЕНО"
-    
+
+    # Убираем кнопки с живого сообщения в топике — голосование больше не активно
+    await _poll_update_topic_tally(context, poll_id)
+
     # === В КОНФУ ===
     conf_text = (
         f"🗳 ГОЛОСОВАНИЕ #{poll_id} ЗАКРЫТО\n"
