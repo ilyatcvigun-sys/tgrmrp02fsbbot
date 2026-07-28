@@ -12455,16 +12455,26 @@ async def startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
         c.execute("SELECT COUNT(*) FROM reports WHERE status = 'pending'")
         pending_n = c.fetchone()[0]
         conn.close()
-        db_line = f"👥 Пользователей: {users_n}\n📨 Жалоб в ожидании: {pending_n}"
+        db_line = f"👥 Зарегистрировано в боте: {users_n}\n📨 Жалоб в ожидании: {pending_n}"
     except Exception as e:
         logger.debug(f"startup stats failed: {e}")
         db_line = "⚠️ Не удалось прочитать статистику из базы"
+
+    # Численность самой конференции в Telegram — не то же самое, что зарегистрировано
+    # в боте (кто-то в конфе не регистрировался, кто-то зарегистрирован, но вышел).
+    conf_line = ""
+    try:
+        conf_count = await context.bot.get_chat_member_count(CONFERENCE_CHAT_ID)
+        conf_line = f"\n🏛 Участников в конфе: {conf_count}"
+    except Exception as e:
+        logger.debug(f"startup conf member count failed: {e}")
 
     text = (
         "🟢 БОТ ЗАПУЩЕН\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"🕐 {now_msk_str('%d.%m.%Y %H:%M:%S')} МСК\n"
         f"{db_line}"
+        f"{conf_line}"
     )
 
     # Шлём и в лог-группу, и в личку главному админу — независимо друг от друга,
