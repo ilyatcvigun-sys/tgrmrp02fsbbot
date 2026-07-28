@@ -263,22 +263,31 @@ class Cursor:
         # и явный conn.rollback() переставал работать. Поэтому пишем SAVEPOINT
         # вручную: psycopg сам откроет транзакцию перед первым запросом, а мы
         # внутри неё ставим точку сохранения.
+        #
+        # SAVEPOINT + сам запрос + RELEASE отправляются одним pipeline-батчем —
+        # это 1 network round-trip вместо 3. Раньше БД была локальным SQLite-файлом
+        # (round-trip ~0), после переезда на сетевой PostgreSQL три round-trip'а на
+        # каждый запрос стали заметно тормозить отклик бота. Семантика (откат только
+        # упавшего запроса, а не всей транзакции) не меняется — только группировка
+        # сетевых обращений. Проверено на реальном PostgreSQL: успешный путь,
+        # ошибка с восстановлением через ROLLBACK TO SAVEPOINT, RETURNING id — типовые
+        # сценарии этого слоя совместимости отрабатывают как раньше.
         sp = "sp_bot"
-        self._sp(f"SAVEPOINT {sp}")
         try:
-            self._cur.execute(pg_sql, tuple(params) if params else None)
-            if want_lastrowid:
-                row = self._cur.fetchone()
-                if row:
-                    self.lastrowid = row[0]
+            with self._cw._raw.pipeline():
+                self._sp(f"SAVEPOINT {sp}")
+                self._cur.execute(pg_sql, tuple(params) if params else None)
+                if want_lastrowid:
+                    row = self._cur.fetchone()
+                    if row:
+                        self.lastrowid = row[0]
+                self._sp(f"RELEASE SAVEPOINT {sp}")
         except psycopg.Error as e:
             self._sp(f"ROLLBACK TO SAVEPOINT {sp}")
             if isinstance(e, (psycopg.errors.UniqueViolation,
                               psycopg.errors.IntegrityError)):
                 raise _sqlite3.IntegrityError(str(e)) from e
             raise _sqlite3.OperationalError(f"{e}\nЗапрос: {pg_sql}") from e
-        else:
-            self._sp(f"RELEASE SAVEPOINT {sp}")
         return self
 
     def _sp(self, cmd):
