@@ -213,7 +213,7 @@ GRANTABLE_COMMANDS = {
     # Спецдопуск
     'acheckall',
     # Прочее, что бывает полезно делегировать
-    'asetnick', 'aspeciallist',
+    'asetnick', 'aspeciallist', 'apm',
 }
 
 
@@ -9523,14 +9523,15 @@ async def pm_log_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def apm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Написать пользователю в личку от имени бота. Только главный админ.
-    
+    Написать пользователю в личку от имени бота.
+    Главный админ — всегда; остальным — только через индивидуальный грант.
+
     /apm <user> <текст>
     /apm (reply в лог-группе не нужен — это для произвольных сообщений)
     """
     user_id = update.effective_user.id
-    if not is_main_admin(user_id):
-        await update.message.reply_text("❌ Команда доступна только главному админу.")
+    if not has_permission(user_id, 'apm', 'apm'):
+        await update.message.reply_text("❌ Команда доступна только главному админу (или с грантом).")
         return
     
     args = list(context.args or [])
