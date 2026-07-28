@@ -3615,19 +3615,6 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Пользователь больше не появится в командных списках,\n"
         "а бот не будет реагировать на его сообщения в ЛС."
     )
-    # Пытаемся уведомить юзера ПОСЛЕДНИМ сообщением (после этого он уже отрезан)
-    try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=(
-                "🚫 Вы отключены от бота.\n"
-                f"👮 Отключил: {issuer_name}\n\n"
-                "Ваш ранг и отдел сняты. Бот больше не будет отвечать на ваши сообщения.\n"
-                "По вопросам обращайтесь к руководству."
-            ),
-        )
-    except Exception:
-        pass
 
 
 async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3667,13 +3654,6 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 ID: {target_id}\n"
         f"👮 Подключил: {issuer_name}"
     )
-    try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=f"✅ Вы снова подключены к боту.\n👮 Подключил: {issuer_name}",
-        )
-    except Exception:
-        pass
 
 
 async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
