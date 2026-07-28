@@ -1878,7 +1878,7 @@ HELP_SECTIONS = [
         ("aperms",     "",                      "ваши индивидуальные доступы", 0),
         ("awarns",     "",                      "ваши предупреждения", 0),
         ("astats",     "",                      "статистика бота", 0),
-        ("ahelp",      "",                      "эта справка", 0),
+        ("ahelp",      "[текст]",               "эта справка (с текстом — поиск команды)", 0),
         ("cancel",     "",                      "прервать начатую форму", 0),
         ("acallsign",  "<новый позывной>",      "сменить себе позывной", 0),
         ("awho",       "<user>",                "профиль другого пользователя", 5),
@@ -2017,20 +2017,28 @@ HELP_SECTIONS = [
 ]
 
 
-def _help_can_see(user_id: int, rank: int, level) -> bool:
+def _help_can_see(user_id: int, rank: int, level, special: bool) -> bool:
     """Доступна ли команда этому пользователю (нужно ли показывать её в справке)."""
     if level == "main":
         return is_main_admin(user_id)
     if level == "spec":
-        return has_special_access(user_id) or is_main_admin(user_id)
+        return special
     return rank >= level
 
 
-def _help_visible_sections(user_id: int, rank: int):
-    """Разделы с доступными пользователю командами. Пустые разделы отбрасываются."""
+def _help_visible_sections(user_id: int, rank: int, special: bool):
+    """
+    Разделы с доступными пользователю командами. Пустые разделы отбрасываются.
+
+    special — предвычисленный флаг спецдоступа (is_main_admin or has_special_access).
+    ВАЖНО: не вычислять его заново внутри цикла — раньше has_special_access()
+    (отдельный запрос к БД) вызывался на КАЖДУЮ команду уровня "spec" (их ~29),
+    из-за чего одна отрисовка /ahelp делала ~30 отдельных запросов вместо одного
+    и после переезда на сетевой PostgreSQL ощутимо тормозила.
+    """
     out = []
     for key, emoji, title, cmds in HELP_SECTIONS:
-        visible = [c for c in cmds if _help_can_see(user_id, rank, c[3])]
+        visible = [c for c in cmds if _help_can_see(user_id, rank, c[3], special)]
         if visible:
             out.append((key, emoji, title, visible))
     return out
@@ -2050,11 +2058,11 @@ def _help_menu_markup(sections) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _help_header(user_id: int, user_data: dict, sections) -> str:
+def _help_header(user_id: int, user_data: dict, sections, special: bool) -> str:
     """Шапка: кто вы, ранг и сколько команд доступно."""
     total_available = sum(len(c) for _, _, _, c in sections)
     total_all = sum(len(c) for _, _, _, c in HELP_SECTIONS)
-    
+
     if user_data:
         name = user_data['nick']
         callsign = user_data.get('callsign')
@@ -2063,11 +2071,11 @@ def _help_header(user_id: int, user_data: dict, sections) -> str:
     else:
         who = "не зарегистрирован"
         rank_name = RANKS[0]['name']
-    
+
     extra = ""
     if is_main_admin(user_id):
         extra = " · 👑 разработчик"
-    elif has_special_access(user_id):
+    elif special:
         extra = " · 🔐 спецдоступ"
     
     # Склонение: 1 команда, 2-4 команды, 5+ команд
@@ -2108,19 +2116,48 @@ def _help_section_text(emoji: str, title: str, cmds: list) -> str:
     return "\n".join(lines)
 
 
+def _help_search_text(query: str, cmds: list) -> str:
+    """Результаты поиска команд по ключевому слову (/ahelp <текст>)."""
+    lines = [f"🔎 ПОИСК: «{query}»", "━━━━━━━━━━━━━━━━━"]
+    for name, args, desc, level in cmds:
+        sig = f"/{name}" + (f" {args}" if args else "")
+        lines.append(sig)
+        lines.append(f"   {desc}")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append(f"Найдено: {len(cmds)}")
+    return "\n".join(lines)
+
+
 async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Справка по командам: меню разделов с кнопками."""
+    """
+    Справка по командам: меню разделов с кнопками.
+    /ahelp <текст> — поиск команды по названию или описанию, без меню.
+    """
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
-    
-    sections = _help_visible_sections(user_id, rank)
+    special = is_main_admin(user_id) or has_special_access(user_id)
+
+    sections = _help_visible_sections(user_id, rank, special)
     if not sections:
         await update.message.reply_text("❌ Нет доступных команд.")
         return
-    
+
+    query = ' '.join(context.args or []).strip().lower()
+    if query:
+        found = [c for _, _, _, cmds in sections for c in cmds
+                 if query in c[0].lower() or query in c[2].lower()]
+        if not found:
+            await update.message.reply_text(f"❌ По запросу «{query}» ничего не найдено.")
+            return
+        text = _help_search_text(query, found)
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+        await update.message.reply_text(text)
+        return
+
     await update.message.reply_text(
-        _help_header(user_id, user_data, sections),
+        _help_header(user_id, user_data, sections, special),
         reply_markup=_help_menu_markup(sections),
     )
 
@@ -2131,16 +2168,17 @@ async def ahelp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     user_data = get_user_data(user_id)
     rank = user_data['rank'] if user_data else 0
-    sections = _help_visible_sections(user_id, rank)
-    
+    special = is_main_admin(user_id) or has_special_access(user_id)
+    sections = _help_visible_sections(user_id, rank, special)
+
     parts = (query.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
-    
+
     if action == "menu":
         await query.answer()
         try:
             await query.edit_message_text(
-                _help_header(user_id, user_data, sections),
+                _help_header(user_id, user_data, sections, special),
                 reply_markup=_help_menu_markup(sections),
             )
         except Exception:
