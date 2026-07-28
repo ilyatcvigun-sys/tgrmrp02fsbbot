@@ -59,9 +59,9 @@ OPENROUTER_FALLBACK_MODELS = [
 
 GAME_NICK, CALLSIGN = range(2)
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
-# States для /apunish (форма выдачи наказания, только в личке).
+# States для /punish (форма выдачи наказания, только в личке).
 PUNISH_VIOLATOR, PUNISH_VIOLATION, PUNISH_EVIDENCE, PUNISH_FACTION, PUNISH_WARNS, PUNISH_CONFIRM = range(20, 26)
-# State для интерактивного меню настройки доступов /apermsmenu (главный админ).
+# State для интерактивного меню настройки доступов /permsmenu (главный админ).
 PERMS_USER = 30
 
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
@@ -102,7 +102,7 @@ TOPIC_VIOLATION_REACT_COOLDOWN_SEC = 60      # антифлуд замечани
 chat_messages = []
 
 # Множество user_id, отключённых от бота. Заполняется при старте и
-# обновляется командами /ablock и /aunblock. Используется в gate-хэндлере,
+# обновляется командами /block и /unblock. Используется в gate-хэндлере,
 # чтобы не дёргать SQLite на каждое сообщение.
 blocked_users: set = set()
 
@@ -192,28 +192,28 @@ def get_admin_nick(user_id: int) -> str:
     return ud['nick'] if ud else str(user_id)
 
 # ============ ИНДИВИДУАЛЬНЫЕ ГРАНТЫ НА КОМАНДЫ ============
-# Список команд, на которые в принципе можно выдавать гранты через /agrant.
+# Список команд, на которые в принципе можно выдавать гранты через /grant.
 # Команды уровня "разработчик" (управление админами, удаление юзеров, бэкап БД,
 # спецдопуск, глобальный ЧС) сюда сознательно НЕ включены — это защита от эскалации прав.
 GRANTABLE_COMMANDS = {
     # 4 ранг
-    'areport_info', 'acallsign', 'atag', 'atagdept',
-    'arequests', 'arequest_info', 'ahistory',
+    'report_info', 'callsign', 'tag', 'tagdept',
+    'requests', 'request_info', 'history',
     # 5 ранг
-    'akick', 'aban', 'aunban',
-    'awarn', 'aunwarn', 'aunwarnall', 'awarns',
-    'asetrank', 'asetdept',
-    'ablock', 'aunblock', 'ablocklist',
-    'aaudit',
-    'auserlist', 'awho', 'abroadcast',
-    'adepartment', 'asetalldept',
-    'atestwelcome',
+    'kick', 'ban', 'unban',
+    'warn', 'unwarn', 'unwarnall', 'warns',
+    'setrank', 'setdept',
+    'block', 'unblock', 'blocklist',
+    'audit',
+    'userlist', 'who', 'broadcast',
+    'department', 'setalldept',
+    'testwelcome',
     # 6 ранг
-    'asettoken', 'aregister', 'aforcereg', 'achangelog',
+    'settoken', 'register', 'forcereg', 'changelog',
     # Спецдопуск
-    'acheckall',
+    'checkall',
     # Прочее, что бывает полезно делегировать
-    'asetnick', 'aspeciallist', 'apm',
+    'setnick', 'speciallist', 'pm',
 }
 
 
@@ -409,7 +409,7 @@ def _is_real_reply(message) -> bool:
     Возвращает True только если message содержит РЕАЛЬНЫЙ reply на конкретное сообщение.
     В супергруппах с форум-топиками у каждого сообщения автоматически есть
     reply_to_message, указывающий на стартер темы — это НЕ настоящий ответ,
-    его нужно игнорировать. Иначе команды типа /asetrank без аргументов будут
+    его нужно игнорировать. Иначе команды типа /setrank без аргументов будут
     применяться к автору первого сообщения топика (часто — к создателю чата).
     
     Реальный reply отличается тем, что:
@@ -804,7 +804,7 @@ def init_database():
         pass
     
     # Миграция для игры за снятие предупреждения: когда последний раз играл.
-    # Используется для проверки КД (14 дней) на /aunwarngame.
+    # Используется для проверки КД (14 дней) на /unwarngame.
     try:
         c.execute('ALTER TABLE users ADD COLUMN last_warn_game_at TEXT')
         logger.info("Migration: added users.last_warn_game_at column")
@@ -913,7 +913,7 @@ def init_database():
         pass
     
     # Changelogs — обновления бота: черновики и опубликованные посты.
-    # status: 'draft' (видно только админам) | 'published' (видно всем через /achangelog).
+    # status: 'draft' (видно только админам) | 'published' (видно всем через /changelog).
     c.execute('''
         CREATE TABLE IF NOT EXISTS changelogs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1009,7 +1009,7 @@ def init_database():
         pass
     
     # Пометки на пользователей — досье модератора.
-    # Видны только тем, кто может /anotes (модераторам 4+).
+    # Видны только тем, кто может /notes (модераторам 4+).
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1533,7 +1533,7 @@ def get_admins() -> list:
 
 def get_all_users_list() -> list:
     """Полный список активных (не отключённых от бота) пользователей.
-       Для просмотра ВСЕХ записей, включая отключённых, используйте /abackup."""
+       Для просмотра ВСЕХ записей, включая отключённых, используйте /backup."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''SELECT user_id, game_nick, callsign, token, rank, department 
@@ -1594,7 +1594,7 @@ def disconnect_user_from_bot(user_id: int) -> bool:
       - department='Не назначен'
       - кладём в кэш blocked_users
     Возвращает True если запись существовала и обновлена, False если юзера нет в БД.
-    Используется и /ablock, и автоматикой при кике из конфы.
+    Используется и /block, и автоматикой при кике из конфы.
     """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -1829,7 +1829,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⭐ {permissions['name']}\n"
             "━━━━━━━━━━━━━━━━━\n"
             "Выберите действие на клавиатуре ниже\n"
-            "или используйте /ahelp для списка команд.",
+            "или используйте /help для списка команд.",
             reply_markup=reply_markup,
         )
     else:
@@ -1869,7 +1869,7 @@ async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{flags_line}"
     )
 
-# ============ СПРАВКА ПО КОМАНДАМ (/ahelp) ============
+# ============ СПРАВКА ПО КОМАНДАМ (/help) ============
 # Единый реестр команд. Из него строятся и меню разделов, и их содержимое.
 # При добавлении новой команды достаточно дописать сюда одну строку.
 #
@@ -1880,147 +1880,147 @@ async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 HELP_SECTIONS = [
     ("profile", "👤", "Профиль", [
         ("start",      "",                      "главное меню", 0),
-        ("ainfo",      "",                      "краткая информация о вас", 0),
-        ("aprofile",   "",                      "полный профиль", 0),
-        ("aawards",    "",                      "ваши награды", 0),
-        ("aperms",     "",                      "ваши индивидуальные доступы", 0),
-        ("awarns",     "",                      "ваши предупреждения", 0),
-        ("astats",     "",                      "статистика бота", 0),
-        ("ahelp",      "[текст]",               "эта справка (с текстом — поиск команды)", 0),
+        ("info",      "",                      "краткая информация о вас", 0),
+        ("profile",   "",                      "полный профиль", 0),
+        ("awards",    "",                      "ваши награды", 0),
+        ("perms",     "",                      "ваши индивидуальные доступы", 0),
+        ("warns",     "",                      "ваши предупреждения", 0),
+        ("stats",     "",                      "статистика бота", 0),
+        ("help",      "[текст]",               "эта справка (с текстом — поиск команды)", 0),
         ("cancel",     "",                      "прервать начатую форму", 0),
-        ("acallsign",  "<новый позывной>",      "сменить себе позывной", 0),
-        ("awho",       "<user>",                "профиль другого пользователя", 5),
-        ("awhois",     "<id>",                  "полная информация по ID", "spec"),
+        ("callsign",  "<новый позывной>",      "сменить себе позывной", 0),
+        ("who",       "<user>",                "профиль другого пользователя", 5),
+        ("whois",     "<id>",                  "полная информация по ID", "spec"),
     ]),
 
     ("search", "🔍", "Поиск и состав", [
         ("find",       "",                      "руководящий состав", 0),
-        ("anick",      "<имя>",                 "поиск по нику", 0),
-        ("asearch",    "<жетон>",               "поиск по жетону", 0),
+        ("nick",      "<имя>",                 "поиск по нику", 0),
+        ("search",    "<жетон>",               "поиск по жетону", 0),
         ("check_gban", "<user>",                "проверить, есть ли в ЧС", 0),
-        ("auserlist",  "",                      "все участники", 5),
-        ("aadmins",    "",                      "администрация по рангам бота", 5),
-        ("atgadmins",  "",                      "администраторы конференции", "spec"),
-        ("aadminlist", "",                      "список главных админов", "main"),
+        ("userlist",  "",                      "все участники", 5),
+        ("admins",    "",                      "администрация по рангам бота", 5),
+        ("tgadmins",  "",                      "администраторы конференции", "spec"),
+        ("adminlist", "",                      "список главных админов", "main"),
         ("gban_list",  "",                      "список глобального ЧС", "spec"),
     ]),
 
     ("games", "🎮", "Игры и развлечения", [
-        ("acubes",       "[@user]",             "кубы; без аргумента — открытый вызов", 0),
-        ("acubes_stats", "[@user]",             "статистика кубов", 0),
-        ("aduel",        "<@user>",             "вызвать на дуэль", 0),
-        ("aduel_stats",  "[@user]",             "статистика дуэлей", 0),
-        ("aukrating",    "[day|week|month|all]", "топ преступников по статьям УК", 0),
-        ("aunwarngame",  "",                    "сыграть за снятие предупреждения (КД 14 дней)", 0),
-        ("amood",        "",                    "настроение конференции", 0),
-        ("awedding",     "[@user]",             "карточка пары", 0),
-        ("aweddings_list", "",                  "все пары", 0),
-        ("amarry",       "@user1 @user2",       "поженить пару", 4),
-        ("adivorce",     "@user",               "развести пару", 4),
-        ("awedding_setdate", "<user|#id> <дата>", "изменить дату брака", 4),
-        ("areloadarticles", "",                 "перечитать базу статей УК", "main"),
-        ("amooddebug",   "",                    "диагностика анализа настроения", "main"),
+        ("cubes",       "[@user]",             "кубы; без аргумента — открытый вызов", 0),
+        ("cubes_stats", "[@user]",             "статистика кубов", 0),
+        ("duel",        "<@user>",             "вызвать на дуэль", 0),
+        ("duel_stats",  "[@user]",             "статистика дуэлей", 0),
+        ("ukrating",    "[day|week|month|all]", "топ преступников по статьям УК", 0),
+        ("unwarngame",  "",                    "сыграть за снятие предупреждения (КД 14 дней)", 0),
+        ("mood",        "",                    "настроение конференции", 0),
+        ("wedding",     "[@user]",             "карточка пары", 0),
+        ("weddings_list", "",                  "все пары", 0),
+        ("marry",       "@user1 @user2",       "поженить пару", 4),
+        ("divorce",     "@user",               "развести пару", 4),
+        ("wedding_setdate", "<user|#id> <дата>", "изменить дату брака", 4),
+        ("reloadarticles", "",                 "перечитать базу статей УК", "main"),
+        ("mooddebug",   "",                    "диагностика анализа настроения", "main"),
     ]),
 
     ("reports", "📨", "Жалобы и выговоры", [
-        ("areport",      "",                    "подать жалобу", 0),
-        ("areports",     "",                    "список жалоб", 4),
-        ("areport_info", "<id>",                "карточка жалобы", 4),
-        ("apunish",      "",                    "выдать выговор (форма в личке)", 4),
-        ("arequests",    "",                    "заявки на смену ранга и отдела", 4),
-        ("arequest_info", "<id>",               "карточка заявки", 4),
-        ("acheckall",    "",                    "запустить проверку рангов сейчас", "spec"),
+        ("report",      "",                    "подать жалобу", 0),
+        ("reports",     "",                    "список жалоб", 4),
+        ("report_info", "<id>",                "карточка жалобы", 4),
+        ("punish",      "",                    "выдать выговор (форма в личке)", 4),
+        ("requests",    "",                    "заявки на смену ранга и отдела", 4),
+        ("request_info", "<id>",               "карточка заявки", 4),
+        ("checkall",    "",                    "запустить проверку рангов сейчас", "spec"),
     ]),
 
     ("moderation", "🛡", "Модерация", [
-        ("awarn",       "<user> <причина>",     "выдать предупреждение", 5),
-        ("aunwarn",     "<user>",               "снять одно предупреждение", 5),
-        ("aunwarnall",  "<user>",               "снять все предупреждения", 5),
-        ("awarnlist",   "[user]",               "предупреждения пользователя", 5),
-        ("amute",       "<user> [срок] [причина]", "мут; срок 30m · 2ч · 7 дней · число = минуты", 5),
-        ("aunmute",     "<user>",               "снять мут", 5),
-        ("akick",       "<user> [причина]",     "кик из конференции", 5),
-        ("aban",        "<user> [срок] [причина]", "бан; без срока — бессрочно", 5),
-        ("aunban",      "<user>",               "разбан", 5),
-        ("ablock",      "<user>",               "отключить пользователя от бота", 5),
-        ("aunblock",    "<user>",               "подключить обратно", 5),
-        ("ablocklist",  "",                     "список отключённых", 5),
-        ("aaudit",      "[@user]",              "журнал действий", 5),
-        ("ahistory",    "<user>",               "история пользователя", 4),
+        ("warn",       "<user> <причина>",     "выдать предупреждение", 5),
+        ("unwarn",     "<user>",               "снять одно предупреждение", 5),
+        ("unwarnall",  "<user>",               "снять все предупреждения", 5),
+        ("warnlist",   "[user]",               "предупреждения пользователя", 5),
+        ("mute",       "<user> [срок] [причина]", "мут; срок 30m · 2ч · 7 дней · число = минуты", 5),
+        ("unmute",     "<user>",               "снять мут", 5),
+        ("kick",       "<user> [причина]",     "кик из конференции", 5),
+        ("ban",        "<user> [срок] [причина]", "бан; без срока — бессрочно", 5),
+        ("unban",      "<user>",               "разбан", 5),
+        ("block",      "<user>",               "отключить пользователя от бота", 5),
+        ("unblock",    "<user>",               "подключить обратно", 5),
+        ("blocklist",  "",                     "список отключённых", 5),
+        ("audit",      "[@user]",              "журнал действий", 5),
+        ("history",    "<user>",               "история пользователя", 4),
         ("gban",        "<user> <причина>",     "глобальный ЧС (тихо)", "spec"),
         ("ungban",      "<user>",               "снять глобальный ЧС", "spec"),
-        ("aglobal_unban", "",                   "снять все баны разом", "main"),
+        ("global_unban", "",                   "снять все баны разом", "main"),
     ]),
 
     ("awards", "🏅", "Награды и пометки", [
-        ("aaward",      "<user> <тип> <название>", "выдать награду; типы: медаль, орден, грамота, благодарность, знак", 5),
-        ("aawards_of",  "<user>",               "награды пользователя с номерами", 5),
-        ("aaward_del",  "<номер>",              "снять награду", 5),
-        ("anote",       "<user> <текст>",       "оставить пометку на пользователе", 4),
-        ("anotes",      "<user>",               "посмотреть пометки", 4),
-        ("anote_edit",  "<id> <текст>",         "изменить свою пометку", 4),
-        ("anote_pin",   "<id>",                 "закрепить или открепить пометку", 4),
-        ("anote_del",   "<id>",                 "удалить свою пометку", 4),
+        ("award",      "<user> <тип> <название>", "выдать награду; типы: медаль, орден, грамота, благодарность, знак", 5),
+        ("awards_of",  "<user>",               "награды пользователя с номерами", 5),
+        ("award_del",  "<номер>",              "снять награду", 5),
+        ("note",       "<user> <текст>",       "оставить пометку на пользователе", 4),
+        ("notes",      "<user>",               "посмотреть пометки", 4),
+        ("note_edit",  "<id> <текст>",         "изменить свою пометку", 4),
+        ("note_pin",   "<id>",                 "закрепить или открепить пометку", 4),
+        ("note_del",   "<id>",                 "удалить свою пометку", 4),
     ]),
 
     ("staff", "👥", "Ранги, отделы, состав", [
-        ("asetrank",    "<user> <0-7>",         "изменить ранг", 5),
-        ("asetdept",    "<user> <номер>",       "изменить отдел", 5),
-        ("atag",        "<user(s)> <текст>",    "тегнуть людей", 4),
-        ("atagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
-        ("adepartment", "add|remove|rename|list|find", "управление отделами", 5),
-        ("asetalldept", "<номер>",              "перевести всех в отдел", 5),
-        ("asetallrank", "<0-7>",                "выставить всем ранг", "main"),
-        ("aregister",   "<user> <ник> <позывной>", "зарегистрировать пользователя", 6),
-        ("aforcereg",   "<user> <ник> <позывной> <жетон>", "перерегистрировать", 6),
-        ("asettoken",   "<user> <52****>",      "изменить жетон", 6),
-        ("asetnick",    "<user> <ник>",         "изменить ник", "spec"),
-        ("aspecial",    "<user>",               "переключить спецдопуск", 7),
-        ("aspeciallist", "",                    "у кого есть спецдопуск", 7),
-        ("areset_user", "<user>",               "сбросить пользователя", "main"),
-        ("adelete_user", "<user>",              "удалить пользователя", "main"),
-        ("adept_list",  "",                     "все отделы с номерами и порядком", "spec"),
-        ("adept_rename", "<id> <имя>",          "переименовать отдел", "spec"),
-        ("adept_move",  "<id> <порядок>",       "изменить порядок отдела", "spec"),
-        ("adept_group_add", "<название>",       "создать группу отделов", "spec"),
-        ("adept_group_del", "<id>",             "удалить группу", "spec"),
-        ("adept_group_assign", "<dept_id> <group_id|0>", "привязать отдел к группе", "spec"),
-        ("adept_apply_template", "confirm",     "применить шаблон отделов", "spec"),
-        ("afindsetup",  "",                     "настроить видимость отделов в /find", "main"),
+        ("setrank",    "<user> <0-7>",         "изменить ранг", 5),
+        ("setdept",    "<user> <номер>",       "изменить отдел", 5),
+        ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
+        ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
+        ("department", "add|remove|rename|list|find", "управление отделами", 5),
+        ("setalldept", "<номер>",              "перевести всех в отдел", 5),
+        ("setallrank", "<0-7>",                "выставить всем ранг", "main"),
+        ("register",   "<user> <ник> <позывной>", "зарегистрировать пользователя", 6),
+        ("forcereg",   "<user> <ник> <позывной> <жетон>", "перерегистрировать", 6),
+        ("settoken",   "<user> <52****>",      "изменить жетон", 6),
+        ("setnick",    "<user> <ник>",         "изменить ник", "spec"),
+        ("special",    "<user>",               "переключить спецдопуск", 7),
+        ("speciallist", "",                    "у кого есть спецдопуск", 7),
+        ("reset_user", "<user>",               "сбросить пользователя", "main"),
+        ("delete_user", "<user>",              "удалить пользователя", "main"),
+        ("dept_list",  "",                     "все отделы с номерами и порядком", "spec"),
+        ("dept_rename", "<id> <имя>",          "переименовать отдел", "spec"),
+        ("dept_move",  "<id> <порядок>",       "изменить порядок отдела", "spec"),
+        ("dept_group_add", "<название>",       "создать группу отделов", "spec"),
+        ("dept_group_del", "<id>",             "удалить группу", "spec"),
+        ("dept_group_assign", "<dept_id> <group_id|0>", "привязать отдел к группе", "spec"),
+        ("dept_apply_template", "confirm",     "применить шаблон отделов", "spec"),
+        ("findsetup",  "",                     "настроить видимость отделов в /find", "main"),
     ]),
 
     ("system", "⚙️", "Система", [
-        ("apoll_create", "<кандидат> <описание>", "создать голосование", "spec"),
-        ("apolls",      "",                     "активные голосования", "spec"),
-        ("apoll_info",  "<id>",                 "результаты голосования", "spec"),
-        ("apoll_close", "<id>",                 "закрыть голосование", "spec"),
-        ("avote",       "<id> <за|против>",     "проголосовать текстом (резерв — обычно кнопки в ЛС)", 0),
-        ("aidea_submit", "<текст>",             "предложить идею по улучшению бота", 0),
-        ("aideas",      "[статус]",             "список идей", 0),
-        ("aidea_info",  "<id>",                 "подробно об идее", 0),
-        ("aideas_start", "[текст]",             "запустить опрос идей", "spec"),
-        ("aidea_to_changelog", "<id>",          "идея → черновик обновления", "spec"),
-        ("achangelog",  "[id]",                 "обновления бота", 0),
-        ("achangelog_list", "",                 "список обновлений", 0),
-        ("achangelog_add", "<текст>",           "создать черновик обновления", "spec"),
-        ("achangelog_draft", "",                "собрать черновик из журнала", "spec"),
-        ("achangelog_publish", "[id]",          "опубликовать обновление", "spec"),
-        ("achangelog_delete", "<id>",           "удалить обновление", "spec"),
-        ("abroadcast",  "<текст>",              "рассылка всем", 5),
-        ("apm",         "<user> <текст>",       "написать пользователю от имени бота", "main"),
-        ("atgadmin",    "<user> [должность]",   "назначить админом конференции (меню прав кнопками)", "main"),
-        ("atgunadmin",  "<user>",               "снять админа конференции", "main"),
-        ("asetadmin",   "<user>",               "добавить главного админа", "main"),
-        ("aunsetadmin", "<user>",               "убрать главного админа", "main"),
-        ("agrant",      "<user> <cmd> [...]",   "выдать доступ к команде", "spec"),
-        ("arevoke",     "<user> <cmd>|all",     "отозвать доступ", "spec"),
-        ("agrantlist",  "<cmd>",                "кому выдан доступ", "spec"),
-        ("agrantcmds",  "",                     "какие команды можно выдавать", "spec"),
-        ("apermsmenu",  "",                     "меню настройки доступов кнопками", "main"),
-        ("abackup",     "",                     "выгрузка списка пользователей", "main"),
-        ("aadd",        "",                     "служебная команда", "main"),
-        ("atest",       "",                     "проверка связи", "main"),
-        ("atestwelcome", "",                    "проверить приветствие новичка", "main"),
+        ("poll_create", "<кандидат> <описание>", "создать голосование", "spec"),
+        ("polls",      "",                     "активные голосования", "spec"),
+        ("poll_info",  "<id>",                 "результаты голосования", "spec"),
+        ("poll_close", "<id>",                 "закрыть голосование", "spec"),
+        ("vote",       "<id> <да|нет|воздерж>", "проголосовать текстом (резерв — обычно кнопки в топике)", 0),
+        ("idea_submit", "<текст>",             "предложить идею по улучшению бота", 0),
+        ("ideas",      "[статус]",             "список идей", 0),
+        ("idea_info",  "<id>",                 "подробно об идее", 0),
+        ("ideas_start", "[текст]",             "запустить опрос идей", "spec"),
+        ("idea_to_changelog", "<id>",          "идея → черновик обновления", "spec"),
+        ("changelog",  "[id]",                 "обновления бота", 0),
+        ("changelog_list", "",                 "список обновлений", 0),
+        ("changelog_add", "<текст>",           "создать черновик обновления", "spec"),
+        ("changelog_draft", "",                "собрать черновик из журнала", "spec"),
+        ("changelog_publish", "[id]",          "опубликовать обновление", "spec"),
+        ("changelog_delete", "<id>",           "удалить обновление", "spec"),
+        ("broadcast",  "<текст>",              "рассылка всем", 5),
+        ("pm",         "<user> <текст>",       "написать пользователю от имени бота", "main"),
+        ("tgadmin",    "<user> [должность]",   "назначить админом конференции (меню прав кнопками)", "main"),
+        ("tgunadmin",  "<user>",               "снять админа конференции", "main"),
+        ("setadmin",   "<user>",               "добавить главного админа", "main"),
+        ("unsetadmin", "<user>",               "убрать главного админа", "main"),
+        ("grant",      "<user> <cmd> [...]",   "выдать доступ к команде", "spec"),
+        ("revoke",     "<user> <cmd>|all",     "отозвать доступ", "spec"),
+        ("grantlist",  "<cmd>",                "кому выдан доступ", "spec"),
+        ("grantcmds",  "",                     "какие команды можно выдавать", "spec"),
+        ("permsmenu",  "",                     "меню настройки доступов кнопками", "main"),
+        ("backup",     "",                     "выгрузка списка пользователей", "main"),
+        ("add",        "",                     "служебная команда", "main"),
+        ("test",       "",                     "проверка связи", "main"),
+        ("testwelcome", "",                    "проверить приветствие новичка", "main"),
     ]),
 ]
 
@@ -2041,7 +2041,7 @@ def _help_visible_sections(user_id: int, rank: int, special: bool):
     special — предвычисленный флаг спецдоступа (is_main_admin or has_special_access).
     ВАЖНО: не вычислять его заново внутри цикла — раньше has_special_access()
     (отдельный запрос к БД) вызывался на КАЖДУЮ команду уровня "spec" (их ~29),
-    из-за чего одна отрисовка /ahelp делала ~30 отдельных запросов вместо одного
+    из-за чего одна отрисовка /help делала ~30 отдельных запросов вместо одного
     и после переезда на сетевой PostgreSQL ощутимо тормозила.
     """
     out = []
@@ -2125,7 +2125,7 @@ def _help_section_text(emoji: str, title: str, cmds: list) -> str:
 
 
 def _help_search_text(query: str, cmds: list) -> str:
-    """Результаты поиска команд по ключевому слову (/ahelp <текст>)."""
+    """Результаты поиска команд по ключевому слову (/help <текст>)."""
     lines = [f"🔎 ПОИСК: «{query}»", "━━━━━━━━━━━━━━━━━"]
     for name, args, desc, level in cmds:
         sig = f"/{name}" + (f" {args}" if args else "")
@@ -2139,7 +2139,7 @@ def _help_search_text(query: str, cmds: list) -> str:
 async def ahelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Справка по командам: меню разделов с кнопками.
-    /ahelp <текст> — поиск команды по названию или описанию, без меню.
+    /help <текст> — поиск команды по названию или описанию, без меню.
     """
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
@@ -2284,16 +2284,16 @@ async def aaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Выдать награду.
     
-    /aaward @user <тип> <название>
-    /aaward (reply) <тип> <название>
+    /award @user <тип> <название>
+    /award (reply) <тип> <название>
     
     Типы: медаль, орден, грамота, благодарность, знак.
     Если тип не указан — по умолчанию «медаль».
     
-    Пример: /aaward @sokol орден За отвагу при задержании
+    Пример: /award @sokol орден За отвагу при задержании
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'aaward'):
+    if not has_permission(user_id, 'warn', 'award'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга или со спецдоступом.")
         return
     
@@ -2307,9 +2307,9 @@ async def aaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_id in (None, -1):
         types_line = ', '.join(AWARD_TYPES.keys())
         await update.message.reply_text(
-            "❌ Использование: /aaward <@user> <тип> <название>\n"
+            "❌ Использование: /award <@user> <тип> <название>\n"
             f"Типы: {types_line}\n\n"
-            "Пример: /aaward @sokol орден За отвагу при задержании"
+            "Пример: /award @sokol орден За отвагу при задержании"
         )
         return
     
@@ -2329,7 +2329,7 @@ async def aaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         types_line = ', '.join(AWARD_TYPES.keys())
         await update.message.reply_text(
             "❌ Не указано название награды.\n"
-            f"Формат: /aaward @user <тип> <название>\n"
+            f"Формат: /award @user <тип> <название>\n"
             f"Типы: {types_line}"
         )
         return
@@ -2358,17 +2358,17 @@ async def aaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{type_view}\n"
         f"📜 {award_name}\n"
         f"👮 Наградил: {issuer}\n\n"
-        "Посмотреть все награды: /aawards"
+        "Посмотреть все награды: /awards"
     )
 
 
 async def aawards_of(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Награды другого пользователя (с номерами, чтобы можно было снять).
-    /aawards_of @user   (или reply)
+    /awards_of @user   (или reply)
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'aawards_of'):
+    if not has_permission(user_id, 'warn', 'awards_of'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга или со спецдоступом.")
         return
     
@@ -2378,7 +2378,7 @@ async def aawards_of(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
-        await update.message.reply_text("❌ Использование: /aawards_of @user (или reply).")
+        await update.message.reply_text("❌ Использование: /awards_of @user (или reply).")
         return
     
     td = get_user_data(target_id)
@@ -2408,7 +2408,7 @@ async def aawards_of(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"   📅 {r['date']} · 👮 {iname}")
     lines.append("━━━━━━━━━━━━━━━━━")
     lines.append(f"Всего: {len(rows)}")
-    lines.append("Снять: /aaward_del <номер>")
+    lines.append("Снять: /award_del <номер>")
     
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -2419,17 +2419,17 @@ async def aawards_of(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aaward_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Снять (удалить) награду по её номеру.
-    /aaward_del <номер>
-    Номер виден в /aawards_of @user.
+    /award_del <номер>
+    Номер виден в /awards_of @user.
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'aaward_del'):
+    if not has_permission(user_id, 'warn', 'award_del'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга или со спецдоступом.")
         return
     if not context.args:
         await update.message.reply_text(
-            "❌ Использование: /aaward_del <номер>\n"
-            "Номер награды можно посмотреть в /aawards_of @user"
+            "❌ Использование: /award_del <номер>\n"
+            "Номер награды можно посмотреть в /awards_of @user"
         )
         return
     try:
@@ -2482,7 +2482,7 @@ async def aawards(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по нику"""
     if not context.args:
-        await update.message.reply_text("❌ Использование: /anick <имя>")
+        await update.message.reply_text("❌ Использование: /nick <имя>")
         return
     
     nickname = ' '.join(context.args)
@@ -2510,7 +2510,7 @@ async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список участников (5+)"""
-    if not has_permission(update.effective_user.id, 'manage_ranks', 'auserlist'):
+    if not has_permission(update.effective_user.id, 'manage_ranks', 'userlist'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -2534,7 +2534,7 @@ async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по жетону"""
     if not context.args:
-        await update.message.reply_text("❌ Использование: /asearch 52****")
+        await update.message.reply_text("❌ Использование: /search 52****")
         return
     
     token = context.args[0]
@@ -2699,12 +2699,12 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         welcome_text += (
             f"▫️ Всего участников: *{total_users}*\n\n"
             f"📋 *ПОЛЕЗНЫЕ КОМАНДЫ:*\n"
-            f"├ /ainfo — Ваш профиль\n"
-            f"├ /ahelp — Команды\n"
+            f"├ /info — Ваш профиль\n"
+            f"├ /help — Команды\n"
             f"├ /find — Руководящий состав\n"
-            f"├ /anick имя — Найти по нику\n"
-            f"├ /awarns — Ваши предупреждения\n"
-            f"└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
+            f"├ /nick имя — Найти по нику\n"
+            f"├ /warns — Ваши предупреждения\n"
+            f"└ кнопка в лс или /report — Подать заявку на выдачу наказаний\n\n"
         )
         
         if admins:
@@ -2746,7 +2746,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тест приветствия"""
-    if not has_permission(update.effective_user.id, 'warn', 'atestwelcome'):
+    if not has_permission(update.effective_user.id, 'warn', 'testwelcome'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2778,9 +2778,9 @@ async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text += (
         f"▫️ Всего участников: *{total_users}*\n\n"
         f"📋 *ПОЛЕЗНЫЕ КОМАНДЫ:*\n"
-        f"├ /ainfo — Ваш профиль\n├ /ahelp — Команды\n├ /find — Руководящий состав\n"
-        f"├ /anick имя — Найти по нику\n├ /awarns — Ваши предупреждения\n"
-        f"└ кнопка в лс или /areport — Подать заявку на выдачу наказаний\n\n"
+        f"├ /info — Ваш профиль\n├ /help — Команды\n├ /find — Руководящий состав\n"
+        f"├ /nick имя — Найти по нику\n├ /warns — Ваши предупреждения\n"
+        f"└ кнопка в лс или /report — Подать заявку на выдачу наказаний\n\n"
     )
     
     if admins:
@@ -2840,7 +2840,7 @@ async def send_action_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кик пользователя"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'kick', 'akick'):
+    if not has_permission(user_id, 'kick', 'kick'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -2851,7 +2851,7 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason = ' '.join(context.args) if context.args else ""
     else:
         if not context.args:
-            await update.message.reply_text("❌ /akick @user причина")
+            await update.message.reply_text("❌ /kick @user причина")
             return
         target_id = extract_user_id(update, context, context.args[0])
         reason = ' '.join(context.args[1:]) if len(context.args) > 1 else ""
@@ -2912,19 +2912,19 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Бан пользователя — постоянный или временный.
     
     Использование:
-      /aban @user [длительность] [причина...]
-      (ответом на сообщение) /aban [длительность] [причина...]
+      /ban @user [длительность] [причина...]
+      (ответом на сообщение) /ban [длительность] [причина...]
     
     Длительность опциональна: 30m, 2h, 7d, 1w (минуты/часы/дни/недели).
     Без длительности — бессрочный бан.
     
     Примеры:
-      /aban @ivan спам
-      /aban @ivan 7d флуд в чате
-      (ответом) /aban 2h оскорбления
+      /ban @ivan спам
+      /ban @ivan 7d флуд в чате
+      (ответом) /ban 2h оскорбления
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'ban', 'aban'):
+    if not has_permission(user_id, 'ban', 'ban'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -2937,7 +2937,7 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         if not args:
             await update.message.reply_text(
-                "❌ Использование: /aban <@user|ID> [длительность] [причина]\n"
+                "❌ Использование: /ban <@user|ID> [длительность] [причина]\n"
                 "Длительность: 30m, 2h, 7d, 1w (опц.)"
             )
             return
@@ -2955,8 +2955,8 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Первый оставшийся аргумент может быть длительностью.
     # Поддерживается и двухсловная форма: «7 дней», «2 часа», «1 неделя».
-    # Голое число БЕЗ единицы в /aban длительностью НЕ считается (в отличие от
-    # /amute) — чтобы причина вида «3 варна» не превращалась в бан на 3 минуты.
+    # Голое число БЕЗ единицы в /ban длительностью НЕ считается (в отличие от
+    # /mute) — чтобы причина вида «3 варна» не превращалась в бан на 3 минуты.
     duration_td = None
     if args:
         first = args[0].strip()
@@ -3088,7 +3088,7 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача предупреждения"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'awarn'):
+    if not has_permission(user_id, 'warn', 'warn'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -3099,7 +3099,7 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason = ' '.join(context.args) if context.args else "Без причины"
     else:
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /awarn @user причина")
+            await update.message.reply_text("❌ /warn @user причина")
             return
         target_id = extract_user_id(update, context, context.args[0])
         reason = ' '.join(context.args[1:])
@@ -3147,7 +3147,7 @@ async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось найти.")
         return
     
-    if target_id != user_id and not has_permission(user_id, 'warn', 'awarns'):
+    if target_id != user_id and not has_permission(user_id, 'warn', 'warns'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -3167,7 +3167,7 @@ async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снятие одного предупреждения"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'aunwarn'):
+    if not has_permission(user_id, 'warn', 'unwarn'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -3175,7 +3175,7 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
     if not target_id:
-        await update.message.reply_text("❌ /aunwarn @user")
+        await update.message.reply_text("❌ /unwarn @user")
         return
     
     if isinstance(target_id, str) and target_id.startswith('@'):
@@ -3238,7 +3238,7 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снятие всех предупреждений"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'aunwarnall'):
+    if not has_permission(user_id, 'warn', 'unwarnall'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -3246,7 +3246,7 @@ async def aunwarnall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
     if not target_id:
-        await update.message.reply_text("❌ /aunwarnall @user")
+        await update.message.reply_text("❌ /unwarnall @user")
         return
     
     if isinstance(target_id, str) and target_id.startswith('@'):
@@ -3450,7 +3450,7 @@ async def warn_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             await query.edit_message_text(
                 "🎮 Сессия игры истекла.\n"
-                "Если КД ещё активно — повторите позже. Иначе запустите снова: /aunwarngame"
+                "Если КД ещё активно — повторите позже. Иначе запустите снова: /unwarngame"
             )
         except Exception:
             pass
@@ -3570,11 +3570,11 @@ async def _resolve_target_for_admin(update: Update, context: ContextTypes.DEFAUL
 async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отключение пользователя от бота"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'ablock'):
+    if not has_permission(user_id, 'warn', 'block'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
 
-    target_id = await _resolve_target_for_admin(update, context, "/ablock @user")
+    target_id = await _resolve_target_for_admin(update, context, "/block @user")
     if not target_id:
         return
 
@@ -3628,11 +3628,11 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подключение пользователя к боту"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'aunblock'):
+    if not has_permission(user_id, 'warn', 'unblock'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
 
-    target_id = await _resolve_target_for_admin(update, context, "/aunblock @user")
+    target_id = await _resolve_target_for_admin(update, context, "/unblock @user")
     if not target_id:
         return
 
@@ -3667,7 +3667,7 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список всех пользователей, отключённых от бота."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'ablocklist'):
+    if not has_permission(user_id, 'warn', 'blocklist'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -3702,7 +3702,7 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(rows) > 80:
         lines.append(f"\n…и ещё {len(rows) - 80}.")
     lines.append("\n━━━━━━━━━━━━━━━━━")
-    lines.append("Подключить обратно: /aunblock <user>")
+    lines.append("Подключить обратно: /unblock <user>")
     
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -3798,7 +3798,7 @@ def _call_openrouter_sync(combined_text: str, model: str) -> str:
     return completion.choices[0].message.content or ""
 
 
-# Диагностика — заполняется при каждом запуске анализа, доступна через /amooddebug
+# Диагностика — заполняется при каждом запуске анализа, доступна через /mooddebug
 _last_mood_diagnostics = {
     "ran_at": None,
     "model_used": None,
@@ -3997,7 +3997,7 @@ async def amooddebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление отделами: add/remove/rename/list"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'adepartment'):
+    if not has_permission(user_id, 'manage_ranks', 'department'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -4005,11 +4005,11 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📁 УПРАВЛЕНИЕ ОТДЕЛАМИ\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "/adepartment list — список отделов\n"
-            "/adepartment find <номер|название> — участники отдела\n"
-            "/adepartment add <название>\n"
-            "/adepartment remove <номер>\n"
-            "/adepartment rename <номер> <новое название>"
+            "/department list — список отделов\n"
+            "/department find <номер|название> — участники отдела\n"
+            "/department add <название>\n"
+            "/department remove <номер>\n"
+            "/department rename <номер> <новое название>"
         )
         return
     
@@ -4019,7 +4019,7 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if action == 'add':
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /adepartment add Название")
+            await update.message.reply_text("❌ /department add Название")
             conn.close()
             return
         name = ' '.join(context.args[1:])
@@ -4032,7 +4032,7 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == 'remove':
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /adepartment remove Номер")
+            await update.message.reply_text("❌ /department remove Номер")
             conn.close()
             return
         try:
@@ -4052,7 +4052,7 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == 'rename':
         if len(context.args) < 3:
-            await update.message.reply_text("❌ /adepartment rename Номер НовоеНазвание")
+            await update.message.reply_text("❌ /department rename Номер НовоеНазвание")
             conn.close()
             return
         try:
@@ -4082,9 +4082,9 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == 'find':
         if len(context.args) < 2:
             await update.message.reply_text(
-                "❌ Использование: /adepartment find <номер|название>\n"
-                "Пример: /adepartment find 3\n"
-                "Пример: /adepartment find куратор"
+                "❌ Использование: /department find <номер|название>\n"
+                "Пример: /department find 3\n"
+                "Пример: /department find куратор"
             )
             conn.close()
             return
@@ -4166,14 +4166,14 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asetalldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Назначить департамент всем"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'asetalldept'):
+    if not has_permission(user_id, 'manage_ranks', 'setalldept'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
     depts = get_departments()
     if not context.args:
         deps_list = "\n".join([f"{i+1}. {d}" for i, d in enumerate(depts)])
-        await update.message.reply_text(f"❌ /asetalldept номер\n\n{deps_list}")
+        await update.message.reply_text(f"❌ /setalldept номер\n\n{deps_list}")
         return
     
     try:
@@ -4684,12 +4684,12 @@ async def acheckall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Запустить еженедельную проверку ранга/отдела вручную, не дожидаясь воскресенья.
     Полезно после массовых изменений или когда нужно собрать актуальные данные.
     
-    Доступ: главный админ, спецдопуск, либо индивидуальный грант на /acheckall.
+    Доступ: главный админ, спецдопуск, либо индивидуальный грант на /checkall.
     """
     user_id = update.effective_user.id
     if not (is_main_admin(user_id)
             or has_special_access(user_id)
-            or has_command_access(user_id, 'acheckall')):
+            or has_command_access(user_id, 'checkall')):
         await update.message.reply_text("❌ Команда доступна только со спецдопуском.")
         return
     
@@ -4721,7 +4721,7 @@ async def acheckall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def arequests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список ожидающих заявок (для 4+ ранга)."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'arequests'):
+    if not has_permission(user_id, 'search', 'requests'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     pending = get_pending_change_requests()
@@ -4749,18 +4749,18 @@ async def arequests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"#{r['id']} | 📁 {nick}\n   {r['current_value']} → {r['requested_value']}\n   📅 {r['created_at']}")
     if len(pending) > 30:
-        lines.append(f"\n…и ещё {len(pending) - 30}. Используйте /arequest_info <id>.")
+        lines.append(f"\n…и ещё {len(pending) - 30}. Используйте /request_info <id>.")
     await update.message.reply_text("\n".join(lines))
 
 
 async def arequest_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Карточка заявки по id с кнопками решения (если pending и юзер ≥ 5)."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'arequest_info'):
+    if not has_permission(user_id, 'search', 'request_info'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     if not context.args:
-        await update.message.reply_text("❌ Использование: /arequest_info <id>")
+        await update.message.reply_text("❌ Использование: /request_info <id>")
         return
     try:
         req_id = int(context.args[0])
@@ -4849,13 +4849,13 @@ async def aaudit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Журнал действий администрации.
     
-    /aaudit                — последние 30 действий по всем
-    /aaudit @user          — действия НАД юзером и ОТ юзера
-    /aaudit by @user       — только действия ОТ юзера (что он сделал)
-    /aaudit on @user       — только действия НАД юзером (что с ним сделали)
+    /audit                — последние 30 действий по всем
+    /audit @user          — действия НАД юзером и ОТ юзера
+    /audit by @user       — только действия ОТ юзера (что он сделал)
+    /audit on @user       — только действия НАД юзером (что с ним сделали)
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'aaudit'):
+    if not has_permission(user_id, 'warn', 'audit'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -4940,10 +4940,10 @@ async def ahistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Полная история пользователя: aудит, варны, награды, заявки — единой лентой.
     
-    /ahistory <user>   или   /ahistory (ответом на сообщение)
+    /history <user>   или   /history (ответом на сообщение)
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'ahistory'):
+    if not has_permission(user_id, 'search', 'history'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
@@ -4951,7 +4951,7 @@ async def ahistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
     if not target_id:
-        await update.message.reply_text("❌ Использование: /ahistory <user> или ответом на сообщение.")
+        await update.message.reply_text("❌ Использование: /history <user> или ответом на сообщение.")
         return
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
@@ -5063,7 +5063,7 @@ async def ahistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = header + "".join(body_parts)
     if truncated:
-        text += f"…и ещё {truncated} событий (свернуто, открыть подробнее: /aaudit on {target_id})"
+        text += f"…и ещё {truncated} событий (свернуто, открыть подробнее: /audit on {target_id})"
     await update.message.reply_text(text)
 
 
@@ -5083,7 +5083,7 @@ async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_nick = ' '.join(context.args) if context.args else None
     else:
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /asetnick @user НовыйНик")
+            await update.message.reply_text("❌ /setnick @user НовыйНик")
             return
         target_id = extract_user_id(update, context, context.args[0])
         new_nick = ' '.join(context.args[1:])
@@ -5114,11 +5114,11 @@ async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Регистрация пользователя (6+ ранг). 
     Использование:
-      /aregister @user Ник Позывной
-      reply на сообщение + /aregister Ник Позывной
+      /register @user Ник Позывной
+      reply на сообщение + /register Ник Позывной
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'aregister'):
+    if not has_permission(user_id, 'gban', 'register'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -5130,7 +5130,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_args = list(context.args or [])
     else:
         if not context.args or len(context.args) < 3:
-            await update.message.reply_text("❌ /aregister @user Ник Позывной")
+            await update.message.reply_text("❌ /register @user Ник Позывной")
             return
         target_id = extract_user_id(update, context, context.args[0])
         if isinstance(target_id, str) and target_id.startswith('@'):
@@ -5140,7 +5140,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_args = list(context.args[1:])
     
     if len(rest_args) < 2:
-        await update.message.reply_text("❌ Укажите Ник и Позывной.\nПример: /aregister @user Ник Позывной")
+        await update.message.reply_text("❌ Укажите Ник и Позывной.\nПример: /register @user Ник Позывной")
         return
     
     if get_user_data(target_id):
@@ -5169,7 +5169,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Уведомление в лог-группу и генералам (6+)
         uname_view = f"@{tg_uname}" if tg_uname else "—"
         await notify_new_registration(context, (
-            "🆕 НОВАЯ РЕГИСТРАЦИЯ (через /aregister)\n"
+            "🆕 НОВАЯ РЕГИСТРАЦИЯ (через /register)\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"🎮 Ник: {game_nick}\n"
             f"📻 Позывной: {callsign}\n"
@@ -5184,7 +5184,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Принудительная регистрация с жетоном (6+ ранг)"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'aforcereg'):
+    if not has_permission(user_id, 'gban', 'forcereg'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -5195,7 +5195,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_args = list(context.args or [])
     else:
         if not context.args:
-            await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+            await update.message.reply_text("❌ /forcereg @user Ник Позывной 52****")
             return
         target_id = extract_user_id(update, context, context.args[0])
         if isinstance(target_id, str) and target_id.startswith('@'):
@@ -5205,7 +5205,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_args = list(context.args[1:])
     
     if len(rest_args) < 3:
-        await update.message.reply_text("❌ /aforcereg @user Ник Позывной 52****")
+        await update.message.reply_text("❌ /forcereg @user Ник Позывной 52****")
         return
     
     game_nick = rest_args[0]
@@ -5235,7 +5235,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Уведомление в лог-группу и генералам (6+)
         uname_view = f"@{tg_uname}" if tg_uname else "—"
         await notify_new_registration(context, (
-            "🆕 РЕГИСТРАЦИЯ (через /aforcereg)\n"
+            "🆕 РЕГИСТРАЦИЯ (через /forcereg)\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"🎮 Ник: {game_nick}\n"
             f"📻 Позывной: {callsign}\n"
@@ -5346,7 +5346,7 @@ async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args:
-        await update.message.reply_text("❌ /asetallrank 0-7")
+        await update.message.reply_text("❌ /setallrank 0-7")
         return
     
     new_rank = int(context.args[0])
@@ -5366,12 +5366,12 @@ async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Карточка жалобы с кнопками действий."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'areport_info'):
+    if not has_permission(user_id, 'search', 'report_info'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
     if not context.args:
-        await update.message.reply_text("❌ Использование: /areport_info <id>")
+        await update.message.reply_text("❌ Использование: /report_info <id>")
         return
     
     try:
@@ -5398,7 +5398,7 @@ async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aspeciallist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список со спецдопуском"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'aspeciallist'):
+    if not has_permission(user_id, 'gban', 'speciallist'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -5663,12 +5663,12 @@ async def adept_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     lines.append("")
     lines.append("Управление:")
-    lines.append("/adept_rename <id> <новое_имя>")
-    lines.append("/adept_move <id> <порядок>")
-    lines.append("/adept_group_add <название>")
-    lines.append("/adept_group_del <id>")
-    lines.append("/adept_group_assign <dept_id> <group_id|0>")
-    lines.append("/adept_apply_template — применить дефолтный шаблон")
+    lines.append("/dept_rename <id> <новое_имя>")
+    lines.append("/dept_move <id> <порядок>")
+    lines.append("/dept_group_add <название>")
+    lines.append("/dept_group_del <id>")
+    lines.append("/dept_group_assign <dept_id> <group_id|0>")
+    lines.append("/dept_apply_template — применить дефолтный шаблон")
     
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -5677,14 +5677,14 @@ async def adept_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def adept_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/adept_rename <dept_id> <новое имя>. Синхронизирует users.department."""
+    """/dept_rename <dept_id> <новое имя>. Синхронизирует users.department."""
     user_id = update.effective_user.id
     if not _depts_admin_check(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     
     if len(context.args or []) < 2:
-        await update.message.reply_text("❌ Использование: /adept_rename <id> <новое_имя>")
+        await update.message.reply_text("❌ Использование: /dept_rename <id> <новое_имя>")
         return
     try:
         dept_id = int(context.args[0])
@@ -5728,13 +5728,13 @@ async def adept_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def adept_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/adept_move <dept_id> <sort_order>. Изменить порядок (меньше — выше)."""
+    """/dept_move <dept_id> <sort_order>. Изменить порядок (меньше — выше)."""
     user_id = update.effective_user.id
     if not _depts_admin_check(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     if len(context.args or []) < 2:
-        await update.message.reply_text("❌ Использование: /adept_move <id> <число_порядка>")
+        await update.message.reply_text("❌ Использование: /dept_move <id> <число_порядка>")
         return
     try:
         dept_id = int(context.args[0])
@@ -5757,14 +5757,14 @@ async def adept_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def adept_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/adept_group_add <название>. Создать новую группу отделов."""
+    """/dept_group_add <название>. Создать новую группу отделов."""
     user_id = update.effective_user.id
     if not _depts_admin_check(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     name = ' '.join(context.args or []).strip()
     if not name:
-        await update.message.reply_text("❌ Использование: /adept_group_add <название>")
+        await update.message.reply_text("❌ Использование: /dept_group_add <название>")
         return
     
     conn = sqlite3.connect(DB_FILE)
@@ -5786,13 +5786,13 @@ async def adept_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def adept_group_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/adept_group_del <id>. Удалить группу. Отделы из неё становятся «без группы»."""
+    """/dept_group_del <id>. Удалить группу. Отделы из неё становятся «без группы»."""
     user_id = update.effective_user.id
     if not _depts_admin_check(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
-        await update.message.reply_text("❌ Использование: /adept_group_del <id>")
+        await update.message.reply_text("❌ Использование: /dept_group_del <id>")
         return
     try:
         gid = int(context.args[0])
@@ -5823,13 +5823,13 @@ async def adept_group_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def adept_group_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/adept_group_assign <dept_id> <group_id|0>. 0 = убрать из группы."""
+    """/dept_group_assign <dept_id> <group_id|0>. 0 = убрать из группы."""
     user_id = update.effective_user.id
     if not _depts_admin_check(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     if len(context.args or []) < 2:
-        await update.message.reply_text("❌ Использование: /adept_group_assign <dept_id> <group_id|0>")
+        await update.message.reply_text("❌ Использование: /dept_group_assign <dept_id> <group_id|0>")
         return
     try:
         dept_id = int(context.args[0])
@@ -5890,7 +5890,7 @@ async def adept_apply_template(update: Update, context: ContextTypes.DEFAULT_TYP
             "• добавит недостающие отделы\n"
             "• обновит привязки пользователей к переименованным отделам\n\n"
             "Если согласны — отправьте:\n"
-            "/adept_apply_template confirm"
+            "/dept_apply_template confirm"
         )
         return
     
@@ -5948,14 +5948,14 @@ async def adept_apply_template(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🔢 Порядок обновлён: {actions['reordered']}\n"
         f"👥 Привязок юзеров: {actions['users_synced']}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "Проверьте: /adept_list и /find"
+        "Проверьте: /dept_list и /find"
     )
 
 
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Профиль другого пользователя"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'awho'):
+    if not has_permission(user_id, 'manage_ranks', 'who'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -5963,7 +5963,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
     if not target_id:
-        await update.message.reply_text("❌ /awho @user")
+        await update.message.reply_text("❌ /who @user")
         return
     
     if isinstance(target_id, str) and target_id.startswith('@'):
@@ -5985,7 +5985,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     award_count = len(awards) if awards else 0
     special_text = "🔐 Спецдопуск: Да\n" if has_special_access(target_id) else ""
     
-    # Пометки — короткая сводка (счётчик и закреплённая). Полный список — /anotes.
+    # Пометки — короткая сводка (счётчик и закреплённая). Полный список — /notes.
     notes_line = ""
     if _notes_can_read(user_id):
         notes = _notes_get_all(target_id)
@@ -5994,7 +5994,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             notes_line = f"📝 Пометок: {len(notes)}"
             if pinned:
                 notes_line += f" (📌 {len(pinned)})"
-            notes_line += " — /anotes @user\n"
+            notes_line += " — /notes @user\n"
     
     await update.message.reply_text(
         f"👤 ПРОФИЛЬ\n\n"
@@ -6008,7 +6008,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача жетона"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'asettoken'):
+    if not has_permission(user_id, 'gban', 'settoken'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -6019,7 +6019,7 @@ async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_token = context.args[0] if context.args else None
     else:
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /asettoken @user 52****")
+            await update.message.reply_text("❌ /settoken @user 52****")
             return
         target_id = extract_user_id(update, context, context.args[0])
         new_token = context.args[1]
@@ -6051,7 +6051,7 @@ def _first_int_in_args(args) -> int:
 async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Установка ранга. Работает и в ЛС, и в конференции (с reply или с @user)."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'asetrank'):
+    if not has_permission(user_id, 'manage_ranks', 'setrank'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -6062,11 +6062,11 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = update.message.reply_to_message.from_user.id
         new_rank = _first_int_in_args(args)
         if new_rank is None:
-            await update.message.reply_text("❌ Использование: ответ на сообщение + /asetrank <0-7>")
+            await update.message.reply_text("❌ Использование: ответ на сообщение + /setrank <0-7>")
             return
     else:
         if len(args) < 2:
-            await update.message.reply_text("❌ Использование: /asetrank <@user|ID> <0-7>")
+            await update.message.reply_text("❌ Использование: /setrank <@user|ID> <0-7>")
             return
         target_id = extract_user_id(update, context, args[0])
         # Ищем число — это ранг
@@ -6095,7 +6095,7 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if is_user_blocked(target_id):
-        await update.message.reply_text("❌ Пользователь отключён от бота. Сначала /aunblock.")
+        await update.message.reply_text("❌ Пользователь отключён от бота. Сначала /unblock.")
         return
     
     if not update_user_rank(target_id, new_rank):
@@ -6120,7 +6120,7 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Назначение отдела. Работает и в ЛС, и в конференции (с reply или с @user)."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'asetdept'):
+    if not has_permission(user_id, 'manage_ranks', 'setdept'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -6134,7 +6134,7 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dept_num is None:
             deps_text = "\n".join([f"{i+1}. {d}" for i, d in enumerate(depts)])
             await update.message.reply_text(
-                "❌ Использование: ответ на сообщение + /asetdept <номер>\n\n"
+                "❌ Использование: ответ на сообщение + /setdept <номер>\n\n"
                 f"📁 Отделы:\n{deps_text}"
             )
             return
@@ -6142,7 +6142,7 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(args) < 2:
             deps_text = "\n".join([f"{i+1}. {d}" for i, d in enumerate(depts)])
             await update.message.reply_text(
-                "❌ Использование: /asetdept <@user|ID> <номер>\n\n"
+                "❌ Использование: /setdept <@user|ID> <номер>\n\n"
                 f"📁 Отделы:\n{deps_text}"
             )
             return
@@ -6173,7 +6173,7 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if is_user_blocked(target_id):
-        await update.message.reply_text("❌ Пользователь отключён от бота. Сначала /aunblock.")
+        await update.message.reply_text("❌ Пользователь отключён от бота. Сначала /unblock.")
         return
     
     new_dept = depts[idx]
@@ -6201,13 +6201,13 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Работает только в самой конференции (в Telegram мутить пользователя можно
     только внутри группы, где он состоит).
     
-    /amute @user 30m [причина]
-    /amute (reply) 30m [причина]
+    /mute @user 30m [причина]
+    /mute (reply) 30m [причина]
     
     Формат длительности: 30m | 2h | 7d | 1w. По умолчанию — 30 минут.
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'ban', 'amute'):
+    if not has_permission(user_id, 'ban', 'mute'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -6226,7 +6226,7 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
-        await update.message.reply_text("❌ Использование: /amute @user [длительность] [причина]")
+        await update.message.reply_text("❌ Использование: /mute @user [длительность] [причина]")
         return
     
     if target_id == user_id:
@@ -6332,10 +6332,10 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Снять мут в конференции.
-    /aunmute @user   (или reply)
+    /unmute @user   (или reply)
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'ban', 'aunmute'):
+    if not has_permission(user_id, 'ban', 'unmute'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     if update.effective_chat.id != CONFERENCE_CHAT_ID:
@@ -6348,7 +6348,7 @@ async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
-        await update.message.reply_text("❌ Использование: /aunmute @user (или reply).")
+        await update.message.reply_text("❌ Использование: /unmute @user (или reply).")
         return
     
     # Восстанавливаем стандартные права участника чата
@@ -6483,13 +6483,13 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     Текстовые триггеры быстрых модераторских действий (см. секцию выше).
 
-      «повысить» / «понизить» [@user] [ранг]              → /asetrank
-      «поменять отдел» / «сменить отдел» [@user] [номер]  → /asetdept
-      «мут» [@user] [длительность] [причина]               → /amute
-      «бан» [@user] [длительность] [причина]                → /aban
-      «кик» [@user] [причина]                                → /akick
-      «варн» [@user] [причина]                               → /awarn
-      «ты кто» [@user]                                       → /awho
+      «повысить» / «понизить» [@user] [ранг]              → /setrank
+      «поменять отдел» / «сменить отдел» [@user] [номер]  → /setdept
+      «мут» [@user] [длительность] [причина]               → /mute
+      «бан» [@user] [длительность] [причина]                → /ban
+      «кик» [@user] [причина]                                → /kick
+      «варн» [@user] [причина]                               → /warn
+      «ты кто» [@user]                                       → /who
     """
     if not update.message or not update.message.text:
         return
@@ -6502,14 +6502,14 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
 
     if first == "ты" and len(parts) >= 2 and parts[1].lower() == "кто":
-        if not has_permission(user_id, 'manage_ranks', 'awho'):
+        if not has_permission(user_id, 'manage_ranks', 'who'):
             return
         context.args = parts[2:]
         await awhoprofile(update, context)
         return
 
     if first in ("поменять", "сменить") and len(parts) >= 2 and parts[1].lower() == "отдел":
-        if not has_permission(user_id, 'manage_ranks', 'asetdept'):
+        if not has_permission(user_id, 'manage_ranks', 'setdept'):
             return
         tail = parts[2:]
         if _wtrig_value_tokens(update, tail):
@@ -6531,7 +6531,7 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if first in ("повысить", "понизить"):
-        if not has_permission(user_id, 'manage_ranks', 'asetrank'):
+        if not has_permission(user_id, 'manage_ranks', 'setrank'):
             return
         tail = parts[1:]
         if _wtrig_value_tokens(update, tail):
@@ -6558,7 +6558,7 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if first == "мут":
-        if not has_permission(user_id, 'ban', 'amute'):
+        if not has_permission(user_id, 'ban', 'mute'):
             return
         tail = parts[1:]
         if _wtrig_value_tokens(update, tail):
@@ -6580,7 +6580,7 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if first == "бан":
-        if not has_permission(user_id, 'ban', 'aban'):
+        if not has_permission(user_id, 'ban', 'ban'):
             return
         tail = parts[1:]
         if _wtrig_value_tokens(update, tail):
@@ -6602,11 +6602,11 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if first == "кик":
-        if not has_permission(user_id, 'kick', 'akick'):
+        if not has_permission(user_id, 'kick', 'kick'):
             return
         tail = parts[1:]
         if _wtrig_value_tokens(update, tail):
-            # Причина указана текстом — это уже осознанное действие, как /akick
+            # Причина указана текстом — это уже осознанное действие, как /kick
             context.args = tail
             await akick(update, context)
             return
@@ -6626,7 +6626,7 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if first == "варн":
-        if not has_permission(user_id, 'warn', 'awarn'):
+        if not has_permission(user_id, 'warn', 'warn'):
             return
         context.args = parts[1:]
         await awarn(update, context)
@@ -6659,7 +6659,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == 'rank' and len(parts) >= 4:
-        if not has_permission(user_id, 'manage_ranks', 'asetrank'):
+        if not has_permission(user_id, 'manage_ranks', 'setrank'):
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         try:
@@ -6698,7 +6698,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == 'dept' and len(parts) >= 4:
-        if not has_permission(user_id, 'manage_ranks', 'asetdept'):
+        if not has_permission(user_id, 'manage_ranks', 'setdept'):
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         try:
@@ -6738,7 +6738,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == 'mute' and len(parts) >= 4:
-        if not has_permission(user_id, 'ban', 'amute'):
+        if not has_permission(user_id, 'ban', 'mute'):
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         try:
@@ -6792,7 +6792,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == 'kickconfirm' and len(parts) >= 3:
-        if not has_permission(user_id, 'kick', 'akick'):
+        if not has_permission(user_id, 'kick', 'kick'):
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         try:
@@ -6838,7 +6838,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == 'banpick' and len(parts) >= 4:
         # Промежуточный шаг: срок уже выбран кнопкой, но бан ещё не применён —
         # просим подтверждение, чтобы случайное «бан» в реплае не банило по-настоящему.
-        if not has_permission(user_id, 'ban', 'aban'):
+        if not has_permission(user_id, 'ban', 'ban'):
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         try:
@@ -6862,7 +6862,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == 'banconfirm' and len(parts) >= 4:
-        if not has_permission(user_id, 'ban', 'aban'):
+        if not has_permission(user_id, 'ban', 'ban'):
             await query.answer("❌ Нет прав.", show_alert=True)
             return
         try:
@@ -6929,7 +6929,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Разбан"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'ban', 'aunban'):
+    if not has_permission(user_id, 'ban', 'unban'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
     
@@ -7043,7 +7043,7 @@ async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   • бот может выдать только те права, которые есть у него самого;
 #   • снять права бот может только с тех, кого назначал сам.
 
-# Права TG-администратора, которые можно выдавать точечно через меню /atgadmin.
+# Права TG-администратора, которые можно выдавать точечно через меню /tgadmin.
 # can_promote_members сознательно не выдаём и не показываем в меню —
 # иначе назначенный сможет раздавать права дальше (см. CLAUDE.md).
 TG_ADMIN_PERMS = [
@@ -7094,8 +7094,8 @@ async def atgadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Открыть меню назначения администратора конференции с выбором прав кнопками.
 
-    /atgadmin @user [должность]
-    /atgadmin (reply) [должность]
+    /tgadmin @user [должность]
+    /tgadmin (reply) [должность]
 
     Должность — подпись до 16 символов, видна в списке участников.
     """
@@ -7113,8 +7113,8 @@ async def atgadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
         await update.message.reply_text(
-            "❌ Использование: /atgadmin @user [должность]\n"
-            "Или ответом на сообщение: /atgadmin [должность]"
+            "❌ Использование: /tgadmin @user [должность]\n"
+            "Или ответом на сообщение: /tgadmin [должность]"
         )
         return
 
@@ -7128,7 +7128,7 @@ async def atgadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def atgadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Кнопки меню /atgadmin. Паттерны:
+    Кнопки меню /tgadmin. Паттерны:
       atga:tog:<target_id>:<mask>:<idx>:<title>  — переключить бит права
       atga:apply:<target_id>:<mask>:<title>      — назначить с выбранными правами
       atga:cancel:<target_id>                    — отменить
@@ -7246,7 +7246,7 @@ async def atgadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def atgunadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Снять права администратора конференции.
-    /atgunadmin @user   (или reply)
+    /tgunadmin @user   (или reply)
     """
     user_id = update.effective_user.id
     if not is_main_admin(user_id):
@@ -7259,7 +7259,7 @@ async def atgunadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
-        await update.message.reply_text("❌ Использование: /atgunadmin @user (или reply).")
+        await update.message.reply_text("❌ Использование: /tgunadmin @user (или reply).")
         return
     
     if is_main_admin(target_id):
@@ -7310,7 +7310,7 @@ async def atgunadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def atgadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список администраторов конференции (по данным Telegram, не по рангам бота)."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'atgadmins'):
+    if not has_permission(user_id, 'gban', 'tgadmins'):
         await update.message.reply_text("❌ Команда доступна со спецдоступом.")
         return
     
@@ -7336,8 +7336,8 @@ async def atgadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
             line += f"\n  @{u.username}"
         lines.append(line)
     lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append("Назначить: /atgadmin @user [должность]")
-    lines.append("Снять: /atgunadmin @user")
+    lines.append("Назначить: /tgadmin @user [должность]")
+    lines.append("Снять: /tgunadmin @user")
     
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -7415,12 +7415,12 @@ async def aunsetadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def abroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Рассылка всем"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'abroadcast'):
+    if not has_permission(user_id, 'warn', 'broadcast'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
     if not context.args:
-        await update.message.reply_text("❌ /abroadcast Текст")
+        await update.message.reply_text("❌ /broadcast Текст")
         return
     
     message = ' '.join(context.args)
@@ -7532,13 +7532,13 @@ async def atag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Тегнуть одного или нескольких пользователей и написать им.
     
     Использование:
-      /atag @user1 @user2 ... <текст>
-      /atag 123456 @user2 <текст>
-      (ответом на сообщение) /atag <текст>           — тегается автор реплая
-      (ответом на сообщение) /atag @user2 <текст>    — тегается автор реплая + указанные
+      /tag @user1 @user2 ... <текст>
+      /tag 123456 @user2 <текст>
+      (ответом на сообщение) /tag <текст>           — тегается автор реплая
+      (ответом на сообщение) /tag @user2 <текст>    — тегается автор реплая + указанные
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'atag'):
+    if not has_permission(user_id, 'search', 'tag'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
@@ -7572,8 +7572,8 @@ async def atag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📣 ТЕГ ПОЛЬЗОВАТЕЛЕЙ\n"
             "━━━━━━━━━━━━━━━━━\n"
             "Использование:\n"
-            "• /atag @user1 @user2 ... <текст>\n"
-            "• Ответом на сообщение: /atag <текст>\n\n"
+            "• /tag @user1 @user2 ... <текст>\n"
+            "• Ответом на сообщение: /tag <текст>\n\n"
             "Цели можно указать через @username, числовой ID или ответ."
         )
         return
@@ -7641,11 +7641,11 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Тегнуть всех участников отдела и написать им.
     
     Использование:
-      /atagdept <номер_отдела> <текст>
-      /atagdept                       — покажет список отделов с номерами
+      /tagdept <номер_отдела> <текст>
+      /tagdept                       — покажет список отделов с номерами
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'atagdept'):
+    if not has_permission(user_id, 'search', 'tagdept'):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
@@ -7656,7 +7656,7 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📣 ТЕГ ОТДЕЛА\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "Использование: /atagdept <номер> <текст>\n\n"
+            "Использование: /tagdept <номер> <текст>\n\n"
             f"📁 ОТДЕЛЫ:\n{deps_list}"
         )
         return
@@ -7664,7 +7664,7 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         dept_num = int(context.args[0]) - 1
     except (ValueError, IndexError):
-        await update.message.reply_text("❌ Первый аргумент должен быть номером отдела. /atagdept без аргументов покажет список.")
+        await update.message.reply_text("❌ Первый аргумент должен быть номером отдела. /tagdept без аргументов покажет список.")
         return
     
     if dept_num < 0 or dept_num >= len(depts):
@@ -7761,12 +7761,12 @@ async def agrant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Выдать пользователю индивидуальный доступ к команде(ам).
     
     Использование:
-      /agrant <user> <command> [command2 ...]
-      (ответом на сообщение) /agrant <command> [command2 ...]
+      /grant <user> <command> [command2 ...]
+      (ответом на сообщение) /grant <command> [command2 ...]
     
     Примеры:
-      /agrant @ivan atag atagdept
-      /agrant 123456789 awarn
+      /grant @ivan tag tagdept
+      /grant 123456789 warn
     """
     user_id = update.effective_user.id
     if not _can_manage_grants(user_id):
@@ -7785,9 +7785,9 @@ async def agrant(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📥 ВЫДАЧА ДОСТУПА К КОМАНДЕ\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 "Использование:\n"
-                "• /agrant <user> <command> [command2 ...]\n"
-                "• Ответом на сообщение: /agrant <command> [...]\n\n"
-                "Список доступных для гранта команд — /agrantcmds"
+                "• /grant <user> <command> [command2 ...]\n"
+                "• Ответом на сообщение: /grant <command> [...]\n\n"
+                "Список доступных для гранта команд — /grantcmds"
             )
             return
         target_id = extract_user_id(update, context, args[0])
@@ -7852,9 +7852,9 @@ async def arevoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Отозвать у пользователя индивидуальный доступ к команде(ам).
     
     Использование:
-      /arevoke <user> <command> [command2 ...]
-      /arevoke <user> all                   — отозвать все гранты
-      (ответом на сообщение) /arevoke <command> | all
+      /revoke <user> <command> [command2 ...]
+      /revoke <user> all                   — отозвать все гранты
+      (ответом на сообщение) /revoke <command> | all
     """
     user_id = update.effective_user.id
     if not _can_manage_grants(user_id):
@@ -7873,9 +7873,9 @@ async def arevoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📤 ОТЗЫВ ДОСТУПА К КОМАНДЕ\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 "Использование:\n"
-                "• /arevoke <user> <command> [command2 ...]\n"
-                "• /arevoke <user> all — забрать все гранты\n"
-                "• Ответом на сообщение: /arevoke <command>"
+                "• /revoke <user> <command> [command2 ...]\n"
+                "• /revoke <user> all — забрать все гранты\n"
+                "• Ответом на сообщение: /revoke <command>"
             )
             return
         target_id = extract_user_id(update, context, args[0])
@@ -7944,9 +7944,9 @@ async def aperms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Посмотреть индивидуальные гранты пользователя.
     
     Использование:
-      /aperms                — свои гранты
-      /aperms <user>         — гранты указанного юзера (требует право управления грантами)
-      (ответом на сообщение) /aperms
+      /perms                — свои гранты
+      /perms <user>         — гранты указанного юзера (требует право управления грантами)
+      (ответом на сообщение) /perms
     """
     user_id = update.effective_user.id
     
@@ -8000,7 +8000,7 @@ async def agrantlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Посмотреть, кому выдан индивидуальный доступ к данной команде.
     
-    Использование: /agrantlist <command>
+    Использование: /grantlist <command>
     """
     user_id = update.effective_user.id
     if not _can_manage_grants(user_id):
@@ -8008,7 +8008,7 @@ async def agrantlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args:
-        await update.message.reply_text("❌ Использование: /agrantlist <command>")
+        await update.message.reply_text("❌ Использование: /grantlist <command>")
         return
     
     cmd = context.args[0].lstrip('/').strip()
@@ -8051,7 +8051,7 @@ async def agrantcmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n".join(f"• /{c}" for c in cmds)
         + "\n━━━━━━━━━━━━━━━━━\n"
         + f"📊 Всего: {len(cmds)}\n\n"
-        + "Используйте: /agrant <user> <command>"
+        + "Используйте: /grant <user> <command>"
     )
     await update.message.reply_text(text)
 
@@ -8103,7 +8103,7 @@ def _format_verdict_history(report: dict, *, include_current: bool = False) -> s
 
 
 def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
-    """Единое оформление карточки жалобы для всех мест (DM, /areport_info, /areports)."""
+    """Единое оформление карточки жалобы для всех мест (DM, /report_info, /reports)."""
     nick = report['reporter_nick'] or "—"
     head = f"📋 ЖАЛОБА #{report['id']}"
     if report['status'] == 'pending':
@@ -8655,7 +8655,7 @@ async def acallsign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_id = extract_user_id(update, context)
     
     if target_id:
-        if not has_permission(user_id, 'search', 'acallsign'):
+        if not has_permission(user_id, 'search', 'callsign'):
             await update.message.reply_text("❌ С 4 ранга для смены чужого позывного.")
             return
         if isinstance(target_id, str) and target_id.startswith('@'):
@@ -8664,13 +8664,13 @@ async def acallsign(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Не найден.")
                 return
         if not context.args:
-            await update.message.reply_text("❌ /acallsign @user НовыйПозывной")
+            await update.message.reply_text("❌ /callsign @user НовыйПозывной")
             return
         new_callsign = ' '.join(context.args)
     else:
         target_id = user_id
         if not context.args:
-            await update.message.reply_text("❌ /acallsign НовыйПозывной")
+            await update.message.reply_text("❌ /callsign НовыйПозывной")
             return
         new_callsign = ' '.join(context.args)
     
@@ -8731,7 +8731,7 @@ async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args:
-        await update.message.reply_text("❌ /awhois ID")
+        await update.message.reply_text("❌ /whois ID")
         return
     
     target_id = int(context.args[0])
@@ -8834,7 +8834,7 @@ async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 POLL_TOPIC_ID = 10677
 # ============ СИСТЕМА ГОЛОСОВАНИЙ ============
 # Голосование анонимное: кто как проголосовал — не показывается НИГДЕ (ни в
-# конфе, ни модераторам в ЛС, ни в /apoll_info), только агрегированные цифры.
+# конфе, ни модераторам в ЛС, ни в /poll_info), только агрегированные цифры.
 # users.user_id используется исключительно для защиты от повторного голоса.
 
 _POLL_VOTE_LABELS = {'yes': '✅ Да', 'no': '❌ Нет', 'abstain': '⚪ Воздержусь'}
@@ -9006,7 +9006,7 @@ async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Только со спецдопуском или 7 ранг."); return
     
     if len(context.args) < 2:
-        await update.message.reply_text('❌ /apoll_create Ник "Описание"'); return
+        await update.message.reply_text('❌ /poll_create Ник "Описание"'); return
     
     text = ' '.join(context.args)
     if '"' in text:
@@ -9042,7 +9042,7 @@ async def avote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     user_id = update.effective_user.id; user_data = get_user_data(user_id)
     if not user_data: await update.message.reply_text("❌ Не зарегистрированы."); return
-    if len(context.args) < 2: await update.message.reply_text("❌ /avote ID да/нет/воздерж"); return
+    if len(context.args) < 2: await update.message.reply_text("❌ /vote ID да/нет/воздерж"); return
 
     try: poll_id = int(context.args[0])
     except: await update.message.reply_text("❌ Укажите ID."); return
@@ -9111,7 +9111,7 @@ async def aadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Добавление к описанию"""
     user_id = update.effective_user.id; user_data = get_user_data(user_id)
     if not user_data: await update.message.reply_text("❌ Не зарегистрированы."); return
-    if len(context.args) < 2: await update.message.reply_text("❌ /aadd ID текст"); return
+    if len(context.args) < 2: await update.message.reply_text("❌ /add ID текст"); return
     
     try: poll_id = int(context.args[0])
     except: await update.message.reply_text("❌ Укажите ID."); return
@@ -9141,7 +9141,7 @@ async def aadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def apoll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Закрытие голосования"""
     user_id = update.effective_user.id
-    if not context.args: await update.message.reply_text("❌ /apoll_close ID"); return
+    if not context.args: await update.message.reply_text("❌ /poll_close ID"); return
     
     try: poll_id = int(context.args[0])
     except: await update.message.reply_text("❌ Укажите ID."); return
@@ -9164,7 +9164,7 @@ async def apoll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def apoll_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Информация о голосовании"""
-    if not context.args: await update.message.reply_text("❌ /apoll_info ID"); return
+    if not context.args: await update.message.reply_text("❌ /poll_info ID"); return
     try: poll_id = int(context.args[0])
     except: await update.message.reply_text("❌ ID."); return
     
@@ -9492,17 +9492,17 @@ async def apm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Написать пользователю в личку от имени бота.
     Главный админ — всегда; остальным — только через индивидуальный грант.
 
-    /apm <user> <текст>
-    /apm (reply в лог-группе не нужен — это для произвольных сообщений)
+    /pm <user> <текст>
+    /pm (reply в лог-группе не нужен — это для произвольных сообщений)
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'apm', 'apm'):
+    if not has_permission(user_id, 'pm', 'pm'):
         await update.message.reply_text("❌ Команда доступна только главному админу (или с грантом).")
         return
     
     args = list(context.args or [])
     if len(args) < 2:
-        await update.message.reply_text("❌ Использование: /apm <user> <текст>")
+        await update.message.reply_text("❌ Использование: /pm <user> <текст>")
         return
     
     target_id = extract_user_id(update, context, args[0])
@@ -9931,7 +9931,7 @@ async def article_trigger_router(update: Update, context: ContextTypes.DEFAULT_T
 async def duel_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Текстовый триггер дуэли — позволяет писать «дуэль @user», «дуэль <id>» или
-    «дуэль» ответом на сообщение, без слэша. Эквивалент команды /aduel.
+    «дуэль» ответом на сообщение, без слэша. Эквивалент команды /duel.
     Должен быть зарегистрирован в отдельной группе.
     """
     if not update.message or not update.message.text:
@@ -10177,10 +10177,10 @@ async def aukrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Топ «главных преступников» по числу полученных статей.
     
-    /aukrating              — за всё время
-    /aukrating day          — за последние 24 часа
-    /aukrating week         — за последние 7 дней
-    /aukrating month        — за последние 30 дней
+    /ukrating              — за всё время
+    /ukrating day          — за последние 24 часа
+    /ukrating week         — за последние 7 дней
+    /ukrating month        — за последние 30 дней
     """
     period = (context.args[0].lower() if context.args else 'all').strip()
     
@@ -10216,7 +10216,7 @@ async def aukrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━\n"
         f"{body}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"💡 Доступно: /aukrating day | week | month | all"
+        f"💡 Доступно: /ukrating day | week | month | all"
     )
     if len(text) > 4000:
         text = text[:3997] + "..."
@@ -10475,8 +10475,8 @@ async def aduel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Вызвать пользователя на дуэль.
     
-    /aduel @user        — в любом чате
-    (ответом на смс) /aduel  — целью становится автор сообщения
+    /duel @user        — в любом чате
+    (ответом на смс) /duel  — целью становится автор сообщения
     """
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
@@ -10491,7 +10491,7 @@ async def aduel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id is None or target_id == -1:
-        await update.message.reply_text("❌ Использование: /aduel <@user|ID> или ответом на сообщение.")
+        await update.message.reply_text("❌ Использование: /duel <@user|ID> или ответом на сообщение.")
         return
     if target_id == user_id:
         await update.message.reply_text("❌ С собой стреляться не стоит.")
@@ -10812,8 +10812,8 @@ async def aduel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Статистика дуэлей.
     
-    /aduel_stats          — топ-10 по победам за всё время
-    /aduel_stats @user    — статистика конкретного юзера
+    /duel_stats          — топ-10 по победам за всё время
+    /duel_stats @user    — статистика конкретного юзера
     """
     user_id = update.effective_user.id
     if not get_user_data(user_id):
@@ -10895,7 +10895,7 @@ async def aduel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         medal = medals[i] if i < 3 else f"{i + 1}."
         lines.append(f"{medal} {name} — {w} побед")
     lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append("Лично: /aduel_stats @user")
+    lines.append("Лично: /duel_stats @user")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -11004,9 +11004,9 @@ async def acubes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Вызвать на кубы.
     
-    /acubes               — открытый вызов («Кто кубы») — принять может любой
-    /acubes @user         — закрытый вызов конкретному игроку
-    (reply) /acubes       — закрытый вызов автору сообщения
+    /cubes               — открытый вызов («Кто кубы») — принять может любой
+    /cubes @user         — закрытый вызов конкретному игроку
+    (reply) /cubes       — закрытый вызов автору сообщения
     
     В конференции работает ТОЛЬКО в игровом топике (GAMES_ALLOWED_TOPIC_ID).
     Иначе — санкции через _handle_topic_violation.
@@ -11389,14 +11389,14 @@ async def acubes_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         medal = medals[i] if i < 3 else f"{i + 1}."
         lines.append(f"{medal} {name} — {w} побед")
     lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append("Лично: /acubes_stats @user")
+    lines.append("Лично: /cubes_stats @user")
     await update.message.reply_text("\n".join(lines))
 
 
 # ============ CHANGELOG — обновления бота ============
 # Идея: changelog составляется полуавтоматически. Бот анализирует audit_log и
 # показывает, какие новые типы действий появились с момента последнего опубликованного
-# changelog. Главный админ дорабатывает текст и публикует через /achangelog_publish.
+# changelog. Главный админ дорабатывает текст и публикует через /changelog_publish.
 
 # Семантика action → читаемое описание. Когда в audit_log впервые появляется action из
 # этого словаря — бот предлагает его как кандидата в новый changelog.
@@ -11538,14 +11538,14 @@ async def achangelog_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Создать черновик changelog'а с указанным текстом.
     
-    /achangelog_add <текст>
+    /changelog_add <текст>
     
     Можно через несколько строк (бот возьмёт всё что после команды).
     Первая строка после команды может быть «v3 Заголовок» — тогда v3 будет версией,
     а остаток — заголовком; со следующей строки — содержимое.
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'achangelog_add'):
+    if not has_permission(user_id, 'gban', 'changelog_add'):
         await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
@@ -11562,7 +11562,7 @@ async def achangelog_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Пустой текст.\n\n"
             "Использование:\n"
-            "<code>/achangelog_add\nv3 Декабрьские фишки\n• Добавили кубы\n• Поправили дуэли</code>",
+            "<code>/changelog_add\nv3 Декабрьские фишки\n• Добавили кубы\n• Поправили дуэли</code>",
             parse_mode='HTML',
         )
         return
@@ -11599,8 +11599,8 @@ async def achangelog_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         _changelog_format(cl) + 
-        f"\n\n💡 Опубликовать: /achangelog_publish {cid}\n"
-        f"💡 Удалить: /achangelog_delete {cid}"
+        f"\n\n💡 Опубликовать: /changelog_publish {cid}\n"
+        f"💡 Удалить: /changelog_delete {cid}"
     )
 
 
@@ -11609,7 +11609,7 @@ async def achangelog_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Собрать черновик новых фишек, анализируя audit_log с момента последнего опубликованного changelog.
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'achangelog_draft'):
+    if not has_permission(user_id, 'gban', 'changelog_draft'):
         await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
@@ -11627,7 +11627,7 @@ async def achangelog_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
             head + "\n━━━━━━━━━━━━━━━━━\n"
             "ℹ️ Новых типов активности не обнаружено.\n"
             "Если фича добавлена, но никто ей ещё не пользовался — её здесь не будет.\n"
-            "Можете создать вручную через /achangelog_add."
+            "Можете создать вручную через /changelog_add."
         )
         return
     
@@ -11650,9 +11650,9 @@ async def achangelog_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.extend(unknown)
     
     lines.append("\n━━━━━━━━━━━━━━━━━")
-    lines.append("💡 Дальше отредактируйте текст и вызовите /achangelog_add с готовой версией.")
+    lines.append("💡 Дальше отредактируйте текст и вызовите /changelog_add с готовой версией.")
     lines.append("Например:")
-    lines.append("`/achangelog_add v" + str(int(_changelog_next_version()[1:])) + " Новые фишки`")
+    lines.append("`/changelog_add v" + str(int(_changelog_next_version()[1:])) + " Новые фишки`")
     lines.append("`• ...`")
     
     text = "\n".join(lines)
@@ -11665,11 +11665,11 @@ async def achangelog_publish(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """
     Опубликовать черновик: помечает как published, рассылает в конференцию.
     
-    /achangelog_publish <id>    — конкретный
-    /achangelog_publish          — последний черновик
+    /changelog_publish <id>    — конкретный
+    /changelog_publish          — последний черновик
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'achangelog_publish'):
+    if not has_permission(user_id, 'gban', 'changelog_publish'):
         await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
@@ -11691,7 +11691,7 @@ async def achangelog_publish(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not row:
         conn.close()
         await update.message.reply_text(
-            "❌ Подходящий черновик не найден. Создайте через /achangelog_add."
+            "❌ Подходящий черновик не найден. Создайте через /changelog_add."
         )
         return
     cid = row[0]
@@ -11736,8 +11736,8 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Показать changelog.
     
-    /achangelog          — последний опубликованный (доступно всем)
-    /achangelog <id>     — конкретный
+    /changelog          — последний опубликованный (доступно всем)
+    /changelog <id>     — конкретный
     """
     user_id = update.effective_user.id
     if not get_user_data(user_id):
@@ -11757,7 +11757,7 @@ async def achangelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c = conn.cursor()
     if cid:
         # Юзеры могут смотреть только published; редакторы (gban-grant) — любой
-        if has_permission(user_id, 'gban', 'achangelog'):
+        if has_permission(user_id, 'gban', 'changelog'):
             c.execute("SELECT * FROM changelogs WHERE id = ?", (cid,))
         else:
             c.execute("SELECT * FROM changelogs WHERE id = ? AND status = 'published'", (cid,))
@@ -11790,7 +11790,7 @@ async def achangelog_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    if has_permission(user_id, 'gban', 'achangelog_list'):
+    if has_permission(user_id, 'gban', 'changelog_list'):
         c.execute("SELECT id, version, title, status, created_at, published_at FROM changelogs ORDER BY id DESC")
     else:
         c.execute(
@@ -11816,7 +11816,7 @@ async def achangelog_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         line += f"\n   📅 {date}"
         lines.append(line)
     lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append("Просмотр: /achangelog <id>")
+    lines.append("Просмотр: /changelog <id>")
     
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -11825,14 +11825,14 @@ async def achangelog_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def achangelog_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удалить changelog. /achangelog_delete <id>"""
+    """Удалить changelog. /changelog_delete <id>"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'achangelog_delete'):
+    if not has_permission(user_id, 'gban', 'changelog_delete'):
         await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
     if not context.args:
-        await update.message.reply_text("❌ Использование: /achangelog_delete <id>")
+        await update.message.reply_text("❌ Использование: /changelog_delete <id>")
         return
     try:
         cid = int(context.args[0])
@@ -11959,7 +11959,7 @@ def _idea_set_decision(idea_id: int, status: str, decided_by: int, comment: str)
 
 
 def _idea_create_submission(user_id: int, text: str) -> int:
-    """Создание идеи без привязки к опросу (через /aidea_submit)."""
+    """Создание идеи без привязки к опросу (через /idea_submit)."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -12010,11 +12010,11 @@ def _format_idea_card(idea: dict, *, for_admin: bool) -> str:
 async def aideas_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Запустить новый опрос «есть ли у тебя идеи». Рассылка в ЛС всем зарегистрированным.
-    /aideas_start             — стандартный текст
-    /aideas_start <кастомный текст>
+    /ideas_start             — стандартный текст
+    /ideas_start <кастомный текст>
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'aideas_start'):
+    if not has_permission(user_id, 'gban', 'ideas_start'):
         await update.message.reply_text("❌ Команда доступна со спецдоступом или индивидуальным грантом.")
         return
     
@@ -12064,7 +12064,7 @@ async def aideas_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📤 Доставлено: {sent}\n"
         f"❌ Не дошло: {failed} (заблокировали бота)\n\n"
         f"Ответы будут приходить вам в ЛС по мере поступления.\n"
-        f"Сводка: /aideas"
+        f"Сводка: /ideas"
     )
 
 
@@ -12098,7 +12098,7 @@ async def idea_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "💡 СПАСИБО!\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 "Если идеи появятся — можешь в любой момент написать\n"
-                "/aidea_submit <текст>"
+                "/idea_submit <текст>"
             )
         except Exception:
             pass
@@ -12254,7 +12254,7 @@ async def handle_idea_decision_comment(update: Update, context: ContextTypes.DEF
 async def aidea_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Юзер может в любой момент отправить идею, без опроса.
-    /aidea_submit <текст>
+    /idea_submit <текст>
     """
     user_id = update.effective_user.id
     if not get_user_data(user_id):
@@ -12272,7 +12272,7 @@ async def aidea_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not text or len(text) < 5:
         await update.message.reply_text(
-            "❌ Использование: /aidea_submit <текст идеи>\n"
+            "❌ Использование: /idea_submit <текст идеи>\n"
             "Минимум 5 символов."
         )
         return
@@ -12299,18 +12299,18 @@ async def aidea_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Список идей. Юзер видит только свои; админ — все.
-    /aideas              — все ожидающие
-    /aideas all          — все (любой статус)
-    /aideas approved     — принятые
-    /aideas rejected     — отклонённые
-    /aideas implemented  — взятые в работу
+    /ideas              — все ожидающие
+    /ideas all          — все (любой статус)
+    /ideas approved     — принятые
+    /ideas rejected     — отклонённые
+    /ideas implemented  — взятые в работу
     """
     user_id = update.effective_user.id
     if not get_user_data(user_id):
         await update.message.reply_text("❌ Вы не зарегистрированы.")
         return
     
-    is_admin = has_permission(user_id, 'gban', 'aideas')
+    is_admin = has_permission(user_id, 'gban', 'ideas')
     flt = (context.args[0].lower() if context.args else 'submitted').strip()
     
     conn = sqlite3.connect(DB_FILE)
@@ -12355,7 +12355,7 @@ async def aideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
             preview += '…'
         lines.append(f"{emoji} #{r['id']} {a_name}: {preview}")
     lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append("Детально: /aidea_info <id>")
+    lines.append("Детально: /idea_info <id>")
     
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -12364,13 +12364,13 @@ async def aideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def aidea_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Детально про идею. /aidea_info <id>. Автор видит свою, админ — любую."""
+    """Детально про идею. /idea_info <id>. Автор видит свою, админ — любую."""
     user_id = update.effective_user.id
     if not get_user_data(user_id):
         await update.message.reply_text("❌ Вы не зарегистрированы.")
         return
     if not context.args:
-        await update.message.reply_text("❌ Использование: /aidea_info <id>")
+        await update.message.reply_text("❌ Использование: /idea_info <id>")
         return
     try:
         idea_id = int(context.args[0])
@@ -12383,7 +12383,7 @@ async def aidea_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Идея не найдена.")
         return
     
-    is_admin = has_permission(user_id, 'gban', 'aidea_info')
+    is_admin = has_permission(user_id, 'gban', 'idea_info')
     if not is_admin and idea['user_id'] != user_id:
         await update.message.reply_text("❌ Вы можете смотреть только свои идеи.")
         return
@@ -12400,15 +12400,15 @@ async def aidea_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aidea_to_changelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Конвертирует одобренную/реализованную идею в черновик changelog.
-    /aidea_to_changelog <idea_id>
+    /idea_to_changelog <idea_id>
     Полезно при подготовке очередного обновления.
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'aidea_to_changelog'):
+    if not has_permission(user_id, 'gban', 'idea_to_changelog'):
         await update.message.reply_text("❌ Команда доступна со спецдоступом.")
         return
     if not context.args:
-        await update.message.reply_text("❌ Использование: /aidea_to_changelog <idea_id>")
+        await update.message.reply_text("❌ Использование: /idea_to_changelog <idea_id>")
         return
     try:
         idea_id = int(context.args[0])
@@ -12430,7 +12430,7 @@ async def aidea_to_changelog(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await update.message.reply_text(
         _changelog_format(cl) +
-        f"\n\n💡 Опубликовать: /achangelog_publish {cid}"
+        f"\n\n💡 Опубликовать: /changelog_publish {cid}"
     )
 
 
@@ -12481,7 +12481,7 @@ async def startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"startup notify to {admin_id}: {e}")
 
 
-# ============ ВЫДАЧА НАКАЗАНИЯ (/apunish) ============
+# ============ ВЫДАЧА НАКАЗАНИЯ (/punish) ============
 # Форма в личке: ник нарушителя → нарушение → доказательство (текст/медиа) → превью →
 # публикация в VERDICT_TOPIC_ID. Реального варна НЕ выдаёт — только публикация-объявление.
 
@@ -12886,11 +12886,11 @@ async def punish_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ============ ИНТЕРАКТИВНОЕ МЕНЮ ДОСТУПОВ (/apermsmenu) ============
+# ============ ИНТЕРАКТИВНОЕ МЕНЮ ДОСТУПОВ (/permsmenu) ============
 # Только главный админ. Открывает меню «выбери юзера → набор галочек по командам».
 # Тык на галочку — мгновенно выдаёт или снимает индивидуальный грант через
 # grant_command_access / revoke_command_access. Параллельно работают и старые
-# команды /agrant, /arevoke — это просто более удобный UI поверх них.
+# команды /grant, /revoke — это просто более удобный UI поверх них.
 
 
 def _perms_kb_for_user(target_id: int) -> InlineKeyboardMarkup:
@@ -12986,7 +12986,7 @@ async def apermsmenu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     Кнопки меню грантов. Паттерны:
       perms:tog:<target_id>:<cmd>  — переключить грант
-      perms:another                — выбрать другого юзера (запустить /apermsmenu заново)
+      perms:another                — выбрать другого юзера (запустить /permsmenu заново)
       perms:close                  — закрыть меню
     """
     query = update.callback_query
@@ -13015,7 +13015,7 @@ async def apermsmenu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text(
                 "🎫 НАСТРОЙКА ДОСТУПОВ\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                "Чтобы выбрать другого — вызовите /apermsmenu заново."
+                "Чтобы выбрать другого — вызовите /permsmenu заново."
             )
         except Exception:
             pass
@@ -13061,8 +13061,8 @@ async def apermsmenu_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============ ПАРЫ / БРАКИ (Iris-style) ============
-# /amarry — поженить, /adivorce — развести, /awedding — карточка пары,
-# /aweddings_list — все активные, /awedding_setdate — изменить дату.
+# /marry — поженить, /divorce — развести, /wedding — карточка пары,
+# /weddings_list — все активные, /wedding_setdate — изменить дату.
 # В чате конфы текстовые триггеры («поженить пару», «наша пара», «пары», «стаж»…)
 # работают ТОЛЬКО в игровом топике; в неправильном — санкция.
 
@@ -13240,8 +13240,8 @@ async def amarry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Поженить двоих. Доступно с 4 ранга или со спецдоступом.
     
-    /amarry @u1 @u2           — оба явно
-    /amarry @u2  (reply на u1) — reply задаёт первого
+    /marry @u1 @u2           — оба явно
+    /marry @u2  (reply на u1) — reply задаёт первого
     """
     user_id = update.effective_user.id
     if not _can_manage_marriages(user_id):
@@ -13256,7 +13256,7 @@ async def amarry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u1, u2 = await _resolve_two_targets(update, context, context.args or [])
     if not u1 or not u2:
         await update.message.reply_text(
-            "❌ Использование: /amarry @user1 @user2 (или ответом + @user2)"
+            "❌ Использование: /marry @user1 @user2 (или ответом + @user2)"
         )
         return
     if u1 == u2:
@@ -13309,8 +13309,8 @@ async def adivorce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Развести пару. Указываете одного из супругов — найдём активный брак.
     
-    /adivorce @user     — по упоминанию
-    /adivorce  (reply)  — по реплаю
+    /divorce @user     — по упоминанию
+    /divorce  (reply)  — по реплаю
     """
     user_id = update.effective_user.id
     if not _can_manage_marriages(user_id):
@@ -13327,7 +13327,7 @@ async def adivorce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
-        await update.message.reply_text("❌ Использование: /adivorce @user (или reply).")
+        await update.message.reply_text("❌ Использование: /divorce @user (или reply).")
         return
     
     m = _get_active_marriage(target_id)
@@ -13366,8 +13366,8 @@ async def awedding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Показать карточку пары.
     
-    /awedding          — свою
-    /awedding @user    — чужую
+    /wedding          — свою
+    /wedding @user    — чужую
     """
     user_id = update.effective_user.id
     if not get_user_data(user_id):
@@ -13438,8 +13438,8 @@ async def awedding_setdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Изменить дату брака. Принимаются форматы ДД.ММ.ГГГГ или ГГГГ-ММ-ДД (можно с временем).
     
-    /awedding_setdate @user ДД.ММ.ГГГГ
-    /awedding_setdate #<id> ДД.ММ.ГГГГ
+    /wedding_setdate @user ДД.ММ.ГГГГ
+    /wedding_setdate #<id> ДД.ММ.ГГГГ
     """
     user_id = update.effective_user.id
     if not _can_manage_marriages(user_id):
@@ -13450,8 +13450,8 @@ async def awedding_setdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await update.message.reply_text(
             "❌ Использование:\n"
-            "/awedding_setdate @user ДД.ММ.ГГГГ\n"
-            "или /awedding_setdate #ID_пары ДД.ММ.ГГГГ"
+            "/wedding_setdate @user ДД.ММ.ГГГГ\n"
+            "или /wedding_setdate #ID_пары ДД.ММ.ГГГГ"
         )
         return
     
@@ -13524,7 +13524,7 @@ def _notes_can_read(user_id: int) -> bool:
         return False
     return (ud.get('rank', 0) >= 4
             or has_special_access(user_id)
-            or has_permission(user_id, 'warn', 'anotes'))
+            or has_permission(user_id, 'warn', 'notes'))
 
 
 def _notes_get_all(user_id: int) -> list:
@@ -13621,7 +13621,7 @@ def _format_notes_block(user_id: int, target_nick: str) -> str:
         lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━")
     lines.append(f"Всего: {len(notes)}" + (f" (📌 закреплено: {pinned_cnt})" if pinned_cnt else ""))
-    lines.append("Управление: /anote_del <id> · /anote_edit <id> <текст> · /anote_pin <id>")
+    lines.append("Управление: /note_del <id> · /note_edit <id> <текст> · /note_pin <id>")
     return "\n".join(lines)
 
 
@@ -13629,8 +13629,8 @@ async def anote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Добавить пометку на юзера.
     
-    /anote @user <текст>
-    /anote (reply) <текст>
+    /note @user <текст>
+    /note (reply) <текст>
     """
     user_id = update.effective_user.id
     if not _notes_can_read(user_id):
@@ -13640,8 +13640,8 @@ async def anote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = list(context.args or [])
     if not args and not _is_real_reply(update.message):
         await update.message.reply_text(
-            "❌ Использование: /anote @user <текст пометки>\n"
-            "Или: (reply на юзера) /anote <текст пометки>"
+            "❌ Использование: /note @user <текст пометки>\n"
+            "Или: (reply на юзера) /note <текст пометки>"
         )
         return
     
@@ -13685,8 +13685,8 @@ async def anotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Показать все пометки на юзере.
     
-    /anotes @user
-    /anotes (reply)
+    /notes @user
+    /notes (reply)
     """
     user_id = update.effective_user.id
     if not _notes_can_read(user_id):
@@ -13699,7 +13699,7 @@ async def anotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
-        await update.message.reply_text("❌ Использование: /anotes @user (или reply).")
+        await update.message.reply_text("❌ Использование: /notes @user (или reply).")
         return
     
     td = get_user_data(target_id)
@@ -13712,13 +13712,13 @@ async def anotes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def anote_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/anote_del <id>. Удалить свою пометку (главный админ — любую)."""
+    """/note_del <id>. Удалить свою пометку (главный админ — любую)."""
     user_id = update.effective_user.id
     if not _notes_can_read(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
-        await update.message.reply_text("❌ Использование: /anote_del <id>")
+        await update.message.reply_text("❌ Использование: /note_del <id>")
         return
     try:
         nid = int(context.args[0])
@@ -13740,14 +13740,14 @@ async def anote_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def anote_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/anote_edit <id> <новый текст>. Редактировать свою пометку (главный админ — любую)."""
+    """/note_edit <id> <новый текст>. Редактировать свою пометку (главный админ — любую)."""
     user_id = update.effective_user.id
     if not _notes_can_read(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     args = list(context.args or [])
     if len(args) < 2:
-        await update.message.reply_text("❌ Использование: /anote_edit <id> <новый текст>")
+        await update.message.reply_text("❌ Использование: /note_edit <id> <новый текст>")
         return
     try:
         nid = int(args[0])
@@ -13776,13 +13776,13 @@ async def anote_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def anote_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/anote_pin <id>. Переключить закрепление (📌)."""
+    """/note_pin <id>. Переключить закрепление (📌)."""
     user_id = update.effective_user.id
     if not _notes_can_read(user_id):
         await update.message.reply_text("❌ Нет прав.")
         return
     if not context.args:
-        await update.message.reply_text("❌ Использование: /anote_pin <id>")
+        await update.message.reply_text("❌ Использование: /note_pin <id>")
         return
     try:
         nid = int(context.args[0])
@@ -13807,12 +13807,12 @@ async def anote_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def wedding_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Текстовый триггер пар:
-      «поженить пару @u1 @u2»  — /amarry
-      «развести пару @user»    — /adivorce
-      «наша пара» / «моя пара» — /awedding (свою)
-      «пара @user»             — /awedding @user
-      «пары» / «список пар»    — /aweddings_list
-      «стаж» / «стаж брака»    — стаж своего брака (=awedding)
+      «поженить пару @u1 @u2»  — /marry
+      «развести пару @user»    — /divorce
+      «наша пара» / «моя пара» — /wedding (свою)
+      «пара @user»             — /wedding @user
+      «пары» / «список пар»    — /weddings_list
+      «стаж» / «стаж брака»    — стаж своего брака (=/wedding)
     """
     if not update.message or not update.message.text:
         return
@@ -13865,6 +13865,46 @@ async def wedding_trigger_router(update: Update, context: ContextTypes.DEFAULT_T
         return
 
 
+# ============ ОБРАТНАЯ СОВМЕСТИМОСТЬ: СТАРЫЙ ПРЕФИКС "a" ============
+# Раньше все команды были вида /aсуществительное (/asetrank, /aban, ...).
+# Префикс убрали ради читаемости — но кто-то по привычке продолжит писать
+# по-старому. Вместо молчаливого "неизвестная команда" — подсказываем новое имя.
+_LEGACY_A_PREFIX_COMMANDS = {
+    'aadd', 'aadminlist', 'aadmins', 'aaudit', 'aaward', 'aaward_del',
+    'aawards', 'aawards_of', 'abackup', 'aban', 'ablock', 'ablocklist',
+    'abroadcast', 'acallsign', 'achangelog', 'achangelog_add', 'achangelog_delete', 'achangelog_draft',
+    'achangelog_list', 'achangelog_publish', 'acheckall', 'acubes', 'acubes_stats', 'adelete_user',
+    'adepartment', 'adept_apply_template', 'adept_group_add', 'adept_group_assign', 'adept_group_del', 'adept_list',
+    'adept_move', 'adept_rename', 'adivorce', 'aduel', 'aduel_stats', 'afindsetup',
+    'aforcereg', 'aglobal_unban', 'agrant', 'agrantcmds', 'agrantlist', 'ahelp',
+    'ahistory', 'aidea_info', 'aidea_submit', 'aidea_to_changelog', 'aideas', 'aideas_start',
+    'ainfo', 'akick', 'amarry', 'amood', 'amooddebug', 'amute',
+    'anick', 'anote', 'anote_del', 'anote_edit', 'anote_pin', 'anotes',
+    'aperms', 'apermsmenu', 'apm', 'apoll_close', 'apoll_create', 'apoll_info',
+    'apolls', 'aprofile', 'apunish', 'aregister', 'areloadarticles', 'areport',
+    'areport_info', 'areports', 'arequest_info', 'arequests', 'areset_user', 'arevoke',
+    'asearch', 'asetadmin', 'asetalldept', 'asetallrank', 'asetdept', 'asetnick',
+    'asetrank', 'asettoken', 'aspecial', 'aspeciallist', 'astats', 'atag',
+    'atagdept', 'atest', 'atestwelcome', 'atgadmin', 'atgadmins', 'atgunadmin',
+    'aukrating', 'aunban', 'aunblock', 'aunmute', 'aunsetadmin', 'aunwarn',
+    'aunwarnall', 'aunwarngame', 'auserlist', 'avote', 'awarn', 'awarnlist',
+    'awarns', 'awedding', 'awedding_setdate', 'aweddings_list', 'awho', 'awhois',
+}
+
+
+async def _legacy_prefix_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит команды со старым префиксом 'a' и подсказывает актуальное имя."""
+    if not update.message or not update.message.text:
+        return
+    first_word = update.message.text.split()[0]
+    old_name = first_word.lstrip('/').split('@')[0]
+    new_name = old_name[1:] if old_name in _LEGACY_A_PREFIX_COMMANDS else old_name
+    await update.message.reply_text(
+        f"ℹ️ Префикс «a» убрали из команд.\n"
+        f"Чтобы использовать команду, напишите её без префикса: /{new_name}"
+    )
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -13906,70 +13946,74 @@ def main():
     )
     application.add_handler(reg_handler)
     
-    # Все команды с префиксом "a"
+    # Все команды (без префикса)
     commands = {
-        'start': start, 'ainfo': ainfo, 'ahelp': ahelp, 'aprofile': aprofile,
-        'astats': astats, 'aawards': aawards, 'anick': anick, 'asearch': asearch,
-        'akick': akick, 'aban': aban, 'aunban': aunban, 'amute': amute, 'aunmute': aunmute, 'awarn': awarn,
-        'awarns': awarns, 'awarnlist': awarns, 'aunwarn': aunwarn, 'aunwarnall': aunwarnall,
-        'asetrank': asetrank, 'asetdept': asetdept, 'asettoken': asettoken,
-        'aadmins': aadmins, 'auserlist': auserlist, 'awho': awhoprofile,
-        'areports': areports, 'acallsign': acallsign,
-        'ablock': ablock, 'aunblock': aunblock, 'amood': amood,
-        'aspecial': aspecial, 'awhois': awhois, 'abroadcast': abroadcast,
-        'abackup': abackup, 'aregister': aregister, 'aforcereg': aforcereg,
-        'aadminlist': aadminlist, 'asetadmin': asetadmin, 'aunsetadmin': aunsetadmin,
-        'areset_user': areset_user, 'adelete_user': adelete_user,
-        'asetnick': asetnick, 'aglobal_unban': aglobal_unban, 'asetallrank': asetallrank,
-        'areport_info': areport_info, 'aspeciallist': aspeciallist,
-        'adepartment': adepartment, 'asetalldept': asetalldept,
-        'atest': atest, 'find': find, 
-        'afindsetup': afindsetup,
-        'apm': apm,
-        'atgadmin': atgadmin, 'atgunadmin': atgunadmin, 'atgadmins': atgadmins,
-        'aaward': aaward, 'aawards_of': aawards_of, 'aaward_del': aaward_del,
-        'adept_list': adept_list, 'adept_rename': adept_rename, 'adept_move': adept_move,
-        'adept_group_add': adept_group_add, 'adept_group_del': adept_group_del,
-        'adept_group_assign': adept_group_assign, 'adept_apply_template': adept_apply_template,
-        'apoll_create': apoll_create, 'avote': avote, 'aadd': aadd, 'apoll_info': apoll_info, 'apoll_close': apoll_close, 'apolls': apolls,
-        'atag': atag, 'atagdept': atagdept,
-        'agrant': agrant, 'arevoke': arevoke, 'aperms': aperms, 'agrantlist': agrantlist, 'agrantcmds': agrantcmds,
-        'arequests': arequests, 'arequest_info': arequest_info,
-        'acheckall': acheckall,
-        'ablocklist': ablocklist,
-        'aaudit': aaudit, 'ahistory': ahistory,
-        'amooddebug': amooddebug,
-        'aunwarngame': aunwarngame,
-        'aukrating': aukrating,
-        'areloadarticles': areloadarticles,
-        'aduel': aduel, 'aduel_stats': aduel_stats,
-        'acubes': acubes, 'acubes_stats': acubes_stats,
-        'amarry': amarry, 'adivorce': adivorce, 'awedding': awedding,
-        'aweddings_list': aweddings_list, 'awedding_setdate': awedding_setdate,
-        'anote': anote, 'anotes': anotes, 'anote_del': anote_del,
-        'anote_edit': anote_edit, 'anote_pin': anote_pin,
-        'achangelog': achangelog, 'achangelog_list': achangelog_list,
-        'achangelog_add': achangelog_add, 'achangelog_draft': achangelog_draft,
-        'achangelog_publish': achangelog_publish, 'achangelog_delete': achangelog_delete,
-        'aideas_start': aideas_start, 'aideas': aideas, 'aidea_info': aidea_info,
-        'aidea_submit': aidea_submit, 'aidea_to_changelog': aidea_to_changelog,
+        'start': start, 'info': ainfo, 'help': ahelp, 'profile': aprofile,
+        'stats': astats, 'awards': aawards, 'nick': anick, 'search': asearch,
+        'kick': akick, 'ban': aban, 'unban': aunban, 'mute': amute, 'unmute': aunmute, 'warn': awarn,
+        'warns': awarns, 'warnlist': awarns, 'unwarn': aunwarn, 'unwarnall': aunwarnall,
+        'setrank': asetrank, 'setdept': asetdept, 'settoken': asettoken,
+        'admins': aadmins, 'userlist': auserlist, 'who': awhoprofile,
+        'reports': areports, 'callsign': acallsign,
+        'block': ablock, 'unblock': aunblock, 'mood': amood,
+        'special': aspecial, 'whois': awhois, 'broadcast': abroadcast,
+        'backup': abackup, 'register': aregister, 'forcereg': aforcereg,
+        'adminlist': aadminlist, 'setadmin': asetadmin, 'unsetadmin': aunsetadmin,
+        'reset_user': areset_user, 'delete_user': adelete_user,
+        'setnick': asetnick, 'global_unban': aglobal_unban, 'setallrank': asetallrank,
+        'report_info': areport_info, 'speciallist': aspeciallist,
+        'department': adepartment, 'setalldept': asetalldept,
+        'test': atest, 'find': find, 
+        'findsetup': afindsetup,
+        'pm': apm,
+        'tgadmin': atgadmin, 'tgunadmin': atgunadmin, 'tgadmins': atgadmins,
+        'award': aaward, 'awards_of': aawards_of, 'award_del': aaward_del,
+        'dept_list': adept_list, 'dept_rename': adept_rename, 'dept_move': adept_move,
+        'dept_group_add': adept_group_add, 'dept_group_del': adept_group_del,
+        'dept_group_assign': adept_group_assign, 'dept_apply_template': adept_apply_template,
+        'poll_create': apoll_create, 'vote': avote, 'add': aadd, 'poll_info': apoll_info, 'poll_close': apoll_close, 'polls': apolls,
+        'tag': atag, 'tagdept': atagdept,
+        'grant': agrant, 'revoke': arevoke, 'perms': aperms, 'grantlist': agrantlist, 'grantcmds': agrantcmds,
+        'requests': arequests, 'request_info': arequest_info,
+        'checkall': acheckall,
+        'blocklist': ablocklist,
+        'audit': aaudit, 'history': ahistory,
+        'mooddebug': amooddebug,
+        'unwarngame': aunwarngame,
+        'ukrating': aukrating,
+        'reloadarticles': areloadarticles,
+        'duel': aduel, 'duel_stats': aduel_stats,
+        'cubes': acubes, 'cubes_stats': acubes_stats,
+        'marry': amarry, 'divorce': adivorce, 'wedding': awedding,
+        'weddings_list': aweddings_list, 'wedding_setdate': awedding_setdate,
+        'note': anote, 'notes': anotes, 'note_del': anote_del,
+        'note_edit': anote_edit, 'note_pin': anote_pin,
+        'changelog': achangelog, 'changelog_list': achangelog_list,
+        'changelog_add': achangelog_add, 'changelog_draft': achangelog_draft,
+        'changelog_publish': achangelog_publish, 'changelog_delete': achangelog_delete,
+        'ideas_start': aideas_start, 'ideas': aideas, 'idea_info': aidea_info,
+        'idea_submit': aidea_submit, 'idea_to_changelog': aidea_to_changelog,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
     
-    # Команды БЕЗ префикса (gban, ungban, check_gban, gban_list)
+    # Команды без отдельного словаря выше (gban, ungban, check_gban, gban_list, report)
     no_prefix = {
         'gban': gban_command, 'ungban': ungban_command,
         'check_gban': check_gban_command, 'gban_list': gban_list_command,
-        'areport': areport_start
+        'report': areport_start
     }
     for cmd, func in no_prefix.items():
         application.add_handler(CommandHandler(cmd, func))
-    
+
+    # Обратная совместимость по старому префиксу "a" (см. секцию выше)
+    for legacy_cmd in _LEGACY_A_PREFIX_COMMANDS:
+        application.add_handler(CommandHandler(legacy_cmd, _legacy_prefix_notice))
+
     # Жалобы
     report_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('areport', areport_start),
+            CommandHandler('report', areport_start),
             MessageHandler(filters.Regex('^📝 Подать жалобу$'), areport_start)
         ],
         states={
@@ -13996,11 +14040,11 @@ def main():
     )
     application.add_handler(report_handler)
     
-    # Форма выдачи выговора (только в ЛС). Срабатывает по команде /apunish или
+    # Форма выдачи выговора (только в ЛС). Срабатывает по команде /punish или
     # по кнопке reply-keyboard «🚓 Выдать выговор» (видна модераторам с 4 ранга).
     punish_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('apunish', apunish_start),
+            CommandHandler('punish', apunish_start),
             MessageHandler(filters.Regex('^🚓 Выдать выговор$') & filters.ChatType.PRIVATE, apunish_start),
         ],
         states={
@@ -14030,10 +14074,10 @@ def main():
     application.add_handler(punish_handler)
     
     # Интерактивное меню настройки доступов (только главный админ).
-    # Стартует через команду /apermsmenu или reply-keyboard «🎫 Доступы».
+    # Стартует через команду /permsmenu или reply-keyboard «🎫 Доступы».
     perms_menu_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('apermsmenu', apermsmenu),
+            CommandHandler('permsmenu', apermsmenu),
             MessageHandler(filters.Regex('^🎫 Доступы$') & filters.ChatType.PRIVATE, apermsmenu),
         ],
         states={
@@ -14103,9 +14147,9 @@ def main():
     # «моя статья» — fun-фишка. ВАЖНО: отдельная группа, иначе PTB запустит только track_message
     # (внутри одной группы срабатывает только первый совпавший хэндлер).
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, article_trigger_router), group=3)
-    # «дуэль ...» — текст-триггер, эквивалент /aduel. Отдельная группа по той же причине.
+    # «дуэль ...» — текст-триггер, эквивалент /duel. Отдельная группа по той же причине.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, duel_trigger_router), group=4)
-    # «кубы ...» / «кто кубы» — текст-триггер, эквивалент /acubes. Тоже отдельная группа.
+    # «кубы ...» / «кто кубы» — текст-триггер, эквивалент /cubes. Тоже отдельная группа.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cube_trigger_router), group=5)
     # «поженить пару» / «наша пара» / «пары» / «стаж» — текст-триггеры
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wedding_trigger_router), group=6)
@@ -14139,7 +14183,7 @@ def main():
         time=time(hour=8, minute=0, tzinfo=MSK),
         days=(6,),
     )
-    application.add_handler(CommandHandler('atestwelcome', atestwelcome))
+    application.add_handler(CommandHandler('testwelcome', atestwelcome))
     
     print("🤖 Бот запущен!")
     # allowed_updates=Update.ALL_TYPES — чтобы получать chat_member события
