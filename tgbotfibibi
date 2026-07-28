@@ -8890,6 +8890,27 @@ async def _poll_announce_tally(context: ContextTypes.DEFAULT_TYPE, poll_id: int)
         pass
 
 
+async def _poll_log_vote(context: ContextTypes.DEFAULT_TYPE, poll_id: int, user_id: int,
+                          vote_en: str, reason: str = ""):
+    """
+    Атрибутированный лог голоса — уходит ТОЛЬКО в приватную лог-группу
+    (PM_LOG_CHAT_ID), для контроля админами. Везде остальные — анонимно.
+    """
+    poll = get_poll_by_id(poll_id)
+    voter_data = get_user_data(user_id)
+    voter_name = voter_data['nick'] if voter_data else f"id {user_id}"
+    text = (
+        f"🗳 Голос по #{poll_id} ({poll['candidate'] if poll else '?'})\n"
+        f"👤 {voter_name}: {_POLL_VOTE_LABELS.get(vote_en, vote_en)}"
+    )
+    if reason:
+        text += f"\n📝 {reason}"
+    try:
+        await context.bot.send_message(chat_id=PM_LOG_CHAT_ID, text=text)
+    except Exception:
+        pass
+
+
 # ============ ФУНКЦИИ ============
 
 def create_poll(candidate_nick: str, description: str, creator_id: int) -> int:
@@ -9047,6 +9068,7 @@ async def avote(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Да:{poll['yes']} Нет:{poll['no']} Возд:{poll['abstain']}"
         )
         await _poll_announce_tally(context, poll_id)
+        await _poll_log_vote(context, poll_id, user_id, vote_en, reason)
     else: await update.message.reply_text(f"❌ {message}")
 
 
@@ -9092,6 +9114,7 @@ async def poll_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pass
 
     await _poll_announce_tally(context, poll_id)
+    await _poll_log_vote(context, poll_id, user_id, vote_en)
 
 
 async def aadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
