@@ -431,24 +431,30 @@ def _is_real_reply(message) -> bool:
     return True
 
 
-def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None):
+def extract_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None,
+                     ignore_reply: bool = False):
     """
     Извлечение ID. Возвращает:
       - int (user_id) — если нашли точно
       - -1 — если найдено несколько кандидатов (нужно уточнить)
       - "@username" — если строка похожа на @-форму и в БД не нашли (нужно через get_target_id → API)
       - None — нет цели / пустой ввод
-    
+
     Порядок:
       1) reply → ID
       2) числовой ID
       3) @username / t.me/ → tg_username в БД → если нет, возвращаем "@name" (для API-резолва)
       4) голое имя → tg_username в БД → ник/позывной в БД
+
+    ignore_reply — не использовать reply_to_message для определения цели, даже
+    если сообщение является ответом. Нужно, например, в /pm: там reply — это
+    источник медиа для пересылки, а не цель по общему для остальных команд
+    соглашению «reply = кому/о ком команда».
     """
     # 1) Reply — только настоящий, не стартер форум-топика
-    if update.message and _is_real_reply(update.message):
+    if not ignore_reply and update.message and _is_real_reply(update.message):
         return update.message.reply_to_message.from_user.id
-    
+
     if not text:
         return None
     text = text.strip()
@@ -9511,7 +9517,9 @@ async def apm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    target_id = extract_user_id(update, context, args[0])
+    # ignore_reply=True: в /pm reply — это медиа-источник для пересылки, а не
+    # цель (как в остальных командах). Цель всегда только из args[0].
+    target_id = extract_user_id(update, context, args[0], ignore_reply=True)
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
