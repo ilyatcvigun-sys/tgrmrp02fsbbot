@@ -9489,46 +9489,71 @@ async def pm_log_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def apm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Написать пользователю в личку от имени бота.
+    Написать пользователю в личку от имени бота — текстом или медиа.
     Главный админ — всегда; остальным — только через индивидуальный грант.
 
-    /pm <user> <текст>
-    /pm (reply в лог-группе не нужен — это для произвольных сообщений)
+    /pm <user> <текст>                                        — текстовое сообщение
+    (ответом на фото/стикер/видео/документ и т.п.) /pm <user> [текст] — копия
+    этого медиа-сообщения; текст, если указан, становится новой подписью
+    (у стикеров подписей не бывает — игнорируется).
     """
     user_id = update.effective_user.id
     if not has_permission(user_id, 'pm', 'pm'):
         await update.message.reply_text("❌ Команда доступна только главному админу (или с грантом).")
         return
-    
+
     args = list(context.args or [])
-    if len(args) < 2:
-        await update.message.reply_text("❌ Использование: /pm <user> <текст>")
+    if not args:
+        await update.message.reply_text(
+            "❌ Использование:\n"
+            "/pm <user> <текст>\n"
+            "Или ответом на фото/стикер/видео/документ: /pm <user> [текст]"
+        )
         return
-    
+
     target_id = extract_user_id(update, context, args[0])
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
     if target_id in (None, -1):
         await update.message.reply_text("❌ Пользователь не найден.")
         return
-    
-    text = ' '.join(args[1:]).strip()
-    if not text:
-        await update.message.reply_text("❌ Пустой текст.")
+
+    extra_text = ' '.join(args[1:]).strip()
+    source = update.message.reply_to_message
+    has_media = bool(source and (
+        source.photo or source.sticker or source.video or source.animation or
+        source.document or source.voice or source.video_note or source.audio
+    ))
+
+    if not has_media and not extra_text:
+        await update.message.reply_text(
+            "❌ Нужен текст, либо ответьте на сообщение с фото/стикером/видео/документом."
+        )
         return
-    
+
     try:
-        await context.bot.send_message(chat_id=target_id, text=text)
+        if has_media:
+            copy_kwargs = {}
+            if extra_text and not source.sticker:
+                copy_kwargs['caption'] = extra_text
+            await context.bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=source.chat_id,
+                message_id=source.message_id,
+                **copy_kwargs,
+            )
+        else:
+            await context.bot.send_message(chat_id=target_id, text=extra_text)
     except Exception as e:
         await update.message.reply_text(
             f"❌ Не удалось доставить: {e}\n"
             "Юзер не открывал ЛС с ботом или заблокировал его."
         )
         return
-    
+
     td = get_user_data(target_id)
     name = td['nick'] if td else str(target_id)
-    log_action(user_id, 'pm_sent', target_id, text[:120])
+    log_action(user_id, 'pm_sent', target_id, ("[медиа] " if has_media else "") + extra_text[:120])
     await update.message.reply_text(f"✅ Доставлено: {name}")
 
 
