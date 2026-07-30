@@ -1090,6 +1090,11 @@ def init_database():
         c.execute('ALTER TABLE users ADD COLUMN last_kick_at TEXT DEFAULT ""')
     except sqlite3.OperationalError:
         pass
+    # Причина последнего кика
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN last_kick_reason TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
     # Индекс для быстрого поиска по tg_username
     try:
         c.execute('CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(LOWER(tg_username))')
@@ -1195,6 +1200,7 @@ def get_user_data(user_id: int) -> dict:
         "tg_username": g('tg_username', ''),
         "blocked_at": g('blocked_at', ''),
         "last_kick_at": g('last_kick_at', ''),
+        "last_kick_reason": g('last_kick_reason', ''),
     }
 
 def update_user_rank(user_id: int, new_rank: int) -> bool:
@@ -2896,7 +2902,10 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_action(user_id, 'kick', target_id, reason or '')
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('UPDATE users SET last_kick_at = ? WHERE user_id = ?', (now_msk_str(), target_id))
+        c.execute(
+            'UPDATE users SET last_kick_at = ?, last_kick_reason = ? WHERE user_id = ?',
+            (now_msk_str(), reason or '', target_id),
+        )
         conn.commit()
         conn.close()
         # Автоотключение от бота + снятие ранга/отдела
@@ -3702,7 +3711,7 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''SELECT user_id, game_nick, callsign, created_at, blocked_at, last_kick_at
+    c.execute('''SELECT user_id, game_nick, callsign, created_at, blocked_at, last_kick_at, last_kick_reason
                  FROM users
                  WHERE bot_blocked = 'Да'
                  ORDER BY game_nick''')
@@ -3722,7 +3731,7 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━",
     ]
     for r in rows[:80]:
-        uid, nick, callsign, created_at, blocked_at, last_kick_at = r
+        uid, nick, callsign, created_at, blocked_at, last_kick_at, last_kick_reason = r
         entry = (
             f"👤 {nick} | 📻 {callsign}\n"
             f"   🆔 {uid}\n"
@@ -3730,6 +3739,8 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if last_kick_at:
             entry += f"\n   👢 последний кик: {last_kick_at}"
+            if last_kick_reason:
+                entry += f" — {last_kick_reason}"
         lines.append(entry)
     if len(rows) > 80:
         lines.append(f"\n…и ещё {len(rows) - 80}.")
