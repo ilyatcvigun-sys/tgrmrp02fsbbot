@@ -1079,6 +1079,17 @@ def init_database():
         c.execute('ALTER TABLE users ADD COLUMN tg_username TEXT DEFAULT ""')
     except sqlite3.OperationalError:
         pass
+    # Дата отключения от бота (/block, а также автоматически при кике)
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN blocked_at TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
+    # Дата последнего кика из конференции (/kick) — отдельно от blocked_at,
+    # т.к. отключить от бота можно и без кика (/block).
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN last_kick_at TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
     # Индекс для быстрого поиска по tg_username
     try:
         c.execute('CREATE INDEX IF NOT EXISTS idx_users_tg_username ON users(LOWER(tg_username))')
@@ -1182,6 +1193,8 @@ def get_user_data(user_id: int) -> dict:
         "bot_blocked": g('bot_blocked', 'Нет'),
         "reg_date": g('created_at', ''),
         "tg_username": g('tg_username', ''),
+        "blocked_at": g('blocked_at', ''),
+        "last_kick_at": g('last_kick_at', ''),
     }
 
 def update_user_rank(user_id: int, new_rank: int) -> bool:
@@ -1610,9 +1623,9 @@ def disconnect_user_from_bot(user_id: int) -> bool:
         return False
     c.execute(
         '''UPDATE users
-           SET bot_blocked = 'Да', rank = 0, department = 'Не назначен'
+           SET bot_blocked = 'Да', rank = 0, department = 'Не назначен', blocked_at = ?
            WHERE user_id = ?''',
-        (user_id,),
+        (now_msk_str(), user_id),
     )
     conn.commit()
     conn.close()
@@ -2881,6 +2894,11 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if await kick_user_from_chat(update, context, target_id):
         log_action(user_id, 'kick', target_id, reason or '')
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('UPDATE users SET last_kick_at = ? WHERE user_id = ?', (now_msk_str(), target_id))
+        conn.commit()
+        conn.close()
         # Автоотключение от бота + снятие ранга/отдела
         disconnected = disconnect_user_from_bot(target_id)
         if disconnected:
@@ -3605,7 +3623,11 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_user_blocked(target_id):
-        await update.message.reply_text(f"ℹ️ {target_data['nick']} уже отключён от бота.")
+        when = target_data.get('blocked_at') or '—'
+        await update.message.reply_text(
+            f"ℹ️ {target_data['nick']} уже отключён от бота.\n"
+            f"🕐 Отключён: {when}"
+        )
         return
 
     # Сохраняем что было — пригодится для лога/сообщения
@@ -3623,6 +3645,7 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📻 Позывной: {target_data['callsign']}\n"
         f"🆔 ID: {target_id}\n"
         f"👮 Отключил: {issuer_name}\n"
+        f"🕐 Когда: {now_msk_str()}\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"⭐ Снят ранг: {RANKS.get(prev_rank, RANKS[0])['name']}\n"
         f"📁 Снят отдел: {prev_dept}\n"
@@ -3679,13 +3702,13 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''SELECT user_id, game_nick, callsign, created_at
+    c.execute('''SELECT user_id, game_nick, callsign, created_at, blocked_at, last_kick_at
                  FROM users
                  WHERE bot_blocked = 'Да'
                  ORDER BY game_nick''')
     rows = c.fetchall()
     conn.close()
-    
+
     if not rows:
         await update.message.reply_text(
             "🚫 ОТКЛЮЧЁННЫЕ ОТ БОТА\n"
@@ -3693,18 +3716,21 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Никто не отключён."
         )
         return
-    
+
     lines = [
         f"🚫 ОТКЛЮЧЁННЫЕ ОТ БОТА ({len(rows)})",
         "━━━━━━━━━━━━━━━━━",
     ]
     for r in rows[:80]:
-        uid, nick, callsign, created_at = r
-        lines.append(
+        uid, nick, callsign, created_at, blocked_at, last_kick_at = r
+        entry = (
             f"👤 {nick} | 📻 {callsign}\n"
             f"   🆔 {uid}\n"
-            f"   📅 регистрация: {created_at or '—'}"
+            f"   🕐 отключён: {blocked_at or '—'}"
         )
+        if last_kick_at:
+            entry += f"\n   👢 последний кик: {last_kick_at}"
+        lines.append(entry)
     if len(rows) > 80:
         lines.append(f"\n…и ещё {len(rows) - 80}.")
     lines.append("\n━━━━━━━━━━━━━━━━━")
