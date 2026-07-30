@@ -12,7 +12,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import db_pg as sqlite3
 import os
 from pathlib import Path
-import openai
 import json
 import re
 
@@ -44,18 +43,6 @@ def now_msk_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-OPENROUTER_API_KEY = "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"
-OPENROUTER_MODEL = "google/gemma-3-27b-it:free"
-# Цепочка fallback-моделей: пробуем по порядку, пока одна не отдаст валидный JSON.
-# Free-tier модели OpenRouter иногда внезапно перестают отвечать или начинают
-# возвращать пустоту — поэтому держим запас.
-OPENROUTER_FALLBACK_MODELS = [
-    "google/gemma-3-27b-it:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-    "qwen/qwen-2.5-7b-instruct:free",
-]
 
 GAME_NICK, CALLSIGN = range(2)
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
@@ -98,8 +85,6 @@ TOPIC_VIOLATION_WARN_AT = 4                  # с какого — реальн�
 TOPIC_VIOLATION_MUTE_MIN_FIRST = 5           # длительность первого мута, мин
 TOPIC_VIOLATION_MUTE_MIN_REPEAT = 15         # длительность мута при повторах
 TOPIC_VIOLATION_REACT_COOLDOWN_SEC = 60      # антифлуд замечания (на одного юзера)
-
-chat_messages = []
 
 # Множество user_id, отключённых от бота. Заполняется при старте и
 # обновляется командами /block и /unblock. Используется в gate-хэндлере,
@@ -1937,14 +1922,12 @@ HELP_SECTIONS = [
         ("duel_stats",  "[@user]",             "статистика дуэлей", 0),
         ("ukrating",    "[day|week|month|all]", "топ преступников по статьям УК", 0),
         ("unwarngame",  "",                    "сыграть за снятие предупреждения (КД 14 дней)", 0),
-        ("mood",        "",                    "настроение конференции", 0),
         ("wedding",     "[@user]",             "карточка пары", 0),
         ("weddings_list", "",                  "все пары", 0),
         ("marry",       "@user1 @user2",       "поженить пару", 4),
         ("divorce",     "@user",               "развести пару", 4),
         ("wedding_setdate", "<user|#id> <дата>", "изменить дату брака", 4),
         ("reloadarticles", "",                 "перечитать базу статей УК", "main"),
-        ("mooddebug",   "",                    "диагностика анализа настроения", "main"),
     ]),
 
     ("reports", "📨", "Жалобы и выговоры", [
@@ -3751,289 +3734,6 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(text) > 4000:
         text = text[:3997] + "..."
     await update.message.reply_text(text)
-
-# ============ AI АНАЛИЗ НАСТРОЕНИЯ ============
-
-def _extract_json_block(raw: str) -> dict:
-    """
-    Аккуратно вытаскиваем JSON из ответа модели.
-    Gemma и другие free-модели часто оборачивают JSON в ```json ... ```
-    либо добавляют текст до/после. Берём первую сбалансированную {...}.
-    """
-    if not raw:
-        return None
-    s = raw.strip()
-    # Снимаем markdown-обёртку, если есть
-    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*```$", "", s)
-    # Пытаемся распарсить как есть
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    # Ищем первый сбалансированный JSON-объект
-    start = s.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(s)):
-        ch = s[i]
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                candidate = s[start:i + 1]
-                try:
-                    return json.loads(candidate)
-                except Exception:
-                    return None
-    return None
-
-
-def _normalize_mood(parsed: dict) -> dict:
-    """Приводим результат от модели к единой схеме."""
-    if not isinstance(parsed, dict):
-        return {"mood_score": 0, "mood_label": "Не определено", "summary": ""}
-    # score
-    score = parsed.get("mood_score", parsed.get("score", 0))
-    try:
-        score = int(float(score))
-    except Exception:
-        score = 0
-    score = max(0, min(100, score))
-    # label
-    label = parsed.get("mood_label") or parsed.get("label") or parsed.get("mood") or "Не определено"
-    label = str(label).strip() or "Не определено"
-    # summary
-    summary = parsed.get("summary") or parsed.get("comment") or parsed.get("mood_text") or ""
-    summary = str(summary).strip()
-    return {"mood_score": score, "mood_label": label, "summary": summary}
-
-
-def _call_openrouter_sync(combined_text: str, model: str) -> str:
-    """Синхронный вызов OpenRouter с конкретной моделью. Возвращает сырой текст ответа."""
-    client = openai.OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-        timeout=30.0,
-    )
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты — анализатор настроения русскоязычного чата. "
-                    "Прочитай сообщения и оцени общую атмосферу. "
-                    "Верни СТРОГО один JSON-объект без markdown, без пояснений, без префиксов. "
-                    "Формат: "
-                    '{"mood_score": <целое 0-100>, '
-                    '"mood_label": "Позитивное" | "Нейтральное" | "Негативное" | "Токсичное", '
-                    '"summary": "одно короткое предложение на русском о происходящем"}'
-                ),
-            },
-            {"role": "user", "content": f"Сообщения чата:\n{combined_text}"},
-        ],
-        temperature=0.3,
-        max_tokens=300,
-    )
-    return completion.choices[0].message.content or ""
-
-
-# Диагностика — заполняется при каждом запуске анализа, доступна через /mooddebug
-_last_mood_diagnostics = {
-    "ran_at": None,
-    "model_used": None,
-    "raw_response": "",
-    "error": "",
-    "messages_count": 0,
-}
-
-
-async def analyze_mood_with_ai(messages: list) -> dict:
-    """
-    Анализ настроения через OpenRouter с fallback-цепочкой моделей.
-    Никогда не бросает; всегда возвращает нормализованный dict.
-    Заполняет _last_mood_diagnostics для отладки.
-    """
-    global _last_mood_diagnostics
-    _last_mood_diagnostics = {
-        "ran_at": now_msk_str(),
-        "model_used": None,
-        "raw_response": "",
-        "error": "",
-        "messages_count": len(messages) if messages else 0,
-    }
-    
-    if not messages:
-        _last_mood_diagnostics["error"] = "Сообщений ещё не было."
-        return {"mood_score": 0, "mood_label": "Нет данных", "summary": "Сообщений ещё не было."}
-
-    combined_text = "\n".join(messages[-100:])
-    if len(combined_text) < 10:
-        _last_mood_diagnostics["error"] = "Слишком мало сообщений для анализа."
-        return {"mood_score": 0, "mood_label": "Недостаточно данных", "summary": "Слишком мало сообщений для анализа."}
-
-    last_error = ""
-    for model in OPENROUTER_FALLBACK_MODELS:
-        try:
-            raw = await asyncio.to_thread(_call_openrouter_sync, combined_text, model)
-            _last_mood_diagnostics["model_used"] = model
-            _last_mood_diagnostics["raw_response"] = (raw or "")[:500]
-            logger.info(f"AI mood ({model}): {(raw or '')[:200]!r}")
-            parsed = _extract_json_block(raw)
-            if parsed is None:
-                last_error = f"{model}: модель не вернула валидный JSON"
-                logger.warning(f"AI mood: cannot parse JSON from {model}: {(raw or '')[:300]!r}")
-                continue
-            _last_mood_diagnostics["error"] = ""
-            return _normalize_mood(parsed)
-        except Exception as e:
-            last_error = f"{model}: {type(e).__name__}: {e}"
-            logger.error(f"AI mood error on {model}: {e}", exc_info=False)
-            continue
-    
-    _last_mood_diagnostics["error"] = last_error or "Все модели недоступны"
-    return {
-        "mood_score": 0,
-        "mood_label": "Ошибка анализа",
-        "summary": f"Не удалось получить ответ от моделей. {last_error[:200]}",
-    }
-
-
-def _mood_emoji(score: int) -> str:
-    if score >= 75:
-        return "😄"
-    if score >= 55:
-        return "🙂"
-    if score >= 40:
-        return "😐"
-    if score >= 20:
-        return "😟"
-    return "😡"
-
-
-def _mood_bar(score: int, width: int = 10) -> str:
-    filled = max(0, min(width, round(score / 100 * width)))
-    return "█" * filled + "░" * (width - filled)
-
-
-async def amood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Настроение чата"""
-    if not chat_messages:
-        await update.message.reply_text(
-            "📊 НАСТРОЕНИЕ ЧАТА\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "ℹ️ Пока недостаточно сообщений из конференции для анализа."
-        )
-        return
-
-    waiting = await update.message.reply_text("🤖 Анализирую настроение, секунду...")
-    analysis = await analyze_mood_with_ai(chat_messages)
-
-    score = analysis["mood_score"]
-    label = analysis["mood_label"]
-    summary = analysis["summary"] or "—"
-    emoji = _mood_emoji(score)
-    bar = _mood_bar(score)
-
-    text = (
-        "📊 НАСТРОЕНИЕ ЧАТА\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"{emoji} Оценка: {label}\n"
-        f"📈 [{bar}] {score}/100\n"
-        f"💬 Сообщений в выборке: {len(chat_messages)}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"📝 {summary}"
-    )
-    try:
-        await waiting.edit_text(text)
-    except Exception:
-        await update.message.reply_text(text)
-
-
-async def auto_mood(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматический анализ настроения (раз в 6 часов)"""
-    if not chat_messages or not CONFERENCE_CHAT_ID:
-        return
-    if len(chat_messages) < 5:
-        # Не флудим, если в чате почти ничего нет
-        return
-
-    analysis = await analyze_mood_with_ai(chat_messages)
-    score = analysis["mood_score"]
-    label = analysis["mood_label"]
-    summary = analysis["summary"]
-
-    # Если получили ошибку — молча выходим, не шлём шум в конфу
-    if label in ("Ошибка анализа", "Ошибка разбора", "Нет данных", "Недостаточно данных"):
-        logger.info(f"auto_mood: skip broadcast, label={label}")
-        return
-
-    emoji = _mood_emoji(score)
-    bar = _mood_bar(score)
-    text = (
-        "📊 АВТОАНАЛИЗ НАСТРОЕНИЯ\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"{emoji} {label} — {score}/100\n"
-        f"📈 [{bar}]\n"
-        f"💬 По {len(chat_messages)} последним сообщениям"
-    )
-    if summary:
-        text += f"\n━━━━━━━━━━━━━━━━━\n📝 {summary}"
-
-    try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
-    except Exception as e:
-        logger.error(f"auto_mood send error: {e}")
-
-
-async def amooddebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Диагностика анализа настроения. Видит главный админ или спецдопуск."""
-    user_id = update.effective_user.id
-    if not (is_main_admin(user_id) or has_special_access(user_id)):
-        await update.message.reply_text("❌ Команда доступна главному админу или со спецдопуском.")
-        return
-    
-    d = _last_mood_diagnostics
-    buf_size = len(chat_messages)
-    last_msgs = chat_messages[-3:] if chat_messages else []
-    
-    text = (
-        "🔧 ДИАГНОСТИКА НАСТРОЕНИЯ\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"📦 Буфер сообщений: {buf_size}/100\n"
-        f"💬 CONFERENCE_CHAT_ID: {CONFERENCE_CHAT_ID}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-    )
-    if last_msgs:
-        text += "📝 Последние сообщения:\n"
-        for m in last_msgs:
-            preview = m[:80] + ("…" if len(m) > 80 else "")
-            text += f"  • {preview}\n"
-        text += "━━━━━━━━━━━━━━━━━\n"
-    else:
-        text += "ℹ️ Буфер пуст — либо бот не видит сообщений из конфы,\nлибо после рестарта ещё ничего не пришло.\n━━━━━━━━━━━━━━━━━\n"
-    
-    if d["ran_at"]:
-        text += (
-            f"🕐 Последний запуск: {d['ran_at']}\n"
-            f"🧠 Модель: {d['model_used'] or '—'}\n"
-            f"📊 Сообщений на момент запуска: {d['messages_count']}\n"
-        )
-        if d["error"]:
-            text += f"❌ Ошибка: {d['error'][:300]}\n"
-        if d["raw_response"]:
-            text += f"━━━━━━━━━━━━━━━━━\n📥 Ответ AI (первые 500 симв):\n{d['raw_response']}\n"
-    else:
-        text += "ℹ️ Анализ ещё не запускался."
-    
-    # Telegram-лимит
-    if len(text) > 4000:
-        text = text[:3997] + "..."
-    await update.message.reply_text(text)
-
 
 # ============ УПРАВЛЕНИЕ ДЕПАРТАМЕНТАМИ ============
 
@@ -9602,32 +9302,6 @@ async def apm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Доставлено: {name}")
 
 
-async def track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбор сообщений из конференции для анализа настроения"""
-    if not update.message or not update.message.text:
-        return
-    if update.effective_chat.id != CONFERENCE_CHAT_ID:
-        # Лог-намёк, если CONFERENCE_CHAT_ID настроен не на ту конфу
-        logger.debug(
-            f"track_message: ignoring chat {update.effective_chat.id} (expected {CONFERENCE_CHAT_ID})"
-        )
-        return
-    text = update.message.text.strip()
-    # Пропускаем команды бота — они шумят и портят анализ
-    if text.startswith('/'):
-        return
-    # Ограничиваем длину одного сообщения, чтобы один длинный пост не съел всю выборку
-    if len(text) > 500:
-        text = text[:500] + "…"
-    # Дедуп подряд идущих одинаковых
-    if chat_messages and chat_messages[-1] == text:
-        return
-    chat_messages.append(text)
-    if len(chat_messages) > 100:
-        chat_messages.pop(0)
-    logger.debug(f"track_message: buffer={len(chat_messages)}/100")
-
-
 # ============ ПРОВЕРКА ТОПИКА ДЛЯ ИГР ============
 
 def _is_in_games_topic(update) -> bool:
@@ -13958,7 +13632,7 @@ _LEGACY_A_PREFIX_COMMANDS = {
     'adept_move', 'adept_rename', 'adivorce', 'aduel', 'aduel_stats', 'afindsetup',
     'aforcereg', 'aglobal_unban', 'agrant', 'agrantcmds', 'agrantlist', 'ahelp',
     'ahistory', 'aidea_info', 'aidea_submit', 'aidea_to_changelog', 'aideas', 'aideas_start',
-    'ainfo', 'akick', 'amarry', 'amood', 'amooddebug', 'amute',
+    'ainfo', 'akick', 'amarry', 'amute',
     'anick', 'anote', 'anote_del', 'anote_edit', 'anote_pin', 'anotes',
     'aperms', 'apermsmenu', 'apm', 'apoll_close', 'apoll_create', 'apoll_info',
     'apolls', 'aprofile', 'apunish', 'aregister', 'areloadarticles', 'areport',
@@ -14035,7 +13709,7 @@ def main():
         'setrank': asetrank, 'setdept': asetdept, 'settoken': asettoken,
         'admins': aadmins, 'userlist': auserlist, 'who': awhoprofile,
         'reports': areports, 'callsign': acallsign,
-        'block': ablock, 'unblock': aunblock, 'mood': amood,
+        'block': ablock, 'unblock': aunblock,
         'special': aspecial, 'whois': awhois, 'broadcast': abroadcast,
         'backup': abackup, 'register': aregister, 'forcereg': aforcereg,
         'adminlist': aadminlist, 'setadmin': asetadmin, 'unsetadmin': aunsetadmin,
@@ -14058,7 +13732,6 @@ def main():
         'checkall': acheckall,
         'blocklist': ablocklist,
         'audit': aaudit, 'history': ahistory,
-        'mooddebug': amooddebug,
         'unwarngame': aunwarngame,
         'ukrating': aukrating,
         'reloadarticles': areloadarticles,
@@ -14222,10 +13895,8 @@ def main():
     # проверяет наличие своего state в context.user_data и тихо return-ит если не его случай.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idea_input), group=10)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idea_decision_comment), group=11)
-    # Сбор сообщений для анализа настроения (только в конференции)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_message), group=2)
-    # «моя статья» — fun-фишка. ВАЖНО: отдельная группа, иначе PTB запустит только track_message
-    # (внутри одной группы срабатывает только первый совпавший хэндлер).
+    # «моя статья» — fun-фишка. ВАЖНО: отдельная группа — внутри одной группы
+    # PTB запускает только первый совпавший хэндлер.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, article_trigger_router), group=3)
     # «дуэль ...» — текст-триггер, эквивалент /duel. Отдельная группа по той же причине.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, duel_trigger_router), group=4)
@@ -14238,7 +13909,6 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, word_trigger_router), group=7)
     application.add_handler(CallbackQueryHandler(word_trigger_callback, pattern=r'^wtrig:'))
 
-    application.job_queue.run_repeating(auto_mood, interval=21600, first=10)
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
     application.job_queue.run_repeating(expire_warnings_job, interval=3600, first=30)
     # Авто-разбан временных банов: проверяем каждые 5 минут.
