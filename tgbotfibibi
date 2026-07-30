@@ -723,6 +723,15 @@ def init_database():
         )
     ''')
 
+    # Миграция: ник проголосовавшего — на момент голоса (переживает смену ника).
+    # Голосование в интерфейсе бота по-прежнему анонимное — колонка нужна для
+    # приватного лога/аудита в БД, а не для публичного показа.
+    try:
+        c.execute("ALTER TABLE poll_votes ADD COLUMN voter_nick TEXT DEFAULT ''")
+        logger.info("poll_votes.voter_nick: миграция применена")
+    except sqlite3.OperationalError:
+        pass
+
     # Индивидуальные гранты на команды.
     # Позволяют дать юзеру доступ к конкретной команде в обход проверки ранга.
     c.execute('''
@@ -8693,9 +8702,11 @@ def vote_in_poll(poll_id: int, user_id: int, vote: str, reason: str = "") -> tup
     c.execute('SELECT status FROM polls WHERE id = ?', (poll_id,))
     row = c.fetchone()
     if not row or row[0] != 'active': conn.close(); return False, "Голосование неактивно."
-    c.execute('''INSERT INTO poll_votes (poll_id, user_id, vote, reason, voted_at)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (poll_id, user_id, vote, reason, now_msk_str("%Y-%m-%d %H:%M:%S")))
+    voter_data = get_user_data(user_id)
+    voter_nick = voter_data['nick'] if voter_data else f"id {user_id}"
+    c.execute('''INSERT INTO poll_votes (poll_id, user_id, vote, reason, voted_at, voter_nick)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (poll_id, user_id, vote, reason, now_msk_str("%Y-%m-%d %H:%M:%S"), voter_nick))
     if vote == 'yes': c.execute('UPDATE polls SET yes_count = yes_count + 1 WHERE id = ?', (poll_id,))
     elif vote == 'no': c.execute('UPDATE polls SET no_count = no_count + 1 WHERE id = ?', (poll_id,))
     elif vote == 'abstain': c.execute('UPDATE polls SET abstain_count = abstain_count + 1 WHERE id = ?', (poll_id,))
