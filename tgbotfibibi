@@ -8502,6 +8502,24 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if get_user_data(update.effective_user.id):
         await update.message.reply_text("❌ Уже зарегистрированы!")
         return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    try:
+        member = await context.bot.get_chat_member(chat_id=CONFERENCE_CHAT_ID, user_id=user_id)
+        in_conference = member.status not in ('left', 'kicked')
+    except Exception as e:
+        # Для тех, кто вообще не состоит в конфе, Telegram нередко отвечает
+        # ошибкой (а не статусом 'left') — трактуем это тоже как "не в конфе".
+        logger.debug(f"start_registration: get_chat_member failed for {user_id}: {e}")
+        in_conference = False
+
+    if not in_conference:
+        await update.message.reply_text(
+            "❌ Регистрация доступна только участникам конференции.\n"
+            "Сначала вступите в конференцию, затем повторите попытку."
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text("📝 Шаг 1/2 — Игровой ник:")
     return GAME_NICK
 
