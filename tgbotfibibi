@@ -10015,21 +10015,29 @@ async def summer_countdown_job(context: ContextTypes.DEFAULT_TYPE):
         return
     days = _days_until_end_of_summer()
     if days == 0:
-        text = (
-            "🍂 ПОСЛЕДНИЙ ДЕНЬ ЛЕТА\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "Сегодня 31 августа — лето заканчивается!"
-        )
+        text = "@Merobol 🍂 ПОСЛЕДНИЙ ДЕНЬ ЛЕТА"
     else:
-        text = (
-            "☀️ СЧЁТЧИК ЛЕТА\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"До конца лета осталось: {days} {_plural_days(days)}"
-        )
+        text = f"@Merobol До конца лета осталось: {days} {_plural_days(days)} ☀️"
     try:
         await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
     except Exception as e:
         logger.error(f"summer_countdown_job send error: {e}")
+
+
+# Маркер в постоянном томе data/ — чтобы разовый пост при старте сработал
+# ровно один раз (после первого включения фичи), а не при каждом рестарте.
+_SUMMER_COUNTDOWN_FLAG = DATA_DIR / "summer_countdown_posted_once.flag"
+
+
+async def summer_countdown_initial_job(context: ContextTypes.DEFAULT_TYPE):
+    """Разовый пост через 15 сек после старта — но только при самом первом запуске."""
+    if _SUMMER_COUNTDOWN_FLAG.exists():
+        return
+    await summer_countdown_job(context)
+    try:
+        _SUMMER_COUNTDOWN_FLAG.write_text(now_msk_str())
+    except Exception as e:
+        logger.error(f"summer countdown flag write failed: {e}")
 
 
 async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
@@ -13990,7 +13998,7 @@ def main():
         summer_countdown_job,
         time=time(hour=10, minute=0, tzinfo=MSK),
     )
-    application.job_queue.run_once(summer_countdown_job, when=15)
+    application.job_queue.run_once(summer_countdown_initial_job, when=15)
     # Итоги недели — воскресенье в 22:00 МСК (день 6 в datetime.weekday)
     application.job_queue.run_daily(
         weekly_criminal_job,
