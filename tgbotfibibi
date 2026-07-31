@@ -3084,12 +3084,14 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text + "\nУточните: /gban ID причина")
         return
     
-    # ГБАН без публичных уведомлений: пользователь не должен видеть никаких сообщений
-    # ни в чате (театральное «залутал чс»), ни в личку. Кикаем тихо, подтверждение
-    # отправляем вызвавшему в ЛС.
+    # ГБАН без публичных уведомлений для ЦЕЛИ: жертва не видит никаких сообщений
+    # ни в чате (никакого театрального «залутал чс»), ни в личку. Кикаем тихо.
+    # Подтверждение с причиной — тому, кто вызвал команду, туда же, где он её
+    # вызвал (reply в тот же чат: конфа, топик или ЛС — без принудительного
+    # перенаправления в отдельную личку).
     add_gban(target_id, reason, user_id)
     await kick_user_from_chat(update, context, target_id)
-    
+
     target_data = get_user_data(target_id)
     target_name = target_data['nick'] if target_data else f"User {target_id}"
     confirm = (
@@ -3097,16 +3099,7 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 {target_name}\n"
         f"📝 {reason}"
     )
-    # Подтверждение шлём в личку вызвавшему, чтобы в общий чат ничего не утекало.
-    try:
-        await context.bot.send_message(chat_id=user_id, text=confirm)
-    except Exception as e:
-        # Если у вызвавшего нет открытой ЛС с ботом — фоллбэк на тихий reply (без театра)
-        logger.debug(f"gban DM confirm failed for {user_id}: {e}")
-        try:
-            await update.message.reply_text(confirm)
-        except Exception:
-            pass
+    await update.message.reply_text(confirm)
 
 # ============ ВАРНЫ ============
 
