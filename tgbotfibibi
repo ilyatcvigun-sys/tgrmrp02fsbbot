@@ -1,7 +1,7 @@
 import random
 import logging
 import asyncio
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, timedelta, time, timezone, date
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop
 # ВАЖНО: бот работает на PostgreSQL. Модуль db_pg — слой совместимости,
@@ -9989,6 +9989,49 @@ async def aukrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+def _plural_days(n: int) -> str:
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    last = n % 10
+    if last == 1:
+        return "день"
+    if 2 <= last <= 4:
+        return "дня"
+    return "дней"
+
+
+def _days_until_end_of_summer() -> int:
+    """Дней до ближайшего 31 августа (если уже прошло — до 31 августа следующего года)."""
+    today = now_msk().date()
+    end = date(today.year, 8, 31)
+    if today > end:
+        end = date(today.year + 1, 8, 31)
+    return (end - today).days
+
+
+async def summer_countdown_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневно постит в конференцию счётчик дней до конца лета (31 августа)."""
+    if not CONFERENCE_CHAT_ID:
+        return
+    days = _days_until_end_of_summer()
+    if days == 0:
+        text = (
+            "🍂 ПОСЛЕДНИЙ ДЕНЬ ЛЕТА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Сегодня 31 августа — лето заканчивается!"
+        )
+    else:
+        text = (
+            "☀️ СЧЁТЧИК ЛЕТА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"До конца лета осталось: {days} {_plural_days(days)}"
+        )
+    try:
+        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
+    except Exception as e:
+        logger.error(f"summer_countdown_job send error: {e}")
+
+
 async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневно в 21:00 МСК постит главного преступника дня в конференцию."""
     if not CONFERENCE_CHAT_ID:
@@ -13940,6 +13983,14 @@ def main():
         daily_criminal_job,
         time=time(hour=21, minute=0, tzinfo=MSK),
     )
+    # Счётчик дней до конца лета (31 августа) — ежедневно в 10:00 МСК.
+    # Плюс разовый пост через 15 секунд после старта, чтобы не ждать до
+    # следующего 10:00, если бот перезапущен посреди дня.
+    application.job_queue.run_daily(
+        summer_countdown_job,
+        time=time(hour=10, minute=0, tzinfo=MSK),
+    )
+    application.job_queue.run_once(summer_countdown_job, when=15)
     # Итоги недели — воскресенье в 22:00 МСК (день 6 в datetime.weekday)
     application.job_queue.run_daily(
         weekly_criminal_job,
