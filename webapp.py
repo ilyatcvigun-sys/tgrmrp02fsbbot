@@ -254,14 +254,18 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
         if not user_id or not _is_staff(user_id):
             return jsonify({"error": "forbidden"}), 403
         q = (request.args.get('q') or '').strip()
-        if len(q) < 2:
-            return jsonify({"results": []})
-        rows = _fetchall(
-            '''SELECT user_id, game_nick, callsign, rank FROM users
-               WHERE game_nick LIKE ? OR callsign LIKE ?
-               ORDER BY rank DESC LIMIT 20''',
-            (f'%{q}%', f'%{q}%'),
-        )
+        if q:
+            rows = _fetchall(
+                '''SELECT user_id, game_nick, callsign, rank FROM users
+                   WHERE game_nick LIKE ? OR callsign LIKE ?
+                   ORDER BY rank DESC LIMIT 200''',
+                (f'%{q}%', f'%{q}%'),
+            )
+        else:
+            # Без запроса — весь список (для "показать сразу все дела").
+            rows = _fetchall(
+                'SELECT user_id, game_nick, callsign, rank FROM users ORDER BY rank DESC LIMIT 200',
+            )
         return jsonify({"results": [
             {"user_id": r['user_id'], "nick": r['game_nick'], "callsign": r['callsign'],
              "rank_name": _rank_name(r['rank'] or 0)}
@@ -578,19 +582,18 @@ function renderMenu() {
 
 function renderList() {
   let html = topbarHtml('Личные дела');
-  html += '<div class="folder"><input id="search-input" placeholder="Ник или позывной…">' +
-    '<div id="search-results" class="search-results"></div></div>';
+  html += '<div class="folder"><input id="search-input" placeholder="Фильтр по нику или позывному…">' +
+    '<div id="search-results" class="search-results"><div class="muted">Загрузка…</div></div></div>';
   root.innerHTML = html;
   document.getElementById('back-btn').onclick = renderMenu;
   const input = document.getElementById('search-input');
   input.oninput = debounce(doSearch, 350);
-  input.focus();
+  doSearch(); // сразу показываем все личные дела, без запроса
 }
 
 function doSearch() {
   const q = document.getElementById('search-input').value.trim();
   const box = document.getElementById('search-results');
-  if (q.length < 2) { box.innerHTML = ''; return; }
   api('/api/search?q=' + encodeURIComponent(q)).then(res => {
     box.innerHTML = res.results.map(u =>
       '<div class="search-item" data-id="' + u.user_id + '">' + esc(u.nick) +
