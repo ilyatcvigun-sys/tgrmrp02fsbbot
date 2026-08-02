@@ -297,14 +297,21 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
             _execute('UPDATE users SET rank = ? WHERE user_id = ?', (rank, target_id))
         if hired_at is not None:
             # Свободное поле — заполняется вручную, дата принятия на текущий
-            # (открытый) период службы. Если открытого периода почему-то нет
-            # (не должно случаться при обычном ходе дел) — тихо игнорируем.
-            _execute(
+            # (открытый) период службы. У пользователей, зарегистрированных до
+            # появления этой фичи, открытого периода в service_periods ещё нет —
+            # тогда создаём его, а не молча игнорируем.
+            hired_at_value = hired_at.strip()[:32]
+            updated = _execute(
                 '''UPDATE service_periods SET hired_at = ?
                    WHERE user_id = ? AND dismissed_at = ''
                    AND id = (SELECT id FROM service_periods WHERE user_id = ? AND dismissed_at = '' ORDER BY id DESC LIMIT 1)''',
-                (hired_at.strip()[:32], target_id, target_id),
+                (hired_at_value, target_id, target_id),
             )
+            if not updated:
+                _execute(
+                    "INSERT INTO service_periods (user_id, hired_at, dismissed_at) VALUES (?, ?, '')",
+                    (target_id, hired_at_value),
+                )
 
         payload = _dossier_payload(target_id, include_notes=True)
         payload["is_staff"] = True
