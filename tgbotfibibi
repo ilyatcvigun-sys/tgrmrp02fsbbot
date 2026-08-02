@@ -1840,11 +1840,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Кнопка настройки доступов — только главному админу.
         if is_main_admin(user_id):
             keyboard.append([KeyboardButton("🎫 Доступы")])
-        # Mini App «Личное дело» — показываем, только если домен уже подключён
-        # на bothost (иначе ссылка нерабочая и Telegram откажется её открыть).
-        mini_app_url = _mini_app_url()
-        if mini_app_url:
-            keyboard.append([KeyboardButton("📇 Личное дело", web_app=WebAppInfo(url=mini_app_url))])
 
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         permissions = get_user_permissions(user_id)
@@ -1858,6 +1853,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "или используйте /help для списка команд.",
             reply_markup=reply_markup,
         )
+
+        # Mini App «Личное дело» — отдельным сообщением с inline-кнопкой.
+        # web_app-кнопка в ОБЫЧНОЙ клавиатуре на Telegram Desktop у части
+        # версий не передаёт initData (известный баг клиента) — inline-кнопка
+        # под сообщением работает надёжнее на всех платформах, поэтому
+        # используем именно её, а не KeyboardButton.
+        mini_app_url = _mini_app_url()
+        if mini_app_url:
+            await update.message.reply_text(
+                "📇 Личное дело — карточка вашего профиля и служебные отметки.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📇 Открыть личное дело", web_app=WebAppInfo(url=mini_app_url))
+                ]]),
+            )
     else:
         keyboard = [[KeyboardButton("📝 Регистрация")]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
