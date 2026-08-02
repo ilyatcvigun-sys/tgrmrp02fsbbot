@@ -1156,7 +1156,7 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
                    tg_username or ""))
         conn.commit()
         conn.close()
-        _open_service_period(user_id)
+        _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
         return token
     except sqlite3.IntegrityError:
         conn.close()
@@ -1170,7 +1170,7 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
                        now_msk_str("%Y-%m-%d %H:%M:%S")))
             conn.commit()
             conn.close()
-            _open_service_period(user_id)
+            _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
             return token
         except sqlite3.IntegrityError:
             conn.close()
@@ -1635,10 +1635,12 @@ def is_user_blocked(user_id: int) -> bool:
     return False
 
 
-def _open_service_period(user_id: int):
+def _open_service_period(user_id: int, hired_at: str = ""):
     """
-    Открывает новый период службы (принят/принят заново). hired_at оставляем
-    пустым — заполняется вручную из Mini App. Не создаёт дубль, если открытый
+    Открывает новый период службы (принят/принят заново). hired_at — если не
+    передан, оставляем пустым (заполняется вручную из Mini App, для тех, кто
+    уже был в базе до этого механизма). При новой регистрации (add_user)
+    подставляется текущая дата автоматически. Не создаёт дубль, если открытый
     период уже есть (защита от повторного вызова).
     """
     conn = sqlite3.connect(DB_FILE)
@@ -1647,7 +1649,7 @@ def _open_service_period(user_id: int):
     if c.fetchone():
         conn.close()
         return
-    c.execute("INSERT INTO service_periods (user_id, hired_at, dismissed_at) VALUES (?, '', '')", (user_id,))
+    c.execute("INSERT INTO service_periods (user_id, hired_at, dismissed_at) VALUES (?, ?, '')", (user_id, hired_at))
     conn.commit()
     conn.close()
 
