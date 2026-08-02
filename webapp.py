@@ -17,6 +17,7 @@ webapp.py — Telegram Mini App «Личное дело» поверх той ж
     ранг 5+, спецдопуск или главный админ — is_staff().
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -59,10 +60,16 @@ def validate_init_data(init_data: str, bot_token: str):
         return None
 
 
-def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_departments):
+def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_departments,
+                add_warning, conference_chat_id):
     """
     Собирает Flask-приложение. Все зависимости от bot.py — параметрами, чтобы
     этот модуль оставался самостоятельным.
+
+    add_warning — та же функция, что использует /warn (bot.py add_warning):
+    add_warning(user_id, issuer_id, reason, force_written=False) -> (ok, message, kicked).
+    Выговоры из Mini App идут через неё же — единый источник правды со /warn,
+    а не отдельная параллельная система.
     """
     app = Flask(__name__)
     admin_ids_set = set(admin_ids) if isinstance(admin_ids, (list, set, tuple)) else {admin_ids}
@@ -122,6 +129,7 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
         )
         payload = {
             "user_id": user_id,
+            "dossier_no": f"{row.get('id') or 0:02d}",
             "nick": row.get('game_nick') or '',
             "callsign": row.get('callsign') or '',
             "token": row.get('token') or '',
@@ -136,6 +144,42 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
                 for a in awards
             ],
         }
+
+        # Служба: текущий (открытый) период + история закрытых периодов, если
+        # человека увольняли и принимали заново — прошлые периоды не теряются.
+        periods = _fetchall(
+            'SELECT hired_at, dismissed_at FROM service_periods WHERE user_id = ? ORDER BY id ASC',
+            (user_id,),
+        )
+        current = next((p for p in reversed(periods) if not p['dismissed_at']), None)
+        payload["hired_at"] = (current or {}).get('hired_at') or ''
+        payload["dismissed_at"] = ''
+        payload["service_history"] = [
+            {"hired_at": p['hired_at'] or '—', "dismissed_at": p['dismissed_at']}
+            for p in periods if p['dismissed_at']
+        ]
+        # Выговоры — реальная система /warn (таблица warnings), не отдельная
+        # параллельная. Видит и сам сотрудник (дисциплинарная история), в
+        # отличие от notes, которые только для staff.
+        warn_rows = _fetchall(
+            '''SELECT w.id, w.warn_type, w.counter, w.reason, w.date, w.issued_by,
+                      u.game_nick AS issuer_nick
+               FROM warnings w
+               LEFT JOIN users u ON u.user_id = w.issued_by
+               WHERE w.user_id = ? ORDER BY w.id DESC''',
+            (user_id,),
+        )
+        payload["warn_history"] = [
+            {
+                "id": w['id'],
+                "kind": w['warn_type'] or '—',
+                "counter": w['counter'] or '',
+                "reason": w['reason'] or '',
+                "date": w['date'] or '',
+                "issuer_nick": w['issuer_nick'] or (f"id {w['issued_by']}" if w['issued_by'] else '—'),
+            }
+            for w in warn_rows
+        ]
         if include_notes:
             notes = _fetchall(
                 '''SELECT n.id, n.text, n.pinned, n.created_at, n.author_id,
@@ -237,6 +281,7 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
         callsign = (data.get('callsign') or '').strip()
         department = (data.get('department') or '').strip()
         rank = data.get('rank')
+        hired_at = data.get('hired_at')
 
         if nick:
             _execute('UPDATE users SET game_nick = ? WHERE user_id = ?', (nick[:64], target_id))
@@ -246,10 +291,80 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
             _execute('UPDATE users SET department = ? WHERE user_id = ?', (department, target_id))
         if isinstance(rank, int) and rank in ranks:
             _execute('UPDATE users SET rank = ? WHERE user_id = ?', (rank, target_id))
+        if hired_at is not None:
+            # Свободное поле — заполняется вручную, дата принятия на текущий
+            # (открытый) период службы. Если открытого периода почему-то нет
+            # (не должно случаться при обычном ходе дел) — тихо игнорируем.
+            _execute(
+                '''UPDATE service_periods SET hired_at = ?
+                   WHERE user_id = ? AND dismissed_at = ''
+                   AND id = (SELECT id FROM service_periods WHERE user_id = ? AND dismissed_at = '' ORDER BY id DESC LIMIT 1)''',
+                (hired_at.strip()[:32], target_id, target_id),
+            )
 
         payload = _dossier_payload(target_id, include_notes=True)
         payload["is_staff"] = True
         payload["is_self"] = target_id == user_id
+        return jsonify(payload)
+
+    def _notify_and_maybe_kick(target_id, message, reason, issuer_nick, kicked):
+        """
+        ЛС-уведомление о реальном варне + фактический кик из конфы при лимите —
+        то же самое, что делает /warn, только вызвано из Flask-роута, поэтому
+        через отдельный event loop (asyncio.run), а не через context.bot.
+        """
+        async def _run():
+            from telegram import Bot
+            bot = Bot(token=bot_token)
+            try:
+                await bot.send_message(
+                    chat_id=target_id,
+                    text=f"⚠️ Вам выдан пред!\n📊 {message}\n📝 {reason}\n👮 Выдал: {issuer_nick}",
+                )
+            except Exception as e:
+                logger.debug(f"webapp warn notify failed for {target_id}: {e}")
+            if kicked and conference_chat_id:
+                try:
+                    await bot.ban_chat_member(chat_id=conference_chat_id, user_id=target_id)
+                    await asyncio.sleep(1)
+                    await bot.unban_chat_member(chat_id=conference_chat_id, user_id=target_id)
+                except Exception as e:
+                    logger.error(f"webapp warn kick failed for {target_id}: {e}")
+        try:
+            asyncio.run(_run())
+        except Exception as e:
+            logger.error(f"webapp warn notify/kick error: {e}")
+
+    @app.post('/api/dossier/<int:target_id>/warn')
+    def api_dossier_warn(target_id):
+        """
+        Выдать предупреждение через ту же add_warning(), что и /warn — единый
+        источник правды. force_written в теле запроса — выдать письменное
+        сразу, минуя устные (для серьёзных нарушений).
+        """
+        user_id = _authed_user_id()
+        if not user_id or not _is_staff(user_id):
+            return jsonify({"error": "forbidden"}), 403
+        if not _get_user_row(target_id):
+            return jsonify({"error": "not_registered"}), 404
+        data = request.get_json(silent=True) or {}
+        reason = (data.get('reason') or '').strip()[:300]
+        force_written = bool(data.get('force_written'))
+        if not reason:
+            return jsonify({"error": "empty_reason"}), 400
+
+        ok, message, kicked = add_warning(target_id, user_id, reason, force_written)
+        if not ok:
+            return jsonify({"error": "warn_failed", "message": message}), 400
+
+        issuer_row = _get_user_row(user_id)
+        issuer_nick = (issuer_row.get('game_nick') if issuer_row else None) or f"id {user_id}"
+        _notify_and_maybe_kick(target_id, message, reason, issuer_nick, kicked)
+
+        payload = _dossier_payload(target_id, include_notes=True)
+        payload["is_staff"] = True
+        payload["is_self"] = target_id == user_id
+        payload["warn_result"] = message
         return jsonify(payload)
 
     @app.post('/api/dossier/<int:target_id>/notes')
@@ -373,10 +488,29 @@ _INDEX_HTML = r"""<!doctype html>
   .hidden { display: none !important; }
   .error { color: var(--danger); font-size: 13px; padding: 10px; text-align: center; }
   .stamp { text-align: center; color: var(--hint); font-size: 11px; margin-top: 18px; letter-spacing: 1px; }
+  .topbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .back-btn { width: auto; padding: 7px 12px; font-size: 13px; background: transparent; border: 1px solid var(--accent-dim); color: var(--accent); border-radius: 5px; }
+  .topbar-title { font-size: 13px; color: var(--hint); text-transform: uppercase; letter-spacing: 1px; }
+  .menu-header { text-align: center; padding: 10px 0 18px; }
+  .menu-header .crest { font-size: 30px; }
+  .menu-header .title { color: var(--accent); letter-spacing: 1px; text-transform: uppercase; font-size: 13px; margin-top: 6px; }
+  .menu-btn {
+    background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 6px; padding: 16px; margin-bottom: 10px; font-size: 15px; font-weight: 600;
+    cursor: pointer;
+  }
+  .menu-btn:active { background: var(--accent-dim); }
+  .warn-entry { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .warn-entry:last-child { border-bottom: none; }
+  .warn-entry .meta { color: var(--hint); font-size: 11px; margin-top: 2px; }
+  .warn-kind-verbal { background: #4a4326; color: #e6d7a8; }
+  .warn-kind-written { background: #4a2a2a; color: #e6b0b0; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--hint); margin: 4px 0 10px; }
+  .checkbox-row input { width: auto; margin: 0; }
 </style>
 </head>
 <body>
-  <div id="root"><div class="muted" style="text-align:center;padding:40px 0;">Загрузка личного дела…</div></div>
+  <div id="root"><div class="muted" style="text-align:center;padding:40px 0;">Загрузка…</div></div>
 
 <script>
 const tg = window.Telegram && window.Telegram.WebApp;
@@ -388,21 +522,14 @@ function api(path, opts) {
   opts.headers = Object.assign({'Content-Type': 'application/json', 'Telegram-Init-Data': initData}, opts.headers || {});
   return fetch(path, opts).then(async r => {
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || ('http_' + r.status));
+    if (!r.ok) throw new Error(data.message || data.error || ('http_' + r.status));
     return data;
   });
 }
 
 const root = document.getElementById('root');
-
-function renderError(msg) {
-  const map = {
-    unauthorized: 'Не удалось подтвердить личность через Telegram.',
-    not_registered: 'Пользователь не зарегистрирован в боте.',
-    forbidden: 'Недостаточно прав для просмотра этого личного дела.',
-  };
-  root.innerHTML = '<div class="folder"><div class="error">' + (map[msg] || 'Ошибка загрузки: ' + msg) + '</div></div>';
-}
+let me = null;              // кэш /api/me — свои данные, права, справочники
+let backTarget = 'menu';    // куда ведёт кнопка "Назад" из карточки: 'menu' | 'list'
 
 function esc(s) {
   const d = document.createElement('div');
@@ -410,20 +537,114 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+function renderError(msg, withBack) {
+  const map = {
+    unauthorized: 'Не удалось подтвердить личность через Telegram.',
+    not_registered: 'Пользователь не зарегистрирован в боте.',
+    forbidden: 'Недостаточно прав для просмотра этого личного дела.',
+  };
+  root.innerHTML = '<div class="folder"><div class="error">' + (map[msg] || 'Ошибка загрузки: ' + msg) + '</div></div>' +
+    (withBack ? '<button class="secondary" id="err-back-btn">← В меню</button>' : '');
+  const b = document.getElementById('err-back-btn');
+  if (b) b.onclick = renderMenu;
+}
+
+function topbarHtml(title) {
+  return '<div class="topbar"><button class="back-btn" id="back-btn">← Назад</button>' +
+    (title ? '<div class="topbar-title">' + esc(title) + '</div>' : '') + '</div>';
+}
+
+// ── Экран 1: главное меню ──
+
+function renderMenu() {
+  let html = '<div class="menu-header"><div class="crest">🛡</div><div class="title">ФСБ · РМ-РП 02</div></div>';
+  html += '<div class="menu-btn" id="btn-own">👤 Моё личное дело</div>';
+  if (me.is_staff) {
+    html += '<div class="menu-btn" id="btn-list">📁 Личные дела сотрудников</div>';
+  }
+  html += '<div class="stamp">Здесь позже появятся другие разделы</div>';
+  root.innerHTML = html;
+  document.getElementById('btn-own').onclick = () => openDetail(me.user_id, 'menu');
+  const btnList = document.getElementById('btn-list');
+  if (btnList) btnList.onclick = renderList;
+}
+
+// ── Экран 2: список / поиск личных дел (только staff) ──
+
+function renderList() {
+  let html = topbarHtml('Личные дела');
+  html += '<div class="folder"><input id="search-input" placeholder="Ник или позывной…">' +
+    '<div id="search-results" class="search-results"></div></div>';
+  root.innerHTML = html;
+  document.getElementById('back-btn').onclick = renderMenu;
+  const input = document.getElementById('search-input');
+  input.oninput = debounce(doSearch, 350);
+  input.focus();
+}
+
+function doSearch() {
+  const q = document.getElementById('search-input').value.trim();
+  const box = document.getElementById('search-results');
+  if (q.length < 2) { box.innerHTML = ''; return; }
+  api('/api/search?q=' + encodeURIComponent(q)).then(res => {
+    box.innerHTML = res.results.map(u =>
+      '<div class="search-item" data-id="' + u.user_id + '">' + esc(u.nick) +
+      ' <span class="muted">· ' + esc(u.callsign) + ' · ' + esc(u.rank_name) + '</span></div>'
+    ).join('') || '<div class="muted">Ничего не найдено.</div>';
+    box.querySelectorAll('.search-item').forEach(el => {
+      el.onclick = () => openDetail(parseInt(el.dataset.id, 10), 'list');
+    });
+  }).catch(e => { box.innerHTML = '<div class="error">' + esc(e.message) + '</div>'; });
+}
+
+// ── Экран 3: карточка личного дела ──
+
+function openDetail(id, from) {
+  backTarget = from;
+  if (me && id === me.user_id) {
+    renderDossier(me);
+  } else {
+    loadDossier(id);
+  }
+}
+
+function loadDossier(id) {
+  root.innerHTML = '<div class="muted" style="text-align:center;padding:40px 0;">Загрузка…</div>';
+  api('/api/dossier/' + id).then(renderDossier).catch(e => renderError(e.message, true));
+}
+
+function goBack() {
+  if (backTarget === 'list') renderList(); else renderMenu();
+}
+
 function dossierHtml(d) {
   let html = '';
   html += '<div class="folder">';
-  html += '  <div class="folder-title">Личное дело<b>№ ' + esc(d.token || '—') + '</b></div>';
+  html += '  <div class="folder-title">Личное дело<b>№ ' + esc(d.dossier_no || '—') + '</b></div>';
   html += '  <div class="row"><span class="k">Ник</span><span class="v">' + esc(d.nick) + '</span></div>';
   html += '  <div class="row"><span class="k">Позывной</span><span class="v">' + esc(d.callsign) + '</span></div>';
   html += '  <div class="row"><span class="k">Ранг</span><span class="v">' + esc(d.rank_name) + '</span></div>';
   html += '  <div class="row"><span class="k">Отдел</span><span class="v">' + esc(d.department) + '</span></div>';
   html += '  <div class="row"><span class="k">В деле с</span><span class="v">' + esc(d.reg_date || '—') + '</span></div>';
-  html += '  <div class="row"><span class="k">Взыскания</span><span class="v"><span class="badge warn-badge">' + esc(d.warns) + '</span></span></div>';
+  html += '  <div class="row"><span class="k">Принят на службу</span><span class="v">' + esc(d.hired_at || 'не указано') + '</span></div>';
+  html += '  <div class="row"><span class="k">Взыскания (устные/письм.)</span><span class="v"><span class="badge warn-badge">' + esc(d.warns) + '</span></span></div>';
   if (d.blocked) {
     html += '  <div class="row"><span class="k">Статус</span><span class="v"><span class="badge warn-badge">отключён от бота</span></span></div>';
   }
   html += '</div>';
+
+  if (d.service_history && d.service_history.length) {
+    html += '<div class="folder"><div class="section-title">История службы</div>';
+    d.service_history.forEach(p => {
+      html += '<div class="award">🗓 ' + esc(p.hired_at) + ' — ' + esc(p.dismissed_at) + '</div>';
+    });
+    html += '</div>';
+  }
 
   html += '<div class="folder"><div class="section-title">Награды</div>';
   if (d.awards && d.awards.length) {
@@ -456,6 +677,41 @@ function notesHtml(notes) {
   ).join('');
 }
 
+// ── Выговоры: реальная система /warn (устное/письменное), не отдельная ──
+
+function warnsSectionHtml(d) {
+  let html = '<div class="folder"><div class="section-title">Выговоры</div>';
+  html += '<div id="warns-list">' + warnListHtml(d.warn_history || []) + '</div>';
+  if (d.is_staff) {
+    html += '<textarea id="warn-reason" placeholder="Причина выговора…"></textarea>';
+    html += '<label class="checkbox-row"><input type="checkbox" id="warn-force"> Выдать сразу письменное (минуя устные)</label>';
+    html += '<button id="warn-add-btn">Выдать выговор</button>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function warnListHtml(list) {
+  if (!list.length) return '<div class="muted">Выговоров нет.</div>';
+  return list.map(w => {
+    const cls = w.kind === 'Письменное' ? 'warn-kind-written' : 'warn-kind-verbal';
+    return '<div class="warn-entry"><span class="badge ' + cls + '">' + esc(w.kind) + '</span> ' + esc(w.reason) +
+      '<div class="meta">' + esc(w.issuer_nick) + ' · ' + esc(w.date) + ' · счёт ' + esc(w.counter) + '</div></div>';
+  }).join('');
+}
+
+function addWarn(id) {
+  const reasonEl = document.getElementById('warn-reason');
+  const reason = reasonEl.value.trim();
+  if (!reason) return;
+  const forceWritten = document.getElementById('warn-force').checked;
+  api('/api/dossier/' + id + '/warn', { method: 'POST', body: JSON.stringify({ reason, force_written: forceWritten }) })
+    .then(d => { if (me && id === me.user_id) me = d; renderDossier(d); })
+    .catch(e => alert('Не удалось выдать: ' + e.message));
+}
+
+// ── Редактирование карточки (только staff) ──
+
 function editFormHtml(d) {
   let opts = '';
   (window.__RANKS__ || []).forEach(r => {
@@ -470,52 +726,9 @@ function editFormHtml(d) {
     '<input id="edit-callsign" value="' + esc(d.callsign) + '" placeholder="Позывной">' +
     '<select id="edit-dept">' + deptOpts + '</select>' +
     '<select id="edit-rank">' + opts + '</select>' +
+    '<input id="edit-hired" value="' + esc(d.hired_at) + '" placeholder="Дата принятия на службу (дд.мм.гггг)">' +
     '<button id="save-btn">Сохранить изменения</button>' +
     '</div>';
-}
-
-let currentId = null;
-
-function renderDossier(d) {
-  currentId = d.user_id;
-  let html = dossierHtml(d);
-  if (d.is_staff) html += editFormHtml(d);
-  html += searchBlockHtml(d.is_staff);
-  root.innerHTML = html;
-
-  const saveBtn = document.getElementById('save-btn');
-  if (saveBtn) saveBtn.onclick = () => saveEdits(d.user_id);
-  const noteBtn = document.getElementById('note-add-btn');
-  if (noteBtn) noteBtn.onclick = () => addNote(d.user_id);
-  const searchInput = document.getElementById('search-input');
-  if (searchInput) searchInput.oninput = debounce(doSearch, 350);
-}
-
-function searchBlockHtml(isStaff) {
-  if (!isStaff) return '';
-  return '<div class="folder"><div class="section-title">Найти другое личное дело</div>' +
-    '<input id="search-input" placeholder="Ник или позывной…">' +
-    '<div id="search-results" class="search-results"></div></div>';
-}
-
-function debounce(fn, ms) {
-  let t;
-  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-}
-
-function doSearch() {
-  const q = document.getElementById('search-input').value.trim();
-  const box = document.getElementById('search-results');
-  if (q.length < 2) { box.innerHTML = ''; return; }
-  api('/api/search?q=' + encodeURIComponent(q)).then(res => {
-    box.innerHTML = res.results.map(u =>
-      '<div class="search-item" data-id="' + u.user_id + '">' + esc(u.nick) +
-      ' <span class="muted">· ' + esc(u.callsign) + ' · ' + esc(u.rank_name) + '</span></div>'
-    ).join('') || '<div class="muted">Ничего не найдено.</div>';
-    box.querySelectorAll('.search-item').forEach(el => {
-      el.onclick = () => loadDossier(parseInt(el.dataset.id, 10));
-    });
-  }).catch(e => { box.innerHTML = '<div class="error">' + esc(e.message) + '</div>'; });
 }
 
 function saveEdits(id) {
@@ -524,9 +737,10 @@ function saveEdits(id) {
     callsign: document.getElementById('edit-callsign').value,
     department: document.getElementById('edit-dept').value,
     rank: parseInt(document.getElementById('edit-rank').value, 10),
+    hired_at: document.getElementById('edit-hired').value,
   };
   api('/api/dossier/' + id, { method: 'POST', body: JSON.stringify(body) })
-    .then(renderDossier)
+    .then(d => { if (me && id === me.user_id) me = d; renderDossier(d); })
     .catch(e => alert('Не сохранилось: ' + e.message));
 }
 
@@ -535,24 +749,35 @@ function addNote(id) {
   const text = el.value.trim();
   if (!text) return;
   api('/api/dossier/' + id + '/notes', { method: 'POST', body: JSON.stringify({ text }) })
-    .then(renderDossier)
+    .then(d => { if (me && id === me.user_id) me = d; renderDossier(d); })
     .catch(e => alert('Не удалось добавить: ' + e.message));
 }
 
-function loadDossier(id) {
-  root.innerHTML = '<div class="muted" style="text-align:center;padding:40px 0;">Загрузка…</div>';
-  api('/api/dossier/' + id).then(renderDossier).catch(e => renderError(e.message));
+function renderDossier(d) {
+  let html = topbarHtml('');
+  html += dossierHtml(d);
+  html += warnsSectionHtml(d);
+  if (d.is_staff) html += editFormHtml(d);
+  root.innerHTML = html;
+
+  document.getElementById('back-btn').onclick = goBack;
+  const saveBtn = document.getElementById('save-btn');
+  if (saveBtn) saveBtn.onclick = () => saveEdits(d.user_id);
+  const noteBtn = document.getElementById('note-add-btn');
+  if (noteBtn) noteBtn.onclick = () => addNote(d.user_id);
+  const warnBtn = document.getElementById('warn-add-btn');
+  if (warnBtn) warnBtn.onclick = () => addWarn(d.user_id);
 }
 
-// Инициализация: подтягиваем справочники рангов/отделов из своей же карточки,
-// затем рендерим личное дело текущего пользователя.
+// Инициализация: подтягиваем свою карточку (+ справочники рангов/отделов,
+// если staff) и показываем стартовое меню.
 api('/api/me').then(d => {
+  me = d;
   window.__RANKS__ = d.rank_choices || [];
   window.__DEPTS__ = d.dept_choices || [];
-  renderDossier(d);
+  renderMenu();
 }).catch(e => renderError(e.message));
 </script>
-  <div class="stamp">ФСБ · РМ-РП 02</div>
 </body>
 </html>
 """

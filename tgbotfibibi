@@ -536,6 +536,8 @@ async def kick_user_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
         await asyncio.sleep(1)
         await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
+        if chat_id == CONFERENCE_CHAT_ID:
+            _close_service_period(target_id)
         return True
     except Exception as e:
         logger.error(f"Kick error: {e}")
@@ -545,6 +547,8 @@ async def ban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     try:
         chat_id = update.effective_chat.id
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
+        if chat_id == CONFERENCE_CHAT_ID:
+            _close_service_period(target_id)
         return True
     except Exception as e:
         logger.error(f"Ban error: {e}")
@@ -731,6 +735,24 @@ def init_database():
     try:
         c.execute("ALTER TABLE poll_votes ADD COLUMN voter_nick TEXT DEFAULT ''")
         logger.info("poll_votes.voter_nick: миграция применена")
+    except sqlite3.OperationalError:
+        pass
+
+    # История периодов службы (для личного дела в Mini App). Одна строка —
+    # один непрерывный период: hired_at заполняется вручную (см. _open_service_period),
+    # dismissed_at — автоматически при реальном исключении из конфы (кик/бан).
+    # Если человека уволили и приняли заново — это ДВЕ отдельные строки, а не
+    # перезапись одной, поэтому прошлые периоды не теряются.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS service_periods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            hired_at TEXT DEFAULT '',
+            dismissed_at TEXT DEFAULT ''
+        )
+    ''')
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_service_periods_user ON service_periods(user_id, id)')
     except sqlite3.OperationalError:
         pass
 
@@ -1127,13 +1149,14 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, tg_username) 
+        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, tg_username)
                      VALUES (?, ?, ?, ?, ?, ?)''',
                   (user_id, game_nick, callsign, token,
                    now_msk_str("%Y-%m-%d %H:%M:%S"),
                    tg_username or ""))
         conn.commit()
         conn.close()
+        _open_service_period(user_id)
         return token
     except sqlite3.IntegrityError:
         conn.close()
@@ -1141,12 +1164,13 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
     except sqlite3.OperationalError:
         # Старая БД без колонки tg_username — пробуем без неё
         try:
-            c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at) 
+            c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at)
                          VALUES (?, ?, ?, ?, ?)''',
                       (user_id, game_nick, callsign, token,
                        now_msk_str("%Y-%m-%d %H:%M:%S")))
             conn.commit()
             conn.close()
+            _open_service_period(user_id)
             return token
         except sqlite3.IntegrityError:
             conn.close()
@@ -1219,8 +1243,12 @@ def update_user_department(user_id: int, department: str) -> bool:
     conn.close()
     return ok
 
-def add_warning(user_id: int, issuer_id: int, reason: str) -> tuple:
-    """Добавление предупреждения"""
+def add_warning(user_id: int, issuer_id: int, reason: str, force_written: bool = False) -> tuple:
+    """
+    Добавление предупреждения. Первые 2 — устные, дальше — письменные (3-е
+    письменное = автокик). force_written=True — выдать письменное сразу,
+    минуя устные (для серьёзных нарушений, где устного недостаточно).
+    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('SELECT warns, game_nick FROM users WHERE user_id = ?', (user_id,))
@@ -1228,15 +1256,15 @@ def add_warning(user_id: int, issuer_id: int, reason: str) -> tuple:
     if not row:
         conn.close()
         return False, "Пользователь не найден", None
-    
+
     current_warns = row[0]
     user_nick = row[1]
     parts = current_warns.split('/')
     verbal = int(parts[0]) if len(parts) == 2 else 0
     written = int(parts[1]) if len(parts) == 2 else 0
     kicked = False
-    
-    if verbal < 2:
+
+    if not force_written and verbal < 2:
         verbal += 1
         warn_type = "Устное"
     elif written < 3:
@@ -1605,6 +1633,38 @@ def is_user_blocked(user_id: int) -> bool:
         blocked_users.add(user_id)
         return True
     return False
+
+
+def _open_service_period(user_id: int):
+    """
+    Открывает новый период службы (принят/принят заново). hired_at оставляем
+    пустым — заполняется вручную из Mini App. Не создаёт дубль, если открытый
+    период уже есть (защита от повторного вызова).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id FROM service_periods WHERE user_id = ? AND dismissed_at = ''", (user_id,))
+    if c.fetchone():
+        conn.close()
+        return
+    c.execute("INSERT INTO service_periods (user_id, hired_at, dismissed_at) VALUES (?, '', '')", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def _close_service_period(user_id: int):
+    """Закрывает текущий открытый период службы (реальное исключение из конфы)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id FROM service_periods WHERE user_id = ? AND dismissed_at = '' ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE service_periods SET dismissed_at = ? WHERE id = ?", (now_msk_str(), row[0]))
+        conn.commit()
+    conn.close()
 
 
 def disconnect_user_from_bot(user_id: int) -> bool:
@@ -3691,6 +3751,7 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     blocked_users.discard(target_id)
     log_action(user_id, 'unblock', target_id)
+    _open_service_period(target_id)
 
     issuer_name = get_admin_nick(user_id)
     await update.message.reply_text(
@@ -6719,8 +6780,10 @@ async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         
         log_action(user_id, 'unban', target_id)
-        
+
         target_data = get_user_data(target_id)
+        if target_data:
+            _open_service_period(target_id)
         target_name = target_data['nick'] if target_data else f"User {target_id}"
         issuer_name = get_admin_nick(user_id)
         await update.message.reply_text(
@@ -13786,6 +13849,8 @@ def run_webapp():
         ranks=RANKS,
         admin_ids=ADMIN_IDS,
         get_departments=get_departments,
+        add_warning=add_warning,
+        conference_chat_id=CONFERENCE_CHAT_ID,
     )
     try:
         app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
