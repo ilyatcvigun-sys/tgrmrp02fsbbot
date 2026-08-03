@@ -2,7 +2,7 @@ import random
 import logging
 import asyncio
 import threading
-from datetime import datetime, timedelta, time, timezone, date
+from datetime import datetime, timedelta, time, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop
 # ВАЖНО: бот работает на PostgreSQL. Модуль db_pg — слой совместимости,
@@ -10070,57 +10070,6 @@ async def aukrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-def _plural_days(n: int) -> str:
-    if 11 <= n % 100 <= 14:
-        return "дней"
-    last = n % 10
-    if last == 1:
-        return "день"
-    if 2 <= last <= 4:
-        return "дня"
-    return "дней"
-
-
-def _days_until_end_of_summer() -> int:
-    """Дней до ближайшего 31 августа (если уже прошло — до 31 августа следующего года)."""
-    today = now_msk().date()
-    end = date(today.year, 8, 31)
-    if today > end:
-        end = date(today.year + 1, 8, 31)
-    return (end - today).days
-
-# специально для Дарка
-async def summer_countdown_job(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневно постит в конференцию счётчик дней до конца лета (31 августа)."""
-    if not CONFERENCE_CHAT_ID:
-        return
-    days = _days_until_end_of_summer()
-    if days == 0:
-        text = "@Merobol 🍂 ПОСЛЕДНИЙ ДЕНЬ ЛЕТА"
-    else:
-        text = f"@Merobol До конца лета осталось: {days} {_plural_days(days)} ☀️"
-    try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
-    except Exception as e:
-        logger.error(f"summer_countdown_job send error: {e}")
-
-
-# Маркер в постоянном томе data/ — чтобы разовый пост при старте сработал
-# ровно один раз (после первого включения фичи), а не при каждом рестарте.
-_SUMMER_COUNTDOWN_FLAG = DATA_DIR / "summer_countdown_posted_once.flag"
-
-
-async def summer_countdown_initial_job(context: ContextTypes.DEFAULT_TYPE):
-    """Разовый пост через 15 сек после старта — но только при самом первом запуске."""
-    if _SUMMER_COUNTDOWN_FLAG.exists():
-        return
-    await summer_countdown_job(context)
-    try:
-        _SUMMER_COUNTDOWN_FLAG.write_text(now_msk_str())
-    except Exception as e:
-        logger.error(f"summer countdown flag write failed: {e}")
-
-
 async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневно в 21:00 МСК постит главного преступника дня в конференцию."""
     if not CONFERENCE_CHAT_ID:
@@ -14121,14 +14070,6 @@ def main():
         daily_criminal_job,
         time=time(hour=21, minute=0, tzinfo=MSK),
     )
-    # Счётчик дней до конца лета (31 августа) — ежедневно в 10:00 МСК.
-    # Плюс разовый пост через 15 секунд после старта, чтобы не ждать до
-    # следующего 10:00, если бот перезапущен посреди дня.
-    application.job_queue.run_daily(
-        summer_countdown_job,
-        time=time(hour=10, minute=0, tzinfo=MSK),
-    )
-    application.job_queue.run_once(summer_countdown_initial_job, when=15)
     # Итоги недели — воскресенье в 22:00 МСК (день 6 в datetime.weekday)
     application.job_queue.run_daily(
         weekly_criminal_job,
