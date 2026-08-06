@@ -248,6 +248,105 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
         payload["is_self"] = target_id == user_id
         return jsonify(payload)
 
+    # ── Личные дела кандидатов (из системы голосований /poll_create) ──
+    #
+    # Кандидат — не обязательно зарегистрированный в боте пользователь, поэтому
+    # карточка строится не от users, а от таблицы polls: candidate_nick — просто
+    # текст. Один кандидат может выдвигаться несколько раз (отклонили — потом
+    # выдвинули снова) — группируем все его голосования по нику (без учёта
+    # регистра) и показываем их все, самое новое сверху.
+    #
+    # Голосование анонимное (см. POLL_TOPIC_ID / _POLL_VOTE_LABELS в bot.py) —
+    # кто именно проголосовал, здесь так же не показывается, только агрегат и
+    # анонимные причины «нет», как в /poll_info.
+    #
+    # Доступ — любому зарегистрированному пользователю: у команд /poll_info,
+    # /polls в самом боте тоже нет ограничения по рангу, эта карточка не
+    # раскрывает ничего, чего нет в топике голосований.
+
+    def _candidate_payload(nick: str):
+        rows = _fetchall(
+            'SELECT * FROM polls WHERE LOWER(candidate_nick) = LOWER(?) ORDER BY id DESC',
+            (nick,),
+        )
+        if not rows:
+            return None
+        polls = []
+        for r in rows:
+            total = (r['yes_count'] or 0) + (r['no_count'] or 0) + (r['abstain_count'] or 0)
+            no_reasons = _fetchall(
+                "SELECT reason FROM poll_votes WHERE poll_id = ? AND vote = 'no' AND reason != ''",
+                (r['id'],),
+            )
+            verdict = None
+            if r['status'] != 'active':
+                verdict = 'Принято' if (r['yes_count'] or 0) > (r['no_count'] or 0) else 'Отклонено'
+            polls.append({
+                "id": r['id'],
+                "description": r['description'],
+                "additions": r['additions'] or '',
+                "status": r['status'],
+                "verdict": verdict,
+                "yes": r['yes_count'] or 0,
+                "no": r['no_count'] or 0,
+                "abstain": r['abstain_count'] or 0,
+                "total": total,
+                "creator_nick": r['creator_nick'] or '—',
+                "created_at": r['created_at'] or '',
+                "closed_at": r['closed_at'] or '',
+                "no_reasons": [x['reason'] for x in no_reasons],
+            })
+        # Если кандидат с таким ником уже зарегистрирован в боте — даём ссылку
+        # на его личное дело сотрудника (доступ туда проверяется отдельно,
+        # на /api/dossier/<id>, как обычно: свои данные или staff).
+        linked = _fetchone('SELECT user_id FROM users WHERE LOWER(game_nick) = LOWER(?)', (rows[0]['candidate_nick'],))
+        return {
+            "nick": rows[0]['candidate_nick'],
+            "polls": polls,
+            "linked_user_id": linked['user_id'] if linked else None,
+        }
+
+    @app.get('/api/candidates')
+    def api_candidates():
+        user_id = _authed_user_id()
+        if not user_id or not _get_user_row(user_id):
+            return jsonify({"error": "unauthorized"}), 401
+        q = (request.args.get('q') or '').strip().lower()
+        rows = _fetchall('SELECT * FROM polls ORDER BY id DESC')
+        by_nick = {}
+        for r in rows:
+            key = (r['candidate_nick'] or '').strip().lower()
+            if not key:
+                continue
+            by_nick.setdefault(key, []).append(r)
+        results = []
+        for key, polls in by_nick.items():
+            latest = polls[0]  # список уже отсортирован по id DESC
+            nick = latest['candidate_nick']
+            if q and q not in nick.lower():
+                continue
+            results.append({
+                "nick": nick,
+                "status": latest['status'],
+                "yes": latest['yes_count'] or 0,
+                "no": latest['no_count'] or 0,
+                "abstain": latest['abstain_count'] or 0,
+                "last_poll_id": latest['id'],
+                "polls_count": len(polls),
+            })
+        results.sort(key=lambda x: x['last_poll_id'], reverse=True)
+        return jsonify({"results": results[:200]})
+
+    @app.get('/api/candidate/<path:nick>')
+    def api_candidate(nick):
+        user_id = _authed_user_id()
+        if not user_id or not _get_user_row(user_id):
+            return jsonify({"error": "unauthorized"}), 401
+        payload = _candidate_payload(nick)
+        if not payload:
+            return jsonify({"error": "not_found"}), 404
+        return jsonify(payload)
+
     @app.get('/api/search')
     def api_search():
         user_id = _authed_user_id()
@@ -518,6 +617,15 @@ _INDEX_HTML = r"""<!doctype html>
   .warn-kind-written { background: #4a2a2a; color: #e6b0b0; }
   .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--hint); margin: 4px 0 10px; }
   .checkbox-row input { width: auto; margin: 0; }
+  .poll-card { border-bottom: 1px dashed var(--line); padding: 10px 0; }
+  .poll-card:last-child { border-bottom: none; }
+  .poll-card .meta { color: var(--hint); font-size: 11px; margin-top: 6px; }
+  .vote-bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; display: flex; margin: 6px 0 4px; }
+  .vote-bar .yes { background: #4a8f5c; }
+  .vote-bar .no { background: var(--danger); }
+  .vote-pct { display: flex; justify-content: space-between; font-size: 12px; color: var(--hint); }
+  .badge-accept { background: #2c4a2c; color: #b7e6b0; }
+  .badge-reject { background: #4a2a2a; color: #e6b0b0; }
 </style>
 </head>
 <body>
@@ -540,7 +648,7 @@ function api(path, opts) {
 
 const root = document.getElementById('root');
 let me = null;              // кэш /api/me — свои данные, права, справочники
-let backTarget = 'menu';    // куда ведёт кнопка "Назад" из карточки: 'menu' | 'list'
+let backTarget = 'menu';    // куда ведёт кнопка "Назад" из карточки: 'menu' | 'list' | 'candidates'
 
 function esc(s) {
   const d = document.createElement('div');
@@ -578,11 +686,13 @@ function renderMenu() {
   if (me.is_staff) {
     html += '<div class="menu-btn" id="btn-list">📁 Личные дела сотрудников</div>';
   }
+  html += '<div class="menu-btn" id="btn-candidates">🗳 Личные дела кандидатов</div>';
   html += '<div class="stamp">Здесь позже появятся другие разделы</div>';
   root.innerHTML = html;
   document.getElementById('btn-own').onclick = () => openDetail(me.user_id, 'menu');
   const btnList = document.getElementById('btn-list');
   if (btnList) btnList.onclick = renderList;
+  document.getElementById('btn-candidates').onclick = renderCandidates;
 }
 
 // ── Экран 2: список / поиск личных дел (только staff) ──
@@ -612,6 +722,86 @@ function doSearch() {
   }).catch(e => { box.innerHTML = '<div class="error">' + esc(e.message) + '</div>'; });
 }
 
+// ── Экран 2б: список кандидатов (из системы голосований /poll_create) ──
+
+function renderCandidates() {
+  let html = topbarHtml('Кандидаты');
+  html += '<div class="folder"><input id="cand-search-input" placeholder="Фильтр по нику…">' +
+    '<div id="cand-results" class="search-results"><div class="muted">Загрузка…</div></div></div>';
+  root.innerHTML = html;
+  document.getElementById('back-btn').onclick = renderMenu;
+  const input = document.getElementById('cand-search-input');
+  input.oninput = debounce(doCandidateSearch, 350);
+  doCandidateSearch();
+}
+
+function candidateStatusLabel(c) {
+  if (c.status === 'active') return '🟢 голосование идёт';
+  return c.yes > c.no ? '✅ принят' : '❌ отклонён';
+}
+
+function doCandidateSearch() {
+  const q = document.getElementById('cand-search-input').value.trim();
+  const box = document.getElementById('cand-results');
+  api('/api/candidates?q=' + encodeURIComponent(q)).then(res => {
+    box.innerHTML = res.results.map(c => {
+      const extra = c.polls_count > 1 ? ' · голосований: ' + c.polls_count : '';
+      return '<div class="search-item" data-nick="' + esc(c.nick) + '">' + esc(c.nick) +
+        ' <span class="muted">· ' + candidateStatusLabel(c) + extra + '</span></div>';
+    }).join('') || '<div class="muted">Кандидатов не найдено.</div>';
+    box.querySelectorAll('.search-item').forEach(el => {
+      el.onclick = () => openCandidate(el.dataset.nick);
+    });
+  }).catch(e => { box.innerHTML = '<div class="error">' + esc(e.message) + '</div>'; });
+}
+
+function openCandidate(nick) {
+  root.innerHTML = '<div class="muted" style="text-align:center;padding:40px 0;">Загрузка…</div>';
+  api('/api/candidate/' + encodeURIComponent(nick)).then(renderCandidate).catch(e => renderError(e.message, true));
+}
+
+function candidatePollHtml(p) {
+  const total = Math.max(p.total, 1);
+  const yesPct = Math.round(p.yes / total * 100);
+  const noPct = Math.round(p.no / total * 100);
+  let verdictBadge;
+  if (p.status === 'active') verdictBadge = '<span class="badge">🟢 голосование идёт</span>';
+  else verdictBadge = p.verdict === 'Принято'
+    ? '<span class="badge badge-accept">✅ принято</span>'
+    : '<span class="badge badge-reject">❌ отклонено</span>';
+
+  let html = '<div class="poll-card">';
+  html += '<div class="row"><span class="k">Голосование #' + p.id + '</span><span class="v">' + verdictBadge + '</span></div>';
+  html += '<div class="muted" style="margin:4px 0;">' + esc(p.description) + '</div>';
+  html += '<div class="vote-bar"><div class="yes" style="width:' + yesPct + '%"></div><div class="no" style="width:' + noPct + '%"></div></div>';
+  html += '<div class="vote-pct"><span>✅ ' + p.yes + ' (' + yesPct + '%)</span><span>⚪ возд. ' + p.abstain + '</span><span>❌ ' + p.no + ' (' + noPct + '%)</span></div>';
+  if (p.additions) {
+    html += '<div class="muted" style="margin-top:6px;white-space:pre-line;">📎' + esc(p.additions) + '</div>';
+  }
+  if (p.no_reasons && p.no_reasons.length) {
+    html += '<div class="muted" style="margin-top:6px;">Причины «нет» (анонимно):<br>' +
+      p.no_reasons.map(r => '• ' + esc(r)).join('<br>') + '</div>';
+  }
+  html += '<div class="meta">👮 ' + esc(p.creator_nick) + ' · ' + esc(p.created_at) + '</div>';
+  html += '</div>';
+  return html;
+}
+
+function renderCandidate(d) {
+  let html = topbarHtml('');
+  html += '<div class="folder">';
+  html += '  <div class="folder-title">Личное дело кандидата<b>' + esc(d.nick) + '</b></div>';
+  d.polls.forEach(p => { html += candidatePollHtml(p); });
+  html += '</div>';
+  if (d.linked_user_id) {
+    html += '<button class="secondary" id="cand-link-btn">📇 Личное дело сотрудника (' + esc(d.nick) + ')</button>';
+  }
+  root.innerHTML = html;
+  document.getElementById('back-btn').onclick = () => renderCandidates();
+  const linkBtn = document.getElementById('cand-link-btn');
+  if (linkBtn) linkBtn.onclick = () => openDetail(d.linked_user_id, 'candidates');
+}
+
 // ── Экран 3: карточка личного дела ──
 
 function openDetail(id, from) {
@@ -629,7 +819,9 @@ function loadDossier(id) {
 }
 
 function goBack() {
-  if (backTarget === 'list') renderList(); else renderMenu();
+  if (backTarget === 'list') renderList();
+  else if (backTarget === 'candidates') renderCandidates();
+  else renderMenu();
 }
 
 function dossierHtml(d) {
