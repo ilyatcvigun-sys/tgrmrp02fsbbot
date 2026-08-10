@@ -5191,7 +5191,7 @@ async def asetallrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Карточка жалобы с кнопками действий."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'report_info'):
+    if not _can_view_reports(user_id):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     
@@ -5210,7 +5210,7 @@ async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Жалоба #{report_id} не найдена.")
         return
     
-    is_5plus = has_permission(user_id, 'warn')
+    is_5plus = _can_manage_reports_extra(user_id)
     card = _format_report_card(report)
     kb = _report_action_keyboard(report_id, report['status'], is_5plus)
     
@@ -7985,10 +7985,28 @@ def _format_report_card(report: dict, *, for_moderator: bool = False) -> str:
     return body.rstrip()
 
 
+def _can_view_reports(user_id: int) -> bool:
+    """Право видеть жалобы и решать по pending (rank4+ или явный грант reports/report_info)."""
+    return (
+        has_permission(user_id, 'search')
+        or has_permission(user_id, 'search', 'reports')
+        or has_permission(user_id, 'search', 'report_info')
+    )
+
+
+def _can_manage_reports_extra(user_id: int) -> bool:
+    """
+    Право на перепроверку/удаление уже решённых жалоб (rep:reopen/rep:del).
+    Раньше это была жёсткая rank5+ зона — теперь так же, как и на просмотр/решение
+    по pending-жалобам, туда пускаем и гранты на reports/report_info.
+    """
+    return has_permission(user_id, 'warn') or _can_view_reports(user_id)
+
+
 def _report_action_keyboard(report_id: int, status: str, is_mod_5plus: bool) -> InlineKeyboardMarkup:
     """Кнопки под карточкой жалобы.
     - pending → Одобрить / Отказать (для 4+ или гранта reports/report_info, обрабатывается handle_report_callback)
-    - решена + 5+ → Перепроверить / Удалить
+    - решена + 5+/грант → Перепроверить / Удалить (см. _can_manage_reports_extra)
     """
     if status == 'pending':
         return InlineKeyboardMarkup([[
@@ -8230,10 +8248,7 @@ async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     
     user_id = query.from_user.id
-    # Тот же круг, что и на просмотр (rank 4+, спецдопуск, грант на reports/report_info) —
-    # раз человеку доверили видеть жалобы, ему же доверяем по ним и решать.
-    if not (has_permission(user_id, 'search') or has_permission(user_id, 'search', 'reports')
-            or has_permission(user_id, 'search', 'report_info')):
+    if not _can_view_reports(user_id):
         try:
             await query.edit_message_text("❌ Решения по жалобам — только с 4 ранга.")
         except Exception:
@@ -8252,7 +8267,7 @@ async def handle_report_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     if report['status'] != 'pending':
-        is_5plus = has_permission(user_id, 'warn')
+        is_5plus = _can_manage_reports_extra(user_id)
         kb = _report_action_keyboard(report_id, report['status'], is_5plus)
         try:
             await query.edit_message_text(
@@ -8291,10 +8306,10 @@ async def report_extra_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     user_id = query.from_user.id
     
-    if not has_permission(user_id, 'warn'):
-        await query.answer("Только с 5 ранга.", show_alert=True)
+    if not _can_manage_reports_extra(user_id):
+        await query.answer("Только с 5 ранга (или грант на reports/report_info).", show_alert=True)
         return
-    
+
     parts = (query.data or "").split(":")
     if len(parts) < 3:
         return
@@ -8379,7 +8394,7 @@ async def report_extra_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     if action == 'delcancel':
-        is_5plus = has_permission(user_id, 'warn')
+        is_5plus = _can_manage_reports_extra(user_id)
         kb = _report_action_keyboard(report_id, report['status'], is_5plus)
         try:
             await query.edit_message_text(_format_report_card(report), reply_markup=kb)
@@ -8467,9 +8482,9 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
     context.user_data.pop('pending_action', None)
 
 async def areports(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список жалоб (4+ ранга или явный грант на 'reports' — см. /grant)."""
+    """Список жалоб (4+ ранга или явный грант на reports/report_info — см. /grant)."""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'search', 'reports'):
+    if not _can_view_reports(user_id):
         await update.message.reply_text("❌ Команда доступна с 4 ранга.")
         return
     conn = sqlite3.connect(DB_FILE)
