@@ -180,29 +180,39 @@ def get_admin_nick(user_id: int) -> str:
     return ud['nick'] if ud else str(user_id)
 
 # ============ ИНДИВИДУАЛЬНЫЕ ГРАНТЫ НА КОМАНДЫ ============
-# Список команд, на которые в принципе можно выдавать гранты через /grant.
-# Команды уровня "разработчик" (управление админами, удаление юзеров, бэкап БД,
-# спецдопуск, глобальный ЧС) сюда сознательно НЕ включены — это защита от эскалации прав.
-GRANTABLE_COMMANDS = {
-    # 4 ранг
-    'reports', 'report_info', 'callsign', 'tag', 'tagdept',
-    'requests', 'request_info', 'history',
-    # 5 ранг
-    'kick', 'ban', 'unban',
-    'warn', 'unwarn', 'unwarnall', 'warns',
-    'setrank', 'setdept',
-    'block', 'unblock', 'blocklist',
-    'audit',
-    'userlist', 'who', 'broadcast',
-    'department', 'setalldept',
-    'testwelcome',
-    # 6 ранг
-    'settoken', 'register', 'forcereg', 'changelog',
-    # Спецдопуск
-    'checkall',
-    # Прочее, что бывает полезно делегировать
-    'setnick', 'speciallist', 'pm',
+# Раньше здесь был allow-list конкретных команд. Теперь наоборот: грантовать
+# через /grant можно ЛЮБУЮ зарегистрированную команду бота (ALL_COMMAND_NAMES —
+# наполняется в main() из тех же словарей commands/no_prefix, которыми реально
+# регистрируются хендлеры, так что список команд не дублируется и не рассинхронится),
+# КРОМЕ команд уровня "разработчик" — это осознанное ограничение, защита от
+# эскалации прав, не убирай их отсюда без явного запроса владельца:
+#   - grant/revoke        — иначе гранты можно раздавать/отзывать по цепочке
+#   - setadmin/unsetadmin — управление главными админами
+#   - backup              — полный дамп БД
+#   - delete_user/reset_user — необратимое удаление/сброс пользователя
+#   - special             — выдача спецдопуска (де-факто суперправа, обходят все проверки)
+#   - gban/ungban/global_unban/gban_list/check_gban — глобальный ЧС
+#   - setallrank          — массовая смена ранга всем разом
+#   - tgadmin/tgunadmin   — реальные права администратора в Telegram-чате
+NON_GRANTABLE_COMMANDS = {
+    'grant', 'revoke',
+    'setadmin', 'unsetadmin',
+    'backup',
+    'delete_user', 'reset_user',
+    'special',
+    'gban', 'ungban', 'global_unban', 'gban_list', 'check_gban',
+    'setallrank',
+    'tgadmin', 'tgunadmin',
 }
+
+# Полный список зарегистрированных имён команд — заполняется в main() сразу
+# после сборки commands/no_prefix, до этого пуст.
+ALL_COMMAND_NAMES: set = set()
+
+
+def grantable_commands() -> set:
+    """Актуальный набор команд, которые можно точечно выдать через /grant."""
+    return ALL_COMMAND_NAMES - NON_GRANTABLE_COMMANDS
 
 
 def has_command_access(user_id: int, command_name: str) -> bool:
@@ -7640,7 +7650,7 @@ async def agrant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     granted, already, invalid = [], [], []
     for cmd in commands_to_grant:
         cmd = cmd.lstrip('/').strip()
-        if cmd not in GRANTABLE_COMMANDS:
+        if cmd not in grantable_commands():
             invalid.append(cmd)
             continue
         if grant_command_access(target_id, cmd, user_id):
@@ -7871,7 +7881,7 @@ async def agrantcmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступно только главному админу или со спецдопуском.")
         return
     
-    cmds = sorted(GRANTABLE_COMMANDS)
+    cmds = sorted(grantable_commands())
     text = (
         "📋 КОМАНДЫ, ДОСТУПНЫЕ ДЛЯ ГРАНТА\n"
         "━━━━━━━━━━━━━━━━━\n"
@@ -7880,6 +7890,8 @@ async def agrantcmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"📊 Всего: {len(cmds)}\n\n"
         + "Используйте: /grant <user> <command>"
     )
+    if len(text) > 4000:
+        text = text[:3997] + "..."
     await update.message.reply_text(text)
 
 # ============ ЖАЛОБЫ ============
@@ -12782,17 +12794,34 @@ async def punish_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # команды /grant, /revoke — это просто более удобный UI поверх них.
 
 
-def _perms_kb_for_user(target_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура: один ряд на грантовую команду + её состояние ✅/⬜."""
+_PERMS_PAGE_SIZE = 20  # грантуемых команд теперь под сотню — на одной клавиатуре Telegram
+                        # столько кнопок не помещается (лимит 100), поэтому листаем страницами.
+
+
+def _perms_kb_for_user(target_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    """Клавиатура: один ряд на грантовую команду + её состояние ✅/⬜, с пагинацией."""
     granted = {g[0] for g in list_user_grants(target_id)}
+    cmds = sorted(grantable_commands())
+    total_pages = max(1, (len(cmds) + _PERMS_PAGE_SIZE - 1) // _PERMS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _PERMS_PAGE_SIZE
+    page_cmds = cmds[start:start + _PERMS_PAGE_SIZE]
+
     rows = []
-    # Сортируем для стабильного отображения
-    for cmd in sorted(GRANTABLE_COMMANDS):
+    for cmd in page_cmds:
         marker = "✅" if cmd in granted else "⬜"
         rows.append([
             InlineKeyboardButton(f"{marker} /{cmd}",
-                                 callback_data=f"perms:tog:{target_id}:{cmd}")
+                                 callback_data=f"perms:tog:{target_id}:{page}:{cmd}")
         ])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"perms:page:{target_id}:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"стр. {page + 1}/{total_pages}", callback_data="perms:noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"perms:page:{target_id}:{page + 1}"))
+        rows.append(nav)
     rows.append([InlineKeyboardButton("👤 Другой пользователь", callback_data="perms:another")])
     rows.append([InlineKeyboardButton("✖️ Закрыть", callback_data="perms:close")])
     return InlineKeyboardMarkup(rows)
@@ -12805,13 +12834,13 @@ def _perms_text_for_user(target_id: int) -> str:
     rank = ud['rank'] if ud else None
     rank_name = RANKS.get(rank, RANKS[0])['name'] if rank is not None else "—"
     granted_count = len(list_user_grants(target_id))
-    
+
     return (
         "🎫 НАСТРОЙКА ДОСТУПОВ\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"👤 {name}{callsign}\n"
         f"⭐ Ранг: {rank_name}\n"
-        f"🎫 Грантов: {granted_count} из {len(GRANTABLE_COMMANDS)}\n"
+        f"🎫 Грантов: {granted_count} из {len(grantable_commands())}\n"
         "━━━━━━━━━━━━━━━━━\n"
         "Жмите на команду — переключит грант.\n"
         "✅ — есть индивидуальный грант  ⬜ — нет"
@@ -12874,9 +12903,11 @@ async def apermsmenu_pick_user(update: Update, context: ContextTypes.DEFAULT_TYP
 async def apermsmenu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Кнопки меню грантов. Паттерны:
-      perms:tog:<target_id>:<cmd>  — переключить грант
-      perms:another                — выбрать другого юзера (запустить /permsmenu заново)
-      perms:close                  — закрыть меню
+      perms:tog:<target_id>:<page>:<cmd> — переключить грант (страница — чтобы вернуться на неё же)
+      perms:page:<target_id>:<page>      — перелистнуть страницу
+      perms:noop                         — кнопка-индикатор страницы, ничего не делает
+      perms:another                      — выбрать другого юзера (запустить /permsmenu заново)
+      perms:close                        — закрыть меню
     """
     query = update.callback_query
     user_id = query.from_user.id
@@ -12910,17 +12941,39 @@ async def apermsmenu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
         return
     
-    if action == 'tog' and len(parts) >= 4:
+    if action == 'noop':
+        await query.answer()
+        return
+
+    if action == 'page' and len(parts) >= 4:
         try:
             target_id = int(parts[2])
+            page = int(parts[3])
         except ValueError:
             await query.answer()
             return
-        cmd = ":".join(parts[3:])  # на всякий случай — если в имени окажется ':'
-        if cmd not in GRANTABLE_COMMANDS:
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                _perms_text_for_user(target_id),
+                reply_markup=_perms_kb_for_user(target_id, page),
+            )
+        except Exception:
+            pass
+        return
+
+    if action == 'tog' and len(parts) >= 5:
+        try:
+            target_id = int(parts[2])
+            page = int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        cmd = ":".join(parts[4:])  # на всякий случай — если в имени окажется ':'
+        if cmd not in grantable_commands():
             await query.answer("❌ Команда не в списке грантовых.", show_alert=True)
             return
-        
+
         if has_command_access(target_id, cmd):
             revoke_command_access(target_id, cmd)
             log_action(user_id, 'revoke_command', target_id, f"/{cmd} (через меню)")
@@ -12929,12 +12982,12 @@ async def apermsmenu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             grant_command_access(target_id, cmd, user_id)
             log_action(user_id, 'grant_command', target_id, f"/{cmd} (через меню)")
             await query.answer(f"✅ Выдан грант на /{cmd}")
-        
-        # Перерисовываем меню с обновлёнными галочками
+
+        # Перерисовываем ту же страницу с обновлёнными галочками
         try:
             await query.edit_message_text(
                 _perms_text_for_user(target_id),
-                reply_markup=_perms_kb_for_user(target_id),
+                reply_markup=_perms_kb_for_user(target_id, page),
             )
         except Exception:
             pass
@@ -13942,6 +13995,13 @@ def main():
     }
     for cmd, func in no_prefix.items():
         application.add_handler(CommandHandler(cmd, func))
+
+    # Единый источник правды для грантов (/grant, /grantcmds, /permsmenu) — те же
+    # имена, которыми только что реально зарегистрированы хендлеры выше, без
+    # отдельного дублирующего списка (см. NON_GRANTABLE_COMMANDS / grantable_commands()).
+    ALL_COMMAND_NAMES.clear()
+    ALL_COMMAND_NAMES.update(commands.keys())
+    ALL_COMMAND_NAMES.update(no_prefix.keys())
 
     # Обратная совместимость по старому префиксу "a" (см. секцию выше)
     for legacy_cmd in _LEGACY_A_PREFIX_COMMANDS:
