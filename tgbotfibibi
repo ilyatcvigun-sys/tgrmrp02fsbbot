@@ -325,6 +325,7 @@ def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
         "manage_ranks": rank >= 5,
         "ban": rank >= 5,
         "kick": rank >= 5,
+        "poll_create": rank >= 6,
     }
     return permissions.get(action, False)
 
@@ -1990,7 +1991,7 @@ HELP_SECTIONS = [
         ("start",      "",                      "главное меню", 0),
         ("info",      "",                      "краткая информация о вас", 0),
         ("profile",   "",                      "полный профиль", 0),
-        ("awards",    "",                      "ваши награды", 0),
+        ("awards",    "<user?>",               "ваши награды (или чужие — по нику/@/reply)", 0),
         ("perms",     "",                      "ваши индивидуальные доступы", 0),
         ("warns",     "",                      "ваши предупреждения", 0),
         ("stats",     "",                      "статистика бота", 0),
@@ -2096,7 +2097,7 @@ HELP_SECTIONS = [
     ]),
 
     ("system", "⚙️", "Система", [
-        ("poll_create", "<кандидат> <описание>", "создать голосование", "spec"),
+        ("poll_create", "<кандидат> <описание>", "создать голосование", 6),
         ("polls",      "",                     "активные голосования", "spec"),
         ("poll_info",  "<id>",                 "результаты голосования", "spec"),
         ("poll_close", "<id>",                 "закрыть голосование", "spec"),
@@ -2570,20 +2571,37 @@ async def aaward_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def aawards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Награды"""
+    """Награды — свои по умолчанию, чужие через /awards <user> или ответом на сообщение."""
     user_id = update.effective_user.id
-    awards = get_user_awards(user_id)
+
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+        return
+    if not target_id:
+        target_id = user_id
+
+    is_self = target_id == user_id
+    awards = get_user_awards(target_id)
+
+    if is_self:
+        header, empty = "🏅 ВАШИ НАГРАДЫ", "У вас пока нет наград."
+    else:
+        td = get_user_data(target_id)
+        name = td['nick'] if td else f"id {target_id}"
+        header, empty = f"🏅 НАГРАДЫ: {name}", f"У «{name}» пока нет наград."
+
     if awards:
-        text = "🏅 ВАШИ НАГРАДЫ\n━━━━━━━━━━━━━━━━━\n"
+        text = f"{header}\n━━━━━━━━━━━━━━━━━\n"
         for a in awards:
             text += f"• {a[0]} ({a[1]})\n   📅 {a[2]}\n"
         await update.message.reply_text(text)
     else:
-        await update.message.reply_text(
-            "🏅 НАГРАДЫ\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "У вас пока нет наград."
-        )
+        await update.message.reply_text(f"🏅 НАГРАДЫ\n━━━━━━━━━━━━━━━━━\n{empty}")
 
 async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по нику"""
@@ -8890,10 +8908,10 @@ def get_poll_votes(poll_id: int) -> list:
 # ============ КОМАНДЫ ============
 
 async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Создание голосования (спецдопуск или 7 ранг)"""
+    """Создание голосования (6 ранг, спецдопуск, или явный грант на poll_create)"""
     user_id = update.effective_user.id
-    if not has_special_access(user_id) and get_user_data(user_id)['rank'] < 7:
-        await update.message.reply_text("❌ Только со спецдопуском или 7 ранг."); return
+    if not has_permission(user_id, 'poll_create', 'poll_create'):
+        await update.message.reply_text("❌ Нужен 6 ранг, спецдопуск или грант на poll_create."); return
     
     if len(context.args) < 2:
         await update.message.reply_text('❌ /poll_create Ник "Описание"'); return
@@ -9038,8 +9056,8 @@ async def apoll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     poll = get_poll_by_id(poll_id)
     if not poll: await update.message.reply_text("❌ Не найдено."); return
-    if poll['creator_id'] != user_id and not has_special_access(user_id):
-        await update.message.reply_text("❌ Только создатель или спецдопуск."); return
+    if poll['creator_id'] != user_id and not has_permission(user_id, 'poll_close', 'poll_close'):
+        await update.message.reply_text("❌ Только создатель, спецдопуск или грант на poll_close."); return
     
     closed = close_poll(poll_id)
     result = "✅ ПРИНЯТО" if closed['yes'] > closed['no'] else "❌ ОТКЛОНЕНО"
