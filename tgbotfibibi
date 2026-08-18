@@ -2075,6 +2075,7 @@ HELP_SECTIONS = [
         ("setdept",    "<user> <номер>",       "изменить отдел", 5),
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
         ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
+        ("tagall",     "<текст>",              "тегнуть всех активных", 5),
         ("department", "add|remove|rename|list|find", "управление отделами", 5),
         ("setalldept", "<номер>",              "перевести всех в отдел", 5),
         ("setallrank", "<0-7>",                "выставить всем ранг", "main"),
@@ -7597,6 +7598,85 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━\n"
         f"📁 Отдел: {dept_name}\n"
         f"👥 Участников: {len(members)}\n"
+        f"📤 Сообщение → {summary_chat}\n"
+        f"📨 В ЛС доставлено: {delivered}\n"
+        f"⛔ Не доставлено в ЛС: {failed}"
+    )
+
+
+async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Тегнуть вообще всех активных пользователей.
+
+    Технически — не стена из сотен упоминаний в одном сообщении (упёрлись бы
+    в лимиты Telegram: 4096 символов и ≤100 entity на сообщение), а как /broadcast:
+    одно чистое сообщение в чат + личное уведомление каждому в ЛС — гарантированный
+    пинг без флуда чата несколькими сообщениями подряд.
+
+    Использование: /tagall <текст>
+    """
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'tagall'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+
+    message_text = ' '.join(context.args or []).strip()
+    if not message_text:
+        await update.message.reply_text("❌ Использование: /tagall <текст>")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    members = [r[0] for r in c.fetchall()]
+    conn.close()
+
+    if not members:
+        await update.message.reply_text("❌ Некого тегать — нет активных пользователей.")
+        return
+
+    issuer_name = get_admin_nick(user_id)
+    safe_msg = _html_escape(message_text)
+
+    chat_text = (
+        f"📣 ОБРАЩЕНИЕ КО ВСЕМ ОТ <b>{_html_escape(issuer_name)}</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{safe_msg}"
+    )
+
+    out_chat = update.effective_chat.id
+    going_to_conf = False
+    if update.effective_chat.type == 'private':
+        out_chat = CONFERENCE_CHAT_ID
+        going_to_conf = True
+
+    try:
+        await context.bot.send_message(
+            chat_id=out_chat,
+            text=chat_text,
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"atagall send error: {e}")
+        await update.message.reply_text(f"❌ Не удалось отправить в чат: {e}")
+        return
+
+    await update.message.reply_text(f"📤 Рассылка в ЛС на {len(members)} чел...")
+
+    dm_text = (
+        "📣 Обращение ко всем\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👮 От: {issuer_name}\n"
+        f"💬 {message_text}"
+    )
+    delivered, failed = await _send_mention_dms(context, members, dm_text)
+
+    summary_chat = "конференция" if going_to_conf else "текущий чат"
+    await update.message.reply_text(
+        "✅ ТЕГ ВСЕХ ОТПРАВЛЕН\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👥 Активных пользователей: {len(members)}\n"
         f"📤 Сообщение → {summary_chat}\n"
         f"📨 В ЛС доставлено: {delivered}\n"
         f"⛔ Не доставлено в ЛС: {failed}"
@@ -13981,7 +14061,7 @@ def main():
         'dept_group_add': adept_group_add, 'dept_group_del': adept_group_del,
         'dept_group_assign': adept_group_assign, 'dept_apply_template': adept_apply_template,
         'poll_create': apoll_create, 'vote': avote, 'add': aadd, 'poll_info': apoll_info, 'poll_close': apoll_close, 'polls': apolls,
-        'tag': atag, 'tagdept': atagdept,
+        'tag': atag, 'tagdept': atagdept, 'tagall': atagall,
         'grant': agrant, 'revoke': arevoke, 'perms': aperms, 'grantlist': agrantlist, 'grantcmds': agrantcmds,
         'requests': arequests, 'request_info': arequest_info,
         'checkall': acheckall,
