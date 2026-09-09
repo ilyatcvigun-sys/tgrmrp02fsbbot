@@ -297,58 +297,82 @@ def list_command_grantees(command_name: str) -> list:
     return rows
 
 
-# ============ ПЕРЕОПРЕДЕЛЕНИЕ РАНГА ПО КОМАНДЕ (/cmdrank) ============
-# Дефолтный минимальный ранг для команды зашит в коде (permissions{} внутри
-# has_permission). Эти функции позволяют переопределить его точечно для
-# конкретной command_name, не трогая код. Работает только там, где хендлер
-# передаёт command_name в has_permission — см. комментарий у /cmdrank.
+# ============ ДОСТУП К КОМАНДЕ ПО КОНКРЕТНОМУ РАНГУ (/cmdrank) ============
+# Не единый "минимальный ранг", а точечный тумблер на пару (команда, ранг):
+# можно, например, оставить /ban доступным с 5 ранга по умолчанию, но явно
+# выключить его ИМЕННО для 5 ранга, не трогая 6 и 7 — они как были с доступом
+# (по дефолтному порогу из кода), так и остаются. Работает только там, где
+# хендлер передаёт command_name в has_permission — см. комментарий у /cmdrank.
+# Ранг 7 переопределениями не блокируется — см. has_permission (осознанно,
+# как и везде в проекте: 7 ранг проходит всегда).
 
-def get_command_rank_override(command_name: str):
-    """Переопределённый минимальный ранг для команды, или None если не задан."""
+def get_command_rank_access(command_name: str, rank: int):
+    """
+    Явный тумблер для пары (команда, ранг): True/False если задан, None если
+    для этого ранга ничего не переопределяли (действует дефолт из кода).
+    """
     if not command_name:
         return None
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        c.execute('SELECT min_rank FROM command_rank_overrides WHERE command = ?', (command_name,))
+        c.execute(
+            'SELECT allowed FROM command_rank_access WHERE command = ? AND rank = ?',
+            (command_name, rank),
+        )
         row = c.fetchone()
-        return row[0] if row else None
+        return bool(row[0]) if row else None
     except sqlite3.OperationalError:
         return None
     finally:
         conn.close()
 
 
-def set_command_rank_override(command_name: str, min_rank: int, set_by: int):
-    """Задаёт/обновляет переопределение. Delete+insert — не полагаемся на ON CONFLICT."""
+def set_command_rank_access(command_name: str, rank: int, allowed: bool, set_by: int):
+    """Задаёт/обновляет тумблер для (команда, ранг). Delete+insert — не полагаемся на ON CONFLICT."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('DELETE FROM command_rank_overrides WHERE command = ?', (command_name,))
+    c.execute('DELETE FROM command_rank_access WHERE command = ? AND rank = ?', (command_name, rank))
     c.execute(
-        'INSERT INTO command_rank_overrides (command, min_rank, set_by, set_at) VALUES (?, ?, ?, ?)',
-        (command_name, min_rank, set_by, now_msk_str()),
+        'INSERT INTO command_rank_access (command, rank, allowed, set_by, set_at) VALUES (?, ?, ?, ?, ?)',
+        (command_name, rank, 1 if allowed else 0, set_by, now_msk_str()),
     )
     conn.commit()
     conn.close()
 
 
-def clear_command_rank_override(command_name: str) -> bool:
-    """Убирает переопределение — команда возвращается на дефолтный порог из кода. True, если что-то удалили."""
+def clear_command_rank_access(command_name: str, rank: int = None) -> int:
+    """
+    Убирает тумблер(ы) — команда возвращается на дефолт из кода.
+    rank=None — сброс по ВСЕМ рангам этой команды разом. Возвращает число удалённых строк.
+    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('DELETE FROM command_rank_overrides WHERE command = ?', (command_name,))
-    deleted = c.rowcount > 0
+    if rank is None:
+        c.execute('DELETE FROM command_rank_access WHERE command = ?', (command_name,))
+    else:
+        c.execute('DELETE FROM command_rank_access WHERE command = ? AND rank = ?', (command_name, rank))
+    deleted = c.rowcount
     conn.commit()
     conn.close()
     return deleted
 
 
-def list_command_rank_overrides() -> list:
-    """Все текущие переопределения. Возвращает [(command, min_rank), ...] по алфавиту."""
+def list_command_rank_access(command_name: str = None) -> list:
+    """
+    Текущие тумблеры. command_name=None — вообще все, иначе только по одной команде.
+    Возвращает [(command, rank, allowed), ...] отсортированные по команде/рангу.
+    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        c.execute('SELECT command, min_rank FROM command_rank_overrides ORDER BY command')
+        if command_name:
+            c.execute(
+                'SELECT command, rank, allowed FROM command_rank_access WHERE command = ? ORDER BY rank',
+                (command_name,),
+            )
+        else:
+            c.execute('SELECT command, rank, allowed FROM command_rank_access ORDER BY command, rank')
         rows = c.fetchall()
     except sqlite3.OperationalError:
         rows = []
@@ -362,9 +386,9 @@ def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
       1) Главный админ — всегда да.
       2) Спецдопуск — всегда да.
       3) Явный грант на конкретную команду (если передан command_name) — да.
-      4) Ранг 7 — всегда да (даже если ниже переопределённого /cmdrank порога).
-      5) Переопределённый через /cmdrank порог ранга для command_name — если задан,
-         ПЕРЕКРЫВАЕТ дефолт по action из таблицы ниже.
+      4) Ранг 7 — всегда да (/cmdrank его не блокирует, как и везде в проекте).
+      5) Явный тумблер /cmdrank ИМЕННО для этого ранга и command_name — если
+         задан, решает вопрос сам (да/нет), дефолт по action ниже не смотрим.
       6) Иначе — дефолтный порог по action из таблицы ниже.
     """
     if is_main_admin(user_id):
@@ -380,9 +404,9 @@ def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
     if rank >= 7:
         return True
     if command_name:
-        override = get_command_rank_override(command_name)
+        override = get_command_rank_access(command_name, rank)
         if override is not None:
-            return rank >= override
+            return override
     permissions = {
         "search": rank >= 4,
         "award": rank >= 3,
@@ -850,16 +874,18 @@ def init_database():
     except sqlite3.OperationalError:
         pass
 
-    # Переопределение минимального ранга для конкретной команды — поверх
-    # дефолтного порога, зашитого в коде (см. has_permission / /cmdrank).
-    # Работает только для команд, которые проверяют права через
-    # has_permission(..., command_name=...) — см. комментарий у /cmdrank.
+    # Точечный тумблер доступа команды на конкретном ранге — поверх дефолтного
+    # порога, зашитого в коде (см. has_permission / /cmdrank). Работает только
+    # для команд, которые проверяют права через has_permission(...,
+    # command_name=...) — см. комментарий у /cmdrank.
     c.execute('''
-        CREATE TABLE IF NOT EXISTS command_rank_overrides (
-            command TEXT PRIMARY KEY,
-            min_rank INTEGER NOT NULL,
+        CREATE TABLE IF NOT EXISTS command_rank_access (
+            command TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            allowed INTEGER NOT NULL,
             set_by INTEGER,
-            set_at TEXT DEFAULT ''
+            set_at TEXT DEFAULT '',
+            PRIMARY KEY (command, rank)
         )
     ''')
 
@@ -2203,7 +2229,7 @@ HELP_SECTIONS = [
         ("revoke",     "<user> <cmd>|all",     "отозвать доступ", "spec"),
         ("grantlist",  "<cmd>",                "кому выдан доступ", "spec"),
         ("grantcmds",  "",                     "какие команды можно выдавать", "spec"),
-        ("cmdrank",    "<cmd> <0-7|reset>",    "переопределить минимальный ранг команды", "spec"),
+        ("cmdrank",    "<cmd> <0-7> on|off|reset", "разрешить/запретить команду на конкретном ранге", "spec"),
         ("permsmenu",  "",                     "меню настройки доступов кнопками", "main"),
         ("backup",     "",                     "выгрузка списка пользователей", "main"),
         ("add",        "",                     "служебная команда", "main"),
@@ -4761,8 +4787,9 @@ _ACTION_LABELS = {
     'auto_disconnect_kick':   ('🚫', 'Авто-отключение при кике'),
     'grant':                  ('🔑', 'Выдан индивидуальный доступ'),
     'revoke':                 ('🗑', 'Отозван индивидуальный доступ'),
-    'cmdrank_set':            ('🎚', 'Переопределён ранг команды'),
-    'cmdrank_reset':          ('🎚', 'Сброшен ранг команды к дефолту'),
+    'cmdrank_set':            ('🎚', 'Задан тумблер доступа команды на ранге'),
+    'cmdrank_reset':          ('🎚', 'Убран тумблер доступа команды на ранге'),
+    'cmdrank_reset_all':      ('🎚', 'Убраны все тумблеры доступа команды'),
     'request_approved':       ('✅', 'Одобрена заявка'),
     'request_rejected':       ('❌', 'Отклонена заявка'),
     'award':                  ('🏅', 'Награда'),
@@ -8145,10 +8172,24 @@ async def agrantcmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+def _cmdrank_check_command(cmd: str):
+    """Общая валидация имени команды для /cmdrank. Возвращает текст ошибки или None."""
+    if cmd not in ALL_COMMAND_NAMES:
+        return f"❌ Команда /{cmd} не найдена среди зарегистрированных."
+    if cmd in NON_GRANTABLE_COMMANDS:
+        return (
+            f"❌ /{cmd} — команда уровня «разработчик», доступ по рангам для неё нельзя "
+            "переопределить (та же защита от эскалации прав, что и у /grant)."
+        )
+    return None
+
+
 async def acmdrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Переопределить минимальный ранг для конкретной команды — поверх дефолтного
-    порога, зашитого в коде.
+    Точечно разрешить или запретить конкретную команду НА КОНКРЕТНОМ ранге —
+    не сдвигая общий порог для остальных рангов. Например: /ban по коду
+    доступен с 5 ранга; /cmdrank ban 5 off уберёт доступ именно у 5 ранга,
+    6 и 7 при этом как имели доступ (по дефолту из кода), так и имеют.
 
     ВАЖНО: работает только для команд, которые проверяют права через
     has_permission(..., command_name=...) — список тот же, что и у /grantcmds
@@ -8156,12 +8197,15 @@ async def acmdrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (управление админами, бэкап, спецдопуск и т.п.) переопределение запрещено
     намеренно — как и грант на них, см. NON_GRANTABLE_COMMANDS. Часть старых
     хендлеров вообще не передаёт command_name в has_permission — там порог
-    всё ещё зашит в коде, /cmdrank на них не подействует.
+    всё ещё зашит в коде, /cmdrank на них не подействует. Ранг 7 не блокируется
+    никогда — как и везде в проекте, это верхний бесспорный уровень.
 
     Использование:
-      /cmdrank                    — список текущих переопределений
-      /cmdrank <command> <0-7>    — задать минимальный ранг
-      /cmdrank <command> reset    — вернуть дефолтный порог из кода
+      /cmdrank                          — список всех тумблеров по всем командам
+      /cmdrank <command>                — тумблеры только для этой команды
+      /cmdrank <command> <0-7> on|off   — разрешить/запретить команду на этом ранге
+      /cmdrank <command> <0-7> reset    — убрать тумблер для этого ранга (вернуть дефолт)
+      /cmdrank <command> reset          — убрать ВСЕ тумблеры команды (все ранги на дефолт)
     """
     user_id = update.effective_user.id
     if not _can_manage_grants(user_id):
@@ -8170,19 +8214,26 @@ async def acmdrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = list(context.args or [])
 
+    # /cmdrank — весь список, по всем командам
     if not args:
-        overrides = list_command_rank_overrides()
-        lines = ["🎚 ПЕРЕОПРЕДЕЛЕНИЯ РАНГА ПО КОМАНДАМ", "━━━━━━━━━━━━━━━━━"]
-        if overrides:
-            for cmd, min_rank in overrides:
-                rank_name = RANKS.get(min_rank, {}).get('name', str(min_rank))
-                lines.append(f"• /{cmd} → {rank_name} ({min_rank})")
+        rows = list_command_rank_access()
+        lines = ["🎚 ТУМБЛЕРЫ ДОСТУПА ПО РАНГАМ", "━━━━━━━━━━━━━━━━━"]
+        if rows:
+            last_cmd = None
+            for cmd, rank, allowed in rows:
+                if cmd != last_cmd:
+                    lines.append(f"/{cmd}:")
+                    last_cmd = cmd
+                rank_name = RANKS.get(rank, {}).get('name', str(rank))
+                mark = "✅ включено" if allowed else "❌ выключено"
+                lines.append(f"  {rank} {rank_name} — {mark}")
         else:
             lines.append("Пока ничего не переопределено — все команды на дефолтных порогах из кода.")
         lines.append("━━━━━━━━━━━━━━━━━")
-        lines.append("/cmdrank <command> <0-7> — задать порог")
-        lines.append("/cmdrank <command> reset — вернуть дефолт")
-        lines.append("Список подходящих команд — /grantcmds")
+        lines.append("/cmdrank <command> — тумблеры одной команды")
+        lines.append("/cmdrank <command> <ранг> on|off — задать")
+        lines.append("/cmdrank <command> <ранг> reset — убрать один тумблер")
+        lines.append("/cmdrank <command> reset — убрать все тумблеры команды")
         text = "\n".join(lines)
         if len(text) > 4000:
             text = text[:3997] + "..."
@@ -8190,46 +8241,87 @@ async def acmdrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cmd = args[0].lstrip('/').strip()
-    if cmd not in ALL_COMMAND_NAMES:
-        await update.message.reply_text(f"❌ Команда /{cmd} не найдена среди зарегистрированных.")
+    err = _cmdrank_check_command(cmd)
+    if err:
+        await update.message.reply_text(err)
         return
-    if cmd in NON_GRANTABLE_COMMANDS:
+
+    # /cmdrank <command> — тумблеры только этой команды
+    if len(args) == 1:
+        rows = list_command_rank_access(cmd)
+        lines = [f"🎚 ТУМБЛЕРЫ: /{cmd}", "━━━━━━━━━━━━━━━━━"]
+        if rows:
+            for _cmd, rank, allowed in rows:
+                rank_name = RANKS.get(rank, {}).get('name', str(rank))
+                mark = "✅ включено" if allowed else "❌ выключено"
+                lines.append(f"{rank} {rank_name} — {mark}")
+        else:
+            lines.append("Тумблеров нет — вся команда на дефолтном пороге из кода.")
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("Ранги без тумблера — на дефолтном пороге из кода.")
+        lines.append(f"/cmdrank {cmd} <ранг> on|off — задать")
+        lines.append(f"/cmdrank {cmd} <ранг> reset — убрать один тумблер")
+        lines.append(f"/cmdrank {cmd} reset — убрать все тумблеры команды")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # /cmdrank <command> reset — сброс ВСЕХ рангов этой команды разом
+    if len(args) == 2 and args[1].lower() == 'reset':
+        removed = clear_command_rank_access(cmd)
+        log_action(user_id, 'cmdrank_reset_all', None, f"/{cmd}")
         await update.message.reply_text(
-            f"❌ /{cmd} — команда уровня «разработчик», её порог нельзя переопределить "
-            "(та же защита от эскалации прав, что и у /grant)."
+            f"✅ /{cmd} — все тумблеры убраны ({removed}), вся команда на дефолтном пороге из кода."
+            if removed else f"ℹ️ /{cmd} — тумблеров и не было."
         )
         return
 
-    if len(args) < 2:
-        await update.message.reply_text("❌ Использование: /cmdrank <command> <0-7|reset>")
-        return
-
-    value = args[1].lower()
-    if value == 'reset':
-        removed = clear_command_rank_override(cmd)
-        log_action(user_id, 'cmdrank_reset', None, f"/{cmd}")
-        await update.message.reply_text(
-            f"✅ /{cmd} — порог возвращён к дефолтному из кода." if removed
-            else f"ℹ️ /{cmd} — переопределения и не было."
-        )
-        return
-
+    # /cmdrank <command> <ранг> on|off|reset
     try:
-        min_rank = int(value)
+        rank = int(args[1])
     except ValueError:
-        await update.message.reply_text("❌ Ранг должен быть числом 0-7, или 'reset'.")
+        await update.message.reply_text(
+            "❌ Использование:\n"
+            f"/cmdrank {cmd} <0-7> on|off — задать тумблер\n"
+            f"/cmdrank {cmd} <0-7> reset — убрать тумблер\n"
+            f"/cmdrank {cmd} reset — убрать все тумблеры команды"
+        )
         return
-    if min_rank not in RANKS:
+    if rank not in RANKS:
         await update.message.reply_text("❌ Ранг должен быть от 0 до 7.")
         return
 
-    set_command_rank_override(cmd, min_rank, user_id)
-    rank_name = RANKS[min_rank]['name']
-    log_action(user_id, 'cmdrank_set', None, f"/{cmd} → {min_rank} ({rank_name})")
+    if len(args) < 3:
+        await update.message.reply_text(f"❌ Использование: /cmdrank {cmd} {rank} on|off|reset")
+        return
+
+    value = args[2].lower()
+    rank_name = RANKS[rank]['name']
+
+    if value == 'reset':
+        removed = clear_command_rank_access(cmd, rank)
+        log_action(user_id, 'cmdrank_reset', None, f"/{cmd} ранг {rank}")
+        await update.message.reply_text(
+            f"✅ /{cmd}, {rank_name} ({rank}) — тумблер убран, дефолт из кода." if removed
+            else f"ℹ️ /{cmd}, {rank_name} ({rank}) — тумблера и не было."
+        )
+        return
+
+    if value in ('on', 'вкл', 'включить', 'да', 'allow', 'yes', '1'):
+        allowed = True
+    elif value in ('off', 'выкл', 'выключить', 'нет', 'deny', 'no', '0'):
+        allowed = False
+    else:
+        await update.message.reply_text(f"❌ Использование: /cmdrank {cmd} {rank} on|off|reset")
+        return
+
+    set_command_rank_access(cmd, rank, allowed, user_id)
+    log_action(user_id, 'cmdrank_set', None, f"/{cmd} ранг {rank} → {'on' if allowed else 'off'}")
+    emoji, verb = ("✅", "разрешена") if allowed else ("❌", "запрещена")
     await update.message.reply_text(
-        f"✅ /{cmd} теперь доступна с ранга: {rank_name} ({min_rank})\n"
-        "ℹ️ Главный админ, спецдопуск и ранг 7 по-прежнему проходят всегда, "
-        "независимо от этого порога."
+        f"{emoji} /{cmd} теперь {verb} на ранге: {rank_name} ({rank})\n"
+        "ℹ️ Остальные ранги не затронуты — у них действует дефолт из кода "
+        "(или свой отдельный тумблер, если задан). Главный админ, спецдопуск "
+        "и ранг 7 по-прежнему проходят всегда."
     )
 
 # ============ ЖАЛОБЫ ============
