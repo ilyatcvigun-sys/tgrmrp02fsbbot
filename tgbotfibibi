@@ -6135,6 +6135,22 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📢 Ваш отдел изменён!\n📁 Новый отдел: {new_dept}\n👮 Изменил: {issuer_name}",
     )
 
+async def _is_conference_tg_admin(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """
+    Реальный статус в самой конференции (не наш ранг/rank в БД) — 'administrator'
+    или 'creator'. Нужно перед restrict_chat_member: у Telegram ограничения
+    (ChatPermissions) на админов не распространяются, а попытка их применить
+    молча снимает у пользователя админку — именно так съедало права, выданные
+    через /tgadmin, при /mute и особенно при /unmute.
+    """
+    try:
+        member = await context.bot.get_chat_member(chat_id=CONFERENCE_CHAT_ID, user_id=user_id)
+        return member.status in ('administrator', 'creator')
+    except Exception as e:
+        logger.debug(f"_is_conference_tg_admin check failed for {user_id}: {e}")
+        return False
+
+
 async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Мут в конференции: запрещает отправлять сообщения на указанный срок.
@@ -6175,7 +6191,14 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_main_admin(target_id):
         await update.message.reply_text("❌ Главного админа мутить нельзя.")
         return
-    
+    if await _is_conference_tg_admin(context, target_id):
+        await update.message.reply_text(
+            "❌ Пользователь — администратор конференции (в т.ч. через /tgadmin).\n"
+            "Ограничения (ChatPermissions) на админов не действуют, а попытка их наложить "
+            "снимет с него админку. Сначала /tgunadmin, если это правда нужно."
+        )
+        return
+
     # Длительность и причина
     duration = None
     if args:
@@ -6290,7 +6313,20 @@ async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_id in (None, -1):
         await update.message.reply_text("❌ Использование: /unmute @user (или reply).")
         return
-    
+
+    # Администраторов (в т.ч. назначенных через /tgadmin) restrict_chat_member вообще
+    # не трогаем: мут на них и так не действует (ограничения на админов не распространяются),
+    # а сам вызов restrict_chat_member на админе снимает с него админку — этим и съедало
+    # права, выданные через /tgadmin, при каждом /unmute.
+    if await _is_conference_tg_admin(context, target_id):
+        td = get_user_data(target_id)
+        target_nick = td['nick'] if td else f"id {target_id}"
+        await update.message.reply_text(
+            f"ℹ️ {target_nick} — администратор конференции, мут на него не действует.\n"
+            "Права не трогаю (чтобы не снять админку через /tgadmin)."
+        )
+        return
+
     # Восстанавливаем стандартные права участника чата
     try:
         await context.bot.restrict_chat_member(
@@ -6986,8 +7022,12 @@ async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   • снять права бот может только с тех, кого назначал сам.
 
 # Права TG-администратора, которые можно выдавать точечно через меню /tgadmin.
-# can_promote_members сознательно не выдаём и не показываем в меню —
-# иначе назначенный сможет раздавать права дальше (см. CLAUDE.md).
+# can_promote_members — это и есть право менять "тег" (custom title) ДРУГИХ
+# администраторов, но не только: это же право позволяет назначать/снимать
+# других админов — то есть раздавать права дальше. Раньше его вообще не
+# показывали в меню; теперь показываем как явный пункт с предупреждением в
+# названии, но по умолчанию он ВЫКЛЮЧЕН (см. _TG_ADMIN_PERMS_DEFAULT_ON) —
+# включать осознанно, отдельным нажатием.
 TG_ADMIN_PERMS = [
     ('can_delete_messages',   'Удаление сообщений'),
     ('can_restrict_members',  'Ограничение участников'),
@@ -6997,9 +7037,19 @@ TG_ADMIN_PERMS = [
     ('can_manage_chat',       'Управление чатом'),
     ('can_manage_video_chats', 'Управление видеочатами'),
     ('can_change_info',       'Изменение инфо чата'),
+    ('can_promote_members',   '⚠️ Тег участников (= назначение/снятие админов!)'),
 ]
-# Дефолт повторяет прежний жёсткий набор прав (всё, кроме can_change_info).
-TG_ADMIN_PERMS_DEFAULT_MASK = (1 << (len(TG_ADMIN_PERMS) - 1)) - 1
+# Дефолт — прежний жёсткий набор прав (всё, кроме can_change_info и can_promote_members).
+# Перечисляем явно, а не "всё кроме последнего в списке" — иначе при добавлении
+# нового пункта в конец случайно включится/выключится не то.
+_TG_ADMIN_PERMS_DEFAULT_ON = {
+    'can_delete_messages', 'can_restrict_members', 'can_invite_users',
+    'can_pin_messages', 'can_manage_topics', 'can_manage_chat', 'can_manage_video_chats',
+}
+TG_ADMIN_PERMS_DEFAULT_MASK = sum(
+    (1 << idx) for idx, (key, _label) in enumerate(TG_ADMIN_PERMS)
+    if key in _TG_ADMIN_PERMS_DEFAULT_ON
+)
 
 
 def _tgadmin_kb(target_id: int, mask: int, title: str) -> InlineKeyboardMarkup:
@@ -7028,7 +7078,9 @@ def _tgadmin_text(target_id: int, title: str) -> str:
         f"👤 {name}{title_line}\n"
         "━━━━━━━━━━━━━━━━━\n"
         "Выберите права и нажмите «Применить».\n"
-        "✅ — выдаётся  ⬜ — не выдаётся"
+        "✅ — выдаётся  ⬜ — не выдаётся\n"
+        "⚠️ «Тег участников» — это ещё и право назначать/снимать других "
+        "админов и менять их должность. Включайте осознанно."
     )
 
 
@@ -7125,12 +7177,14 @@ async def atgadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         title = parts[4] if len(parts) > 4 else ""
 
+        # can_promote_members теперь тоже приходит из perms (это и есть пункт
+        # "Тег участников" в меню) — отдельным kwarg его больше не передаём,
+        # иначе promote_chat_member получит его дважды.
         perms = {key: bool(mask & (1 << idx)) for idx, (key, _label) in enumerate(TG_ADMIN_PERMS)}
         try:
             await context.bot.promote_chat_member(
                 chat_id=CONFERENCE_CHAT_ID,
                 user_id=target_id,
-                can_promote_members=False,
                 **perms,
             )
         except Exception as e:
