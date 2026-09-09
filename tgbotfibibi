@@ -2714,31 +2714,43 @@ async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список участников (5+)"""
+    """Список участников (5+). Не помещается в одно сообщение — шлёт несколько подряд."""
     if not has_permission(update.effective_user.id, 'manage_ranks', 'userlist'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
-    
+
     users = get_all_users_list()
     if not users:
         await update.message.reply_text("📋 Список пуст.")
         return
-    
-    text = f"📋 СПИСОК УЧАСТНИКОВ ({len(users)})\n━━━━━━━━━━━━━━━━━\n"
-    for u in users[:50]:
-        text += (
-            f"🎮 {u[1]} | 📻 {u[2]}\n"
-            f"🎫 {u[3]} | ⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
-            f"🆔 {u[0]} | 📁 {u[5]}\n"
-            "─────────────────\n"
-        )
-    if len(users) > 50:
-        text += f"\n…и ещё {len(users) - 50}."
-    # На 40-50 участниках текст легко перелезает лимит Telegram в 4096 символов —
-    # send_message падал с BadRequest, и команда выглядела как «не отвечает».
-    if len(text) > 4000:
-        text = text[:3997] + "..."
-    await update.message.reply_text(text)
+
+    header = f"📋 СПИСОК УЧАСТНИКОВ ({len(users)})\n━━━━━━━━━━━━━━━━━\n"
+    blocks = [
+        f"🎮 {u[1]} | 📻 {u[2]}\n"
+        f"🎫 {u[3]} | ⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
+        f"🆔 {u[0]} | 📁 {u[5]}\n"
+        "─────────────────\n"
+        for u in users
+    ]
+
+    # Лимит Telegram — 4096 символов на сообщение. Раньше список резался на
+    # первых 50 и обрезался «...» — часть участников была просто не видна.
+    # Теперь режем на чанки и шлём подряд отдельными сообщениями, ничего не теряя.
+    chunks = []
+    current = header
+    for block in blocks:
+        if len(current) + len(block) > 3900:
+            chunks.append(current)
+            current = ""
+        current += block
+    if current:
+        chunks.append(current)
+
+    for i, chunk in enumerate(chunks, 1):
+        if len(chunks) > 1:
+            chunk += f"\n📄 {i}/{len(chunks)}"
+        await update.message.reply_text(chunk)
+        await asyncio.sleep(0.05)
 
 async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по жетону"""
