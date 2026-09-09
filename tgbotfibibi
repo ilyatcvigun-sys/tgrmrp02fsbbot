@@ -186,7 +186,7 @@ def get_admin_nick(user_id: int) -> str:
 # регистрируются хендлеры, так что список команд не дублируется и не рассинхронится),
 # КРОМЕ команд уровня "разработчик" — это осознанное ограничение, защита от
 # эскалации прав, не убирай их отсюда без явного запроса владельца:
-#   - grant/revoke        — иначе гранты можно раздавать/отзывать по цепочке
+#   - grant/revoke/cmdrank — иначе гранты/пороги рангов можно раздавать/менять по цепочке
 #   - setadmin/unsetadmin — управление главными админами
 #   - backup              — полный дамп БД
 #   - delete_user/reset_user — необратимое удаление/сброс пользователя
@@ -195,7 +195,7 @@ def get_admin_nick(user_id: int) -> str:
 #   - setallrank          — массовая смена ранга всем разом
 #   - tgadmin/tgunadmin   — реальные права администратора в Telegram-чате
 NON_GRANTABLE_COMMANDS = {
-    'grant', 'revoke',
+    'grant', 'revoke', 'cmdrank',
     'setadmin', 'unsetadmin',
     'backup',
     'delete_user', 'reset_user',
@@ -297,14 +297,75 @@ def list_command_grantees(command_name: str) -> list:
     return rows
 
 
+# ============ ПЕРЕОПРЕДЕЛЕНИЕ РАНГА ПО КОМАНДЕ (/cmdrank) ============
+# Дефолтный минимальный ранг для команды зашит в коде (permissions{} внутри
+# has_permission). Эти функции позволяют переопределить его точечно для
+# конкретной command_name, не трогая код. Работает только там, где хендлер
+# передаёт command_name в has_permission — см. комментарий у /cmdrank.
+
+def get_command_rank_override(command_name: str):
+    """Переопределённый минимальный ранг для команды, или None если не задан."""
+    if not command_name:
+        return None
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute('SELECT min_rank FROM command_rank_overrides WHERE command = ?', (command_name,))
+        row = c.fetchone()
+        return row[0] if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+
+def set_command_rank_override(command_name: str, min_rank: int, set_by: int):
+    """Задаёт/обновляет переопределение. Delete+insert — не полагаемся на ON CONFLICT."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM command_rank_overrides WHERE command = ?', (command_name,))
+    c.execute(
+        'INSERT INTO command_rank_overrides (command, min_rank, set_by, set_at) VALUES (?, ?, ?, ?)',
+        (command_name, min_rank, set_by, now_msk_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_command_rank_override(command_name: str) -> bool:
+    """Убирает переопределение — команда возвращается на дефолтный порог из кода. True, если что-то удалили."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM command_rank_overrides WHERE command = ?', (command_name,))
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def list_command_rank_overrides() -> list:
+    """Все текущие переопределения. Возвращает [(command, min_rank), ...] по алфавиту."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute('SELECT command, min_rank FROM command_rank_overrides ORDER BY command')
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return rows
+
+
 def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
     """
     Проверка доступа. Порядок:
       1) Главный админ — всегда да.
       2) Спецдопуск — всегда да.
       3) Явный грант на конкретную команду (если передан command_name) — да.
-      4) Ранг 7 — всегда да.
-      5) Иначе — проверка action по таблице прав.
+      4) Ранг 7 — всегда да (даже если ниже переопределённого /cmdrank порога).
+      5) Переопределённый через /cmdrank порог ранга для command_name — если задан,
+         ПЕРЕКРЫВАЕТ дефолт по action из таблицы ниже.
+      6) Иначе — дефолтный порог по action из таблицы ниже.
     """
     if is_main_admin(user_id):
         return True
@@ -318,6 +379,10 @@ def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
     rank = ud['rank']
     if rank >= 7:
         return True
+    if command_name:
+        override = get_command_rank_override(command_name)
+        if override is not None:
+            return rank >= override
     permissions = {
         "search": rank >= 4,
         "award": rank >= 3,
@@ -326,6 +391,7 @@ def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
         "ban": rank >= 5,
         "kick": rank >= 5,
         "poll_create": rank >= 6,
+        "register": rank >= 6,
     }
     return permissions.get(action, False)
 
@@ -783,6 +849,19 @@ def init_database():
         c.execute('CREATE INDEX IF NOT EXISTS idx_grants_command ON command_grants(command)')
     except sqlite3.OperationalError:
         pass
+
+    # Переопределение минимального ранга для конкретной команды — поверх
+    # дефолтного порога, зашитого в коде (см. has_permission / /cmdrank).
+    # Работает только для команд, которые проверяют права через
+    # has_permission(..., command_name=...) — см. комментарий у /cmdrank.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS command_rank_overrides (
+            command TEXT PRIMARY KEY,
+            min_rank INTEGER NOT NULL,
+            set_by INTEGER,
+            set_at TEXT DEFAULT ''
+        )
+    ''')
 
     # Заявки на смену ранга/отдела от пользователей (через еженедельную проверку или иначе).
     c.execute('''
@@ -2124,6 +2203,7 @@ HELP_SECTIONS = [
         ("revoke",     "<user> <cmd>|all",     "отозвать доступ", "spec"),
         ("grantlist",  "<cmd>",                "кому выдан доступ", "spec"),
         ("grantcmds",  "",                     "какие команды можно выдавать", "spec"),
+        ("cmdrank",    "<cmd> <0-7|reset>",    "переопределить минимальный ранг команды", "spec"),
         ("permsmenu",  "",                     "меню настройки доступов кнопками", "main"),
         ("backup",     "",                     "выгрузка списка пользователей", "main"),
         ("add",        "",                     "служебная команда", "main"),
@@ -2654,6 +2734,10 @@ async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     if len(users) > 50:
         text += f"\n…и ещё {len(users) - 50}."
+    # На 40-50 участниках текст легко перелезает лимит Telegram в 4096 символов —
+    # send_message падал с BadRequest, и команда выглядела как «не отвечает».
+    if len(text) > 4000:
+        text = text[:3997] + "..."
     await update.message.reply_text(text)
 
 async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4665,6 +4749,8 @@ _ACTION_LABELS = {
     'auto_disconnect_kick':   ('🚫', 'Авто-отключение при кике'),
     'grant':                  ('🔑', 'Выдан индивидуальный доступ'),
     'revoke':                 ('🗑', 'Отозван индивидуальный доступ'),
+    'cmdrank_set':            ('🎚', 'Переопределён ранг команды'),
+    'cmdrank_reset':          ('🎚', 'Сброшен ранг команды к дефолту'),
     'request_approved':       ('✅', 'Одобрена заявка'),
     'request_rejected':       ('❌', 'Отклонена заявка'),
     'award':                  ('🏅', 'Награда'),
@@ -4972,7 +5058,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
       reply на сообщение + /register Ник Позывной
     """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'register'):
+    if not has_permission(user_id, 'register', 'register'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -5038,7 +5124,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Принудительная регистрация с жетоном (6+ ранг)"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'forcereg'):
+    if not has_permission(user_id, 'register', 'forcereg'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -5252,7 +5338,7 @@ async def areport_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def aspeciallist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список со спецдопуском"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'speciallist'):
+    if not has_permission(user_id, 'register', 'speciallist'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -5862,7 +5948,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача жетона"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'gban', 'settoken'):
+    if not has_permission(user_id, 'register', 'settoken'):
         await update.message.reply_text("❌ Только генералы.")
         return
     
@@ -6049,6 +6135,22 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📢 Ваш отдел изменён!\n📁 Новый отдел: {new_dept}\n👮 Изменил: {issuer_name}",
     )
 
+async def _is_conference_tg_admin(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """
+    Реальный статус в самой конференции (не наш ранг/rank в БД) — 'administrator'
+    или 'creator'. Нужно перед restrict_chat_member: у Telegram ограничения
+    (ChatPermissions) на админов не распространяются, а попытка их применить
+    молча снимает у пользователя админку — именно так съедало права, выданные
+    через /tgadmin, при /mute и особенно при /unmute.
+    """
+    try:
+        member = await context.bot.get_chat_member(chat_id=CONFERENCE_CHAT_ID, user_id=user_id)
+        return member.status in ('administrator', 'creator')
+    except Exception as e:
+        logger.debug(f"_is_conference_tg_admin check failed for {user_id}: {e}")
+        return False
+
+
 async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Мут в конференции: запрещает отправлять сообщения на указанный срок.
@@ -6089,7 +6191,14 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_main_admin(target_id):
         await update.message.reply_text("❌ Главного админа мутить нельзя.")
         return
-    
+    if await _is_conference_tg_admin(context, target_id):
+        await update.message.reply_text(
+            "❌ Пользователь — администратор конференции (в т.ч. через /tgadmin).\n"
+            "Ограничения (ChatPermissions) на админов не действуют, а попытка их наложить "
+            "снимет с него админку. Сначала /tgunadmin, если это правда нужно."
+        )
+        return
+
     # Длительность и причина
     duration = None
     if args:
@@ -6204,7 +6313,20 @@ async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_id in (None, -1):
         await update.message.reply_text("❌ Использование: /unmute @user (или reply).")
         return
-    
+
+    # Администраторов (в т.ч. назначенных через /tgadmin) restrict_chat_member вообще
+    # не трогаем: мут на них и так не действует (ограничения на админов не распространяются),
+    # а сам вызов restrict_chat_member на админе снимает с него админку — этим и съедало
+    # права, выданные через /tgadmin, при каждом /unmute.
+    if await _is_conference_tg_admin(context, target_id):
+        td = get_user_data(target_id)
+        target_nick = td['nick'] if td else f"id {target_id}"
+        await update.message.reply_text(
+            f"ℹ️ {target_nick} — администратор конференции, мут на него не действует.\n"
+            "Права не трогаю (чтобы не снять админку через /tgadmin)."
+        )
+        return
+
     # Восстанавливаем стандартные права участника чата
     try:
         await context.bot.restrict_chat_member(
@@ -6900,8 +7022,12 @@ async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   • снять права бот может только с тех, кого назначал сам.
 
 # Права TG-администратора, которые можно выдавать точечно через меню /tgadmin.
-# can_promote_members сознательно не выдаём и не показываем в меню —
-# иначе назначенный сможет раздавать права дальше (см. CLAUDE.md).
+# can_promote_members — это и есть право менять "тег" (custom title) ДРУГИХ
+# администраторов, но не только: это же право позволяет назначать/снимать
+# других админов — то есть раздавать права дальше. Раньше его вообще не
+# показывали в меню; теперь показываем как явный пункт с предупреждением в
+# названии, но по умолчанию он ВЫКЛЮЧЕН (см. _TG_ADMIN_PERMS_DEFAULT_ON) —
+# включать осознанно, отдельным нажатием.
 TG_ADMIN_PERMS = [
     ('can_delete_messages',   'Удаление сообщений'),
     ('can_restrict_members',  'Ограничение участников'),
@@ -6911,9 +7037,19 @@ TG_ADMIN_PERMS = [
     ('can_manage_chat',       'Управление чатом'),
     ('can_manage_video_chats', 'Управление видеочатами'),
     ('can_change_info',       'Изменение инфо чата'),
+    ('can_promote_members',   '⚠️ Тег участников (= назначение/снятие админов!)'),
 ]
-# Дефолт повторяет прежний жёсткий набор прав (всё, кроме can_change_info).
-TG_ADMIN_PERMS_DEFAULT_MASK = (1 << (len(TG_ADMIN_PERMS) - 1)) - 1
+# Дефолт — прежний жёсткий набор прав (всё, кроме can_change_info и can_promote_members).
+# Перечисляем явно, а не "всё кроме последнего в списке" — иначе при добавлении
+# нового пункта в конец случайно включится/выключится не то.
+_TG_ADMIN_PERMS_DEFAULT_ON = {
+    'can_delete_messages', 'can_restrict_members', 'can_invite_users',
+    'can_pin_messages', 'can_manage_topics', 'can_manage_chat', 'can_manage_video_chats',
+}
+TG_ADMIN_PERMS_DEFAULT_MASK = sum(
+    (1 << idx) for idx, (key, _label) in enumerate(TG_ADMIN_PERMS)
+    if key in _TG_ADMIN_PERMS_DEFAULT_ON
+)
 
 
 def _tgadmin_kb(target_id: int, mask: int, title: str) -> InlineKeyboardMarkup:
@@ -6942,7 +7078,9 @@ def _tgadmin_text(target_id: int, title: str) -> str:
         f"👤 {name}{title_line}\n"
         "━━━━━━━━━━━━━━━━━\n"
         "Выберите права и нажмите «Применить».\n"
-        "✅ — выдаётся  ⬜ — не выдаётся"
+        "✅ — выдаётся  ⬜ — не выдаётся\n"
+        "⚠️ «Тег участников» — это ещё и право назначать/снимать других "
+        "админов и менять их должность. Включайте осознанно."
     )
 
 
@@ -7039,12 +7177,14 @@ async def atgadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         title = parts[4] if len(parts) > 4 else ""
 
+        # can_promote_members теперь тоже приходит из perms (это и есть пункт
+        # "Тег участников" в меню) — отдельным kwarg его больше не передаём,
+        # иначе promote_chat_member получит его дважды.
         perms = {key: bool(mask & (1 << idx)) for idx, (key, _label) in enumerate(TG_ADMIN_PERMS)}
         try:
             await context.bot.promote_chat_member(
                 chat_id=CONFERENCE_CHAT_ID,
                 user_id=target_id,
-                can_promote_members=False,
                 **perms,
             )
         except Exception as e:
@@ -7991,6 +8131,94 @@ async def agrantcmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(text) > 4000:
         text = text[:3997] + "..."
     await update.message.reply_text(text)
+
+
+async def acmdrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Переопределить минимальный ранг для конкретной команды — поверх дефолтного
+    порога, зашитого в коде.
+
+    ВАЖНО: работает только для команд, которые проверяют права через
+    has_permission(..., command_name=...) — список тот же, что и у /grantcmds
+    (см. grantable_commands()). Для «разработчицких» команд из deny-листа
+    (управление админами, бэкап, спецдопуск и т.п.) переопределение запрещено
+    намеренно — как и грант на них, см. NON_GRANTABLE_COMMANDS. Часть старых
+    хендлеров вообще не передаёт command_name в has_permission — там порог
+    всё ещё зашит в коде, /cmdrank на них не подействует.
+
+    Использование:
+      /cmdrank                    — список текущих переопределений
+      /cmdrank <command> <0-7>    — задать минимальный ранг
+      /cmdrank <command> reset    — вернуть дефолтный порог из кода
+    """
+    user_id = update.effective_user.id
+    if not _can_manage_grants(user_id):
+        await update.message.reply_text("❌ Доступно только главному админу или со спецдопуском.")
+        return
+
+    args = list(context.args or [])
+
+    if not args:
+        overrides = list_command_rank_overrides()
+        lines = ["🎚 ПЕРЕОПРЕДЕЛЕНИЯ РАНГА ПО КОМАНДАМ", "━━━━━━━━━━━━━━━━━"]
+        if overrides:
+            for cmd, min_rank in overrides:
+                rank_name = RANKS.get(min_rank, {}).get('name', str(min_rank))
+                lines.append(f"• /{cmd} → {rank_name} ({min_rank})")
+        else:
+            lines.append("Пока ничего не переопределено — все команды на дефолтных порогах из кода.")
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("/cmdrank <command> <0-7> — задать порог")
+        lines.append("/cmdrank <command> reset — вернуть дефолт")
+        lines.append("Список подходящих команд — /grantcmds")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+        await update.message.reply_text(text)
+        return
+
+    cmd = args[0].lstrip('/').strip()
+    if cmd not in ALL_COMMAND_NAMES:
+        await update.message.reply_text(f"❌ Команда /{cmd} не найдена среди зарегистрированных.")
+        return
+    if cmd in NON_GRANTABLE_COMMANDS:
+        await update.message.reply_text(
+            f"❌ /{cmd} — команда уровня «разработчик», её порог нельзя переопределить "
+            "(та же защита от эскалации прав, что и у /grant)."
+        )
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text("❌ Использование: /cmdrank <command> <0-7|reset>")
+        return
+
+    value = args[1].lower()
+    if value == 'reset':
+        removed = clear_command_rank_override(cmd)
+        log_action(user_id, 'cmdrank_reset', None, f"/{cmd}")
+        await update.message.reply_text(
+            f"✅ /{cmd} — порог возвращён к дефолтному из кода." if removed
+            else f"ℹ️ /{cmd} — переопределения и не было."
+        )
+        return
+
+    try:
+        min_rank = int(value)
+    except ValueError:
+        await update.message.reply_text("❌ Ранг должен быть числом 0-7, или 'reset'.")
+        return
+    if min_rank not in RANKS:
+        await update.message.reply_text("❌ Ранг должен быть от 0 до 7.")
+        return
+
+    set_command_rank_override(cmd, min_rank, user_id)
+    rank_name = RANKS[min_rank]['name']
+    log_action(user_id, 'cmdrank_set', None, f"/{cmd} → {min_rank} ({rank_name})")
+    await update.message.reply_text(
+        f"✅ /{cmd} теперь доступна с ранга: {rank_name} ({min_rank})\n"
+        "ℹ️ Главный админ, спецдопуск и ранг 7 по-прежнему проходят всегда, "
+        "независимо от этого порога."
+    )
 
 # ============ ЖАЛОБЫ ============
 
@@ -14063,6 +14291,7 @@ def main():
         'poll_create': apoll_create, 'vote': avote, 'add': aadd, 'poll_info': apoll_info, 'poll_close': apoll_close, 'polls': apolls,
         'tag': atag, 'tagdept': atagdept, 'tagall': atagall,
         'grant': agrant, 'revoke': arevoke, 'perms': aperms, 'grantlist': agrantlist, 'grantcmds': agrantcmds,
+        'cmdrank': acmdrank,
         'requests': arequests, 'request_info': arequest_info,
         'checkall': acheckall,
         'blocklist': ablocklist,
