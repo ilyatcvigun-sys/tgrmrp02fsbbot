@@ -2,9 +2,12 @@ import random
 import logging
 import asyncio
 import threading
+import contextvars
+from contextlib import contextmanager
+from collections.abc import Mapping
 from datetime import datetime, timedelta, time, timezone
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop
+from telegram import Update, Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop, TypeHandler, ExtBot
 # ВАЖНО: бот работает на PostgreSQL. Модуль db_pg — слой совместимости,
 # который повторяет API sqlite3 (connect / Row / OperationalError /
 # IntegrityError) и на лету переводит запросы в диалект PostgreSQL.
@@ -47,6 +50,8 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 GAME_NICK, CALLSIGN = range(2)
+# Шаг 0 регистрации — выбор конференции
+REG_CONF = 40
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
 # States для /punish (форма выдачи наказания, только в личке).
 PUNISH_VIOLATOR, PUNISH_VIOLATION, PUNISH_EVIDENCE, PUNISH_FACTION, PUNISH_WARNS, PUNISH_CONFIRM = range(20, 26)
@@ -81,6 +86,12 @@ PM_LOG_CHAT_ID = -1003712184120
 # Топик, в котором разрешены игры (кубы, моя статья).
 # В других топиках конференции эти команды наказываются — см. _handle_topic_violation.
 GAMES_ALLOWED_TOPIC_ID = 52562
+# Топик голосований основной конфы.
+POLL_TOPIC_ID = 10677
+# ВНИМАНИЕ: CONFERENCE_CHAT_ID и *_TOPIC_ID выше — настройки ОСНОВНОЙ конфы,
+# они только засеивают реестр (init_conference_registry). В коде используй
+# conf_chat() / conf_topic('verdict'|'games'|'poll') — они берут значения
+# текущей конференции.
 TOPIC_VIOLATION_WINDOW_DAYS = 7              # за сколько дней считаем нарушения
 TOPIC_VIOLATION_MUTE_AT = 3                  # с какого по счёту нарушения — мут
 TOPIC_VIOLATION_WARN_AT = 4                  # с какого — реальный варн поверх мута
@@ -88,25 +99,371 @@ TOPIC_VIOLATION_MUTE_MIN_FIRST = 5           # длительность перв
 TOPIC_VIOLATION_MUTE_MIN_REPEAT = 15         # длительность мута при повторах
 TOPIC_VIOLATION_REACT_COOLDOWN_SEC = 60      # антифлуд замечания (на одного юзера)
 
-# Множество user_id, отключённых от бота. Заполняется при старте и
-# обновляется командами /block и /unblock. Используется в gate-хэндлере,
-# чтобы не дёргать SQLite на каждое сообщение.
-blocked_users: set = set()
+# ============ МУЛЬТИКОНФЕРЕНЦИИ ============
+# Бот обслуживает несколько конференций. У каждой — своя схема PostgreSQL с
+# полным набором таблиц (users, отделы, ранги, жалобы, варны…), поэтому ранг,
+# отдел, жетон и всё остальное в каждой конфе своё. Основная конфа — схема
+# public (исторические данные остались на месте), остальные — conf_<id>.
+#
+# Текущая конфа выбирается на каждый апдейт (conf_router, группа −100):
+#   • в группе — по ID чата (незнакомый чат → основная конфа);
+#   • в ЛС — активная конфа пользователя (/conf переключает).
+# Дальше весь код работает как раньше: db_pg сам ставит search_path на схему
+# текущей конфы. Глобальные таблицы (реестр конф, активная конфа) лежат в
+# public с префиксом g_ и всегда адресуются как public.g_….
+#
+# Связанные конфы (одинаковый link_group) делят ЧС (gban) и глобальные
+# команды /gwarn, /gmute и т.п. — см. раздел «ГЛОБАЛЬНЫЕ КОМАНДЫ».
+
+MAIN_SCHEMA = 'public'
+
+# Текущая конфа (dict из реестра) для этого апдейта. None = основная.
+_conf_var: contextvars.ContextVar = contextvars.ContextVar('conf', default=None)
+# True, пока команда выполняется через глобальную /g-версию в «чужой» конфе.
+_global_run: contextvars.ContextVar = contextvars.ContextVar('global_run', default=False)
+
+# Реестр конференций в памяти: id → dict. Перечитывается reload_conferences().
+_conferences: dict = {}
+
+_CONF_COLUMNS = ('id', 'chat_id', 'title', 'schema_name', 'reg_open', 'link_group',
+                 'verdict_topic', 'games_topic', 'poll_topic')
+
+
+def init_conference_registry():
+    """Глобальные таблицы мультиконференций + запись основной конфы."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS public.g_conferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER UNIQUE,
+            title TEXT NOT NULL DEFAULT '',
+            schema_name TEXT UNIQUE NOT NULL,
+            reg_open INTEGER DEFAULT 1,       -- 1 = можно регистрироваться
+            link_group INTEGER,               -- одинаковый у связанных конф, NULL = не связана
+            verdict_topic INTEGER,            -- топик вердиктов/выговоров (NULL = общий чат)
+            games_topic INTEGER,              -- топик игр (NULL = игры везде)
+            poll_topic INTEGER,               -- топик голосований (NULL = общий чат)
+            created_at TEXT DEFAULT ''
+        )
+    ''')
+    # Активная конфа пользователя в ЛС
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS public.g_active_conf (
+            user_id INTEGER PRIMARY KEY,
+            conf_id INTEGER NOT NULL
+        )
+    ''')
+    # Глобальные связки конференций (/global)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS public.g_link_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT DEFAULT '',
+            created_by INTEGER,
+            created_at TEXT DEFAULT ''
+        )
+    ''')
+    # Из какой конфы отправлено сообщение с inline-кнопками в ЛС. Нужно, чтобы
+    # нажатие кнопки (одобрить жалобу, заявку…) обработалось в «той» конфе,
+    # даже если у пользователя сейчас активна другая.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS public.g_msg_conf (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            conf_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT '',
+            PRIMARY KEY (chat_id, message_id)
+        )
+    ''')
+    c.execute('DELETE FROM public.g_msg_conf WHERE created_at < ?',
+              ((now_msk() - timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S"),))
+    c.execute("SELECT 1 FROM public.g_conferences WHERE schema_name = 'public'")
+    if not c.fetchone():
+        c.execute(
+            '''INSERT INTO public.g_conferences
+               (chat_id, title, schema_name, reg_open, verdict_topic, games_topic, poll_topic, created_at)
+               VALUES (?, ?, 'public', 1, ?, ?, ?, ?)''',
+            (CONFERENCE_CHAT_ID, 'ФСБ', VERDICT_TOPIC_ID, GAMES_ALLOWED_TOPIC_ID,
+             POLL_TOPIC_ID, now_msk_str()),
+        )
+    conn.commit()
+    conn.close()
+    reload_conferences()
+
+
+def reload_conferences():
+    global _conferences
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(f"SELECT {', '.join(_CONF_COLUMNS)} FROM public.g_conferences ORDER BY id")
+    _conferences = {r[0]: dict(zip(_CONF_COLUMNS, r)) for r in c.fetchall()}
+    conn.close()
+
+
+def all_conferences() -> list:
+    return list(_conferences.values())
+
+
+def main_conf() -> dict:
+    for conf in _conferences.values():
+        if conf['schema_name'] == MAIN_SCHEMA:
+            return conf
+    # Реестр ещё не загружен (самый старт) — ведём себя как основная конфа
+    return {'id': 0, 'chat_id': CONFERENCE_CHAT_ID, 'title': 'ФСБ', 'schema_name': MAIN_SCHEMA,
+            'reg_open': 1, 'link_group': None, 'verdict_topic': VERDICT_TOPIC_ID,
+            'games_topic': GAMES_ALLOWED_TOPIC_ID, 'poll_topic': POLL_TOPIC_ID}
+
+
+def get_conf(conf_id) -> dict:
+    return _conferences.get(conf_id)
+
+
+def conf_for_chat(chat_id) -> dict:
+    for conf in _conferences.values():
+        if conf['chat_id'] == chat_id:
+            return conf
+    return None
+
+
+def current_conf() -> dict:
+    return _conf_var.get() or main_conf()
+
+
+def conf_chat():
+    """ID чата текущей конфы (замена прежней константы CONFERENCE_CHAT_ID)."""
+    return current_conf()['chat_id']
+
+
+def conf_topic(kind: str):
+    """Топик текущей конфы: 'verdict' | 'games' | 'poll'. None = общий чат."""
+    return current_conf().get(f'{kind}_topic')
+
+
+def conf_title(conf: dict = None) -> str:
+    conf = conf or current_conf()
+    return conf.get('title') or f"Конфа #{conf['id']}"
+
+
+def is_main_conf(conf: dict = None) -> bool:
+    return (conf or current_conf())['schema_name'] == MAIN_SCHEMA
+
+
+def activate_conf(conf: dict):
+    """Сделать конфу текущей до конца апдейта (без отката)."""
+    _conf_var.set(conf)
+    sqlite3.set_schema(conf['schema_name'])
+
+
+@contextmanager
+def using_conf(conf: dict, global_run: bool = None):
+    """with using_conf(conf): … — временно работать в другой конфе."""
+    t1 = _conf_var.set(conf)
+    t2 = sqlite3.set_schema(conf['schema_name'])
+    t3 = _global_run.set(global_run) if global_run is not None else None
+    try:
+        yield conf
+    finally:
+        if t3 is not None:
+            _global_run.reset(t3)
+        sqlite3.reset_schema(t2)
+        _conf_var.reset(t1)
+
+
+def linked_confs(conf: dict = None) -> list:
+    """Конфа + все связанные с ней (одинаковый link_group)."""
+    conf = conf or current_conf()
+    if conf.get('link_group') is None:
+        return [conf]
+    return [c for c in _conferences.values() if c.get('link_group') == conf['link_group']]
+
+
+def is_registered_in(conf: dict, user_id: int) -> bool:
+    with using_conf(conf):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
+        ok = c.fetchone() is not None
+        conn.close()
+    return ok
+
+
+def confs_of_user(user_id: int) -> list:
+    """Конфы, в которых пользователь зарегистрирован."""
+    return [conf for conf in all_conferences() if is_registered_in(conf, user_id)]
+
+
+def get_active_conf_id(user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT conf_id FROM public.g_active_conf WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_active_conf(user_id: int, conf_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM public.g_active_conf WHERE user_id = ?', (user_id,))
+    c.execute('INSERT INTO public.g_active_conf (user_id, conf_id) VALUES (?, ?)', (user_id, conf_id))
+    conn.commit()
+    conn.close()
+
+
+def remember_msg_conf(chat_id: int, message_id: int):
+    conf = current_conf()
+    if not conf.get('id'):
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM public.g_msg_conf WHERE chat_id = ? AND message_id = ?', (chat_id, message_id))
+    c.execute('INSERT INTO public.g_msg_conf (chat_id, message_id, conf_id, created_at) VALUES (?, ?, ?, ?)',
+              (chat_id, message_id, conf['id'], now_msk_str()))
+    conn.commit()
+    conn.close()
+
+
+def lookup_msg_conf(chat_id: int, message_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT conf_id FROM public.g_msg_conf WHERE chat_id = ? AND message_id = ?', (chat_id, message_id))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+class ConfTrackingBot(ExtBot):
+    """Бот, который запоминает, из какой конфы ушло сообщение с inline-кнопками в ЛС."""
+
+    async def _send_message(self, *args, **kwargs):
+        result = await super()._send_message(*args, **kwargs)
+        try:
+            if (isinstance(result, Message) and result.chat.type == 'private'
+                    and isinstance(result.reply_markup, InlineKeyboardMarkup)):
+                remember_msg_conf(result.chat.id, result.message_id)
+        except Exception as e:
+            logger.debug(f"remember_msg_conf: {e}")
+        return result
+
+
+def resolve_conf_for_update(update: Update) -> dict:
+    chat = update.effective_chat
+    if chat is not None and chat.type != 'private':
+        return conf_for_chat(chat.id) or main_conf()
+    user = update.effective_user
+    if user is None:
+        return main_conf()
+    # Кнопка под сообщением бота в ЛС — в той конфе, откуда пришло сообщение.
+    # Активную конфу переключаем туда же, чтобы следующий текст (например,
+    # комментарий модератора к жалобе) попал в ту же конфу.
+    query = update.callback_query
+    if query is not None and query.message is not None:
+        conf = get_conf(lookup_msg_conf(query.message.chat.id, query.message.message_id))
+        if conf:
+            if get_active_conf_id(user.id) != conf['id']:
+                set_active_conf(user.id, conf['id'])
+            return conf
+    conf = get_conf(get_active_conf_id(user.id))
+    if conf:
+        return conf
+    # Активная не выбрана: первая конфа, где пользователь зарегистрирован
+    mine = confs_of_user(user.id)
+    if mine:
+        set_active_conf(user.id, mine[0]['id'])
+        return mine[0]
+    return main_conf()
+
+
+async def conf_router(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Группа −100: выбрать конфу для всего апдейта, до любых других хэндлеров."""
+    if isinstance(update, Update):
+        try:
+            activate_conf(resolve_conf_for_update(update))
+        except Exception as e:
+            logger.error(f"conf_router: {e}")
+            activate_conf(main_conf())
+
+
+def per_conf_job(func):
+    """Обёртка для периодических задач JobQueue: выполнить задачу в каждой конфе."""
+    async def wrapper(context: ContextTypes.DEFAULT_TYPE):
+        for conf in all_conferences():
+            with using_conf(conf):
+                try:
+                    await func(context)
+                except Exception as e:
+                    logger.error(f"{func.__name__} [{conf_title(conf)}]: {e}")
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+def conf_bound(callback):
+    """Зафиксировать текущую конфу за отложенным колбэком (job_queue.run_once):
+    задачи планировщика выполняются вне контекста апдейта."""
+    conf = current_conf()
+    async def wrapper(context: ContextTypes.DEFAULT_TYPE):
+        with using_conf(conf):
+            return await callback(context)
+    wrapper.__name__ = getattr(callback, '__name__', 'job')
+    return wrapper
+
+
+def _in_conf_chat(update: Update) -> bool:
+    """Команда выполняется «внутри конфы»: в её чате или через глобальную /g-версию."""
+    return _global_run.get() or (update.effective_chat is not None
+                                 and update.effective_chat.id == conf_chat())
+
+
+def _action_chat_id(update: Update):
+    """Где применять кик/бан: чат текущей конфы, если команда пришла из ЛС или
+    через /g-версию; иначе — чат, где её написали (как было раньше)."""
+    chat = update.effective_chat
+    if _global_run.get() or chat is None or chat.type == 'private':
+        return conf_chat()
+    return chat.id
+
+
+# Множества user_id, отключённых от бота, — отдельно на каждую конфу (схему).
+# Заполняются при старте и обновляются /block и /unblock. Используется в
+# gate-хэндлере, чтобы не дёргать БД на каждое сообщение.
+class _PerConfSet:
+    def __init__(self):
+        self._sets = {}
+
+    def _cur(self) -> set:
+        return self._sets.setdefault(sqlite3.get_schema(), set())
+
+    def replace(self, items):
+        self._sets[sqlite3.get_schema()] = set(items)
+
+    def add(self, x):
+        self._cur().add(x)
+
+    def discard(self, x):
+        self._cur().discard(x)
+
+    def __contains__(self, x):
+        return x in self._cur()
+
+    def __len__(self):
+        return len(self._cur())
+
+
+blocked_users = _PerConfSet()
 
 
 def reload_blocked_users():
-    """Перечитать список заблокированных из БД в память."""
-    global blocked_users
+    """Перечитать список заблокированных текущей конфы из БД в память."""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute('SELECT user_id FROM users WHERE bot_blocked = "Да"')
-        blocked_users = {r[0] for r in c.fetchall()}
+        blocked_users.replace(r[0] for r in c.fetchall())
         conn.close()
-        logger.info(f"Loaded {len(blocked_users)} blocked users into memory.")
+        logger.info(f"[{conf_title()}] Loaded {len(blocked_users)} blocked users into memory.")
     except Exception as e:
         logger.error(f"reload_blocked_users error: {e}")
-        blocked_users = set()
+        blocked_users.replace(())
 
 
 # ============ ЖУРНАЛ ДЕЙСТВИЙ АДМИНИСТРАЦИИ ============
@@ -131,7 +488,9 @@ def log_action(actor_id, action: str, target_id=None, details: str = ""):
     except Exception as e:
         logger.debug(f"log_action failed: {e}")
 
-RANKS = {
+# Названия рангов по умолчанию. В каждой конфе их можно переименовать
+# (/rankname), уровни 0–7 и пороги прав при этом общие.
+DEFAULT_RANKS = {
     0: {"name": "👤 Гость"},
     1: {"name": "⭐ Старший лейтенант"},
     2: {"name": "🎖 Капитан"},
@@ -141,6 +500,49 @@ RANKS = {
     6: {"name": "🌟 Генерал"},
     7: {"name": "⚜️ Следящий за ФСБ"}
 }
+
+
+class _ConfRanks(Mapping):
+    """RANKS с названиями текущей конфы: RANKS[5]['name'] в одной конфе может
+    быть «Полковник», в другой — «Директор». Кэш по схеме, сбрасывается /rankname."""
+
+    def __init__(self):
+        self._cache = {}
+
+    def _data(self) -> dict:
+        schema = sqlite3.get_schema()
+        data = self._cache.get(schema)
+        if data is None:
+            data = {k: dict(v) for k, v in DEFAULT_RANKS.items()}
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute('SELECT rank, name FROM rank_names')
+                for rank, name in c.fetchall():
+                    if rank in data and name:
+                        data[rank]['name'] = name
+                conn.close()
+            except Exception as e:
+                # Таблицы ещё нет (самый старт) — названия по умолчанию, без кэша
+                logger.debug(f"rank_names: {e}")
+                return data
+            self._cache[schema] = data
+        return data
+
+    def invalidate(self):
+        self._cache.pop(sqlite3.get_schema(), None)
+
+    def __getitem__(self, key):
+        return self._data()[key]
+
+    def __iter__(self):
+        return iter(self._data())
+
+    def __len__(self):
+        return len(self._data())
+
+
+RANKS = _ConfRanks()
 
 DEPARTMENTS_INITIAL = [
     "🎯 Руководящий состав",
@@ -634,11 +1036,11 @@ def find_users_by_nickname(nickname: str) -> list:
 
 async def kick_user_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
     try:
-        chat_id = update.effective_chat.id
+        chat_id = _action_chat_id(update)
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
         await asyncio.sleep(1)
         await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
-        if chat_id == CONFERENCE_CHAT_ID:
+        if chat_id == conf_chat():
             _close_service_period(target_id)
         return True
     except Exception as e:
@@ -647,9 +1049,9 @@ async def kick_user_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def ban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
     try:
-        chat_id = update.effective_chat.id
+        chat_id = _action_chat_id(update)
         await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
-        if chat_id == CONFERENCE_CHAT_ID:
+        if chat_id == conf_chat():
             _close_service_period(target_id)
         return True
     except Exception as e:
@@ -658,7 +1060,7 @@ async def ban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
 async def unban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
     try:
-        chat_id = update.effective_chat.id
+        chat_id = _action_chat_id(update)
         await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
         return True
     except Exception as e:
@@ -1179,7 +1581,7 @@ def init_database():
             issued_by INTEGER NOT NULL,      -- user_id выдавшего
             issuer_nick TEXT,                -- ник выдавшего на момент публикации
             published_at TEXT DEFAULT '',
-            message_id INTEGER               -- ID сообщения в VERDICT_TOPIC_ID
+            message_id INTEGER               -- ID сообщения в conf_topic('verdict')
         )
     ''')
     # Миграции для уже существующих БД
@@ -1192,31 +1594,28 @@ def init_database():
         except sqlite3.OperationalError:
             pass
 
-    # Настройки бота «ключ → значение» (сейчас: ID чата-ветки).
+    # Свои названия рангов конфы (уровни 0–7 и права по ним общие для всех конф).
+    # Нет строки — берётся название по умолчанию из DEFAULT_RANKS.
     c.execute('''
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
+        CREATE TABLE IF NOT EXISTS rank_names (
+            rank INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
         )
     ''')
-    # Отделы ветки — отдельный от основных departments набор, чтобы не
-    # затрагивать /setdept, /find основной конфы и Mini App.
+    # Дополнительные отделы пользователя. Основной отдел — users.department,
+    # здесь только дополнительные (человек может состоять в нескольких).
     c.execute('''
-        CREATE TABLE IF NOT EXISTS branch_departments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            sort_order INTEGER DEFAULT 0
+        CREATE TABLE IF NOT EXISTS user_departments (
+            user_id INTEGER NOT NULL,
+            department TEXT NOT NULL,
+            PRIMARY KEY (user_id, department)
         )
     ''')
-    # Отдел пользователя в ветке. '' = не состоит в ветке.
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN branch_department TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-    
-    # Заполняем начальные департаменты если таблица пуста
+
+    # Заполняем начальные департаменты если таблица пуста — только в основной
+    # конфе: новые конфы заводят свои отделы сами (/department add).
     c.execute('SELECT COUNT(*) FROM departments')
-    if c.fetchone()[0] == 0:
+    if is_main_conf() and c.fetchone()[0] == 0:
         for dept in DEPARTMENTS_INITIAL:
             try:
                 c.execute('INSERT INTO departments (name) VALUES (?)', (dept,))
@@ -1342,6 +1741,7 @@ def get_user_data(user_id: int) -> dict:
     keys = row.keys()
     def g(name, default=''):
         return row[name] if name in keys else default
+    depts = user_departments_list(g('user_id'), g('department', 'Не назначен'))
     return {
         "user_id": g('user_id'),
         "nick": g('game_nick'),
@@ -1360,7 +1760,38 @@ def get_user_data(user_id: int) -> dict:
         "blocked_at": g('blocked_at', ''),
         "last_kick_at": g('last_kick_at', ''),
         "last_kick_reason": g('last_kick_reason', ''),
+        "departments": depts,
+        "departments_str": ", ".join(depts),
     }
+
+
+# ─── Несколько отделов ───
+# Основной отдел — users.department (его меняют /setdept, заявки, Mini App),
+# дополнительные — таблица user_departments (/adddept, /deldept).
+
+def get_extra_departments(user_id: int) -> list:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT department FROM user_departments WHERE user_id = ? ORDER BY department', (user_id,))
+    rows = [r[0] for r in c.fetchall()]
+    conn.close()
+    return rows
+
+
+def user_departments_list(user_id: int, primary: str) -> list:
+    """Все отделы человека: основной + дополнительные, без «Не назначен», если есть другие."""
+    depts = [primary] if primary and primary != 'Не назначен' else []
+    depts += [d for d in get_extra_departments(user_id) if d not in depts]
+    return depts or [primary or 'Не назначен']
+
+
+def departments_display(user_id: int, primary: str) -> str:
+    return ", ".join(user_departments_list(user_id, primary))
+
+
+# SQL-условие «человек состоит в отделе ?» с учётом дополнительных отделов.
+# Параметр отдела передаётся ДВАЖДЫ: (dept, dept).
+IN_DEPT_SQL = "(department = ? OR user_id IN (SELECT user_id FROM user_departments WHERE department = ?))"
 
 def update_user_rank(user_id: int, new_rank: int) -> bool:
     """Обновление ранга"""
@@ -1428,18 +1859,43 @@ def add_warning(user_id: int, issuer_id: int, reason: str, force_written: bool =
     conn.close()
     return True, f"Выдано {warn_type.lower()} предупреждение ({new_warns})", kicked
 
-def add_gban(user_id: int, reason: str, banned_by: int) -> bool:
-    """Добавление в глобальный бан"""
+def _add_gban_local(user_id: int, nick: str, reason: str, date: str, banned_by: int):
+    """Запись в ЧС текущей конфы (без дублей)."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute('SELECT 1 FROM gban WHERE user_id = ?', (user_id,))
+    if not c.fetchone():
+        c.execute('''INSERT INTO gban (user_id, nick, reason, date, banned_by)
+                     VALUES (?, ?, ?, ?, ?)''',
+                  (user_id, nick, reason, date, banned_by))
+        conn.commit()
+    conn.close()
+
+
+def add_gban(user_id: int, reason: str, banned_by: int) -> bool:
+    """Добавление в ЧС — в текущей конфе и во всех связанных с ней (/global)."""
     ud = get_user_data(user_id)
     nick = ud['nick'] if ud else f"User {user_id}"
-    c.execute('''INSERT INTO gban (user_id, nick, reason, date, banned_by) 
-                 VALUES (?, ?, ?, ?, ?)''',
-              (user_id, nick, reason, now_msk_str("%Y-%m-%d %H:%M:%S"), banned_by))
-    conn.commit()
-    conn.close()
+    date = now_msk_str("%Y-%m-%d %H:%M:%S")
+    for conf in linked_confs():
+        with using_conf(conf):
+            _add_gban_local(user_id, nick, reason, date, banned_by)
     return True
+
+
+def sync_gban_group(link_group: int):
+    """Выровнять ЧС связки: каждый, кто в ЧС хотя бы одной конфы, — в ЧС всех.
+    Вызывается при добавлении конфы в связку."""
+    confs = [c for c in all_conferences() if c.get('link_group') == link_group]
+    union = {}
+    for conf in confs:
+        with using_conf(conf):
+            for uid, nick, reason, date, banned_by in get_gban_list():
+                union.setdefault(uid, (nick, reason, date, banned_by))
+    for conf in confs:
+        with using_conf(conf):
+            for uid, (nick, reason, date, banned_by) in union.items():
+                _add_gban_local(uid, nick, reason, date, banned_by)
 
 def check_gban(user_id: int) -> dict:
     """Проверка глобального бана"""
@@ -1459,13 +1915,16 @@ def check_gban(user_id: int) -> dict:
     return {"is_banned": False}
 
 def remove_gban(user_id: int) -> bool:
-    """Удаление из глобального бана"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('DELETE FROM gban WHERE user_id = ?', (user_id,))
-    deleted = c.rowcount > 0
-    conn.commit()
-    conn.close()
+    """Удаление из ЧС — в текущей конфе и во всех связанных."""
+    deleted = False
+    for conf in linked_confs():
+        with using_conf(conf):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('DELETE FROM gban WHERE user_id = ?', (user_id,))
+            deleted = c.rowcount > 0 or deleted
+            conn.commit()
+            conn.close()
     return deleted
 
 def get_gban_list() -> list:
@@ -1572,9 +2031,9 @@ async def auto_unban_job(context: ContextTypes.DEFAULT_TYPE):
     # Снимаем бан в Telegram + аудит + уведомление
     for uid, nick in rows:
         log_action(None, 'unban', uid, "истёк срок временного бана")
-        if CONFERENCE_CHAT_ID:
+        if conf_chat():
             try:
-                await context.bot.unban_chat_member(CONFERENCE_CHAT_ID, uid, only_if_banned=True)
+                await context.bot.unban_chat_member(conf_chat(), uid, only_if_banned=True)
             except Exception as e:
                 logger.debug(f"auto-unban in TG failed for {uid}: {e}")
         try:
@@ -1587,12 +2046,12 @@ async def auto_unban_job(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.1)
     
     # Системное сообщение в конфу
-    if CONFERENCE_CHAT_ID and rows:
+    if conf_chat() and rows:
         names = ", ".join(n or f"id {u}" for u, n in rows[:10])
         more = f" (и ещё {len(rows) - 10})" if len(rows) > 10 else ""
         try:
             await context.bot.send_message(
-                chat_id=CONFERENCE_CHAT_ID,
+                chat_id=conf_chat(),
                 text=f"⏰ Авто-разбан по истечении срока: {names}{more}",
             )
         except Exception:
@@ -2047,11 +2506,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🤖 БОТ КОНФЕРЕНЦИИ\n"
             "━━━━━━━━━━━━━━━━━\n"
+            f"🏛 {conf_title()}\n"
             f"👋 С возвращением, {user_data['nick']}!\n"
             f"⭐ {permissions['name']}\n"
             "━━━━━━━━━━━━━━━━━\n"
             "Выберите действие на клавиатуре ниже\n"
-            "или используйте /help для списка команд.",
+            "или используйте /help для списка команд.\n"
+            "🌐 Другие конференции — /conf",
             reply_markup=reply_markup,
         )
 
@@ -2060,7 +2521,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # версий не передаёт initData (известный баг клиента) — inline-кнопка
         # под сообщением работает надёжнее на всех платформах, поэтому
         # используем именно её, а не KeyboardButton.
-        mini_app_url = _mini_app_url()
+        mini_app_url = _mini_app_url() if is_main_conf() else None
         if mini_app_url:
             await update.message.reply_text(
                 "📇 Личное дело — карточка вашего профиля и служебные отметки.",
@@ -2101,7 +2562,7 @@ async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n"
         f"⭐ Ранг: {permissions['name']}\n"
-        f"📁 Отдел: {user_data['department']}"
+        f"📁 Отдел: {user_data['departments_str']}"
         f"{flags_line}"
     )
 
@@ -2130,7 +2591,7 @@ HELP_SECTIONS = [
     ]),
 
     ("search", "🔍", "Поиск и состав", [
-        ("find",       "",                      "руководящий состав", 0),
+        ("find",       "",                      "руководящий состав (листается по 10)", 0),
         ("nick",      "<имя>",                 "поиск по нику", 0),
         ("search",    "<жетон>",               "поиск по жетону", 0),
         ("check_gban", "<user>",                "проверить, есть ли в ЧС", 0),
@@ -2181,7 +2642,7 @@ HELP_SECTIONS = [
         ("blocklist",  "",                     "список отключённых", 5),
         ("audit",      "[@user]",              "журнал действий", 5),
         ("history",    "<user>",               "история пользователя", 4),
-        ("gban",        "<user> <причина>",     "глобальный ЧС (тихо)", "spec"),
+        ("gban",        "<user> <причина>",     "ЧС во всех беседах связки (тихо)", "spec"),
         ("ungban",      "<user>",               "снять глобальный ЧС", "spec"),
         ("global_unban", "",                   "снять все баны разом", "main"),
     ]),
@@ -2199,7 +2660,9 @@ HELP_SECTIONS = [
 
     ("staff", "👥", "Ранги, отделы, состав", [
         ("setrank",    "<user> <0-7>",         "изменить ранг", 5),
-        ("setdept",    "<user> <номер>",       "изменить отдел", 5),
+        ("setdept",    "<user> <номер>",       "изменить основной отдел", 5),
+        ("adddept",    "<user> <номер>",       "добавить ещё один отдел", 5),
+        ("deldept",    "<user> <номер>",       "убрать из отдела", 5),
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
         ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
         ("tagall",     "<текст>",              "тегнуть всех активных; гиперссылки сохраняются, ответом на файл — с вложением", 5),
@@ -2222,10 +2685,24 @@ HELP_SECTIONS = [
         ("dept_group_assign", "<dept_id> <group_id|0>", "привязать отдел к группе", "spec"),
         ("dept_apply_template", "confirm",     "применить шаблон отделов", "spec"),
         ("findsetup",  "",                     "настроить видимость отделов в /find", "main"),
-        ("bfind",      "",                     "состав ветки (листается по 10)", 0),
-        ("bdept",      "list|add|remove|rename|move", "отделы ветки", 5),
-        ("bsetdept",   "<user> <номер|0>",     "отдел в ветке; 0 — убрать из ветки", 5),
-        ("branch",     "set|off",              "привязать чат-ветку (выполнять в нём)", "spec"),
+    ]),
+
+    ("confs", "🏛", "Конференции", [
+        ("conf",       "",                     "мои конференции, переключение, регистрация в другой", 0),
+        ("confnew",    "[название]",           "подключить этот чат как конференцию", "main"),
+        ("confset",    "[параметр значение]",  "название, регистрация, топики конференции", "spec"),
+        ("conflist",   "",                     "все конференции бота", "main"),
+        ("rankname",   "[0-7 название]",       "названия рангов этой конференции", 0),
+        ("global",     "create|add|remove|info", "глобальные связки бесед", 0),
+        ("gbinfo",     "<user>",               "информация о человеке во всех беседах", 5),
+        ("gwarn",      "<user> <причина>",     "варн во всех беседах связки", 5),
+        ("gunwarn",    "<user>",               "снять варн во всех беседах связки", 5),
+        ("gmute",      "<user> [срок] [причина]", "мут во всех беседах связки", 5),
+        ("gunmute",    "<user>",               "размут во всех беседах связки", 5),
+        ("gkick",      "<user> [причина]",     "кик из всех бесед связки", 5),
+        ("gunban",     "<user>",               "разбан во всех беседах связки", 5),
+        ("gblock",     "<user>",               "отключить от бота во всех беседах связки", 5),
+        ("gunblock",   "<user>",               "подключить обратно во всех беседах связки", 5),
     ]),
 
     ("system", "⚙️", "Система", [
@@ -2474,7 +2951,7 @@ async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n"
         f"⭐ Ранг: {permissions['name']}\n"
-        f"📁 Отдел: {user_data['department']}\n"
+        f"📁 Отдел: {user_data['departments_str']}\n"
         f"⚠️ Предупреждения: {user_data['warns']}\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
@@ -2826,7 +3303,7 @@ async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎮 Ник: {row['game_nick']}\n"
             f"📻 Позывной: {row['callsign']}\n"
             f"⭐ Ранг: {RANKS.get(rank, RANKS[0])['name']}\n"
-            f"📁 Отдел: {row['department']}"
+            f"📁 Отдел: {departments_display(row['user_id'], row['department'])}"
         )
     else:
         await update.message.reply_text(f"❌ Жетон {token} не найден.")
@@ -2893,7 +3370,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # --- Случай: пользователя кикнули/забанили в чате ---
     if new_status == 'kicked' and old_status not in ('kicked',):
         # Делаем только если это наша целевая конфа
-        if CONFERENCE_CHAT_ID and chat.id == CONFERENCE_CHAT_ID:
+        if conf_chat() and chat.id == conf_chat():
             user_data = get_user_data(user.id)
             actor = chat_member_update.from_user  # КТО кикнул
             actor_name = "—"
@@ -2905,7 +3382,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if user_data:
                 try:
                     await context.bot.send_message(
-                        chat_id=CONFERENCE_CHAT_ID,
+                        chat_id=conf_chat(),
                         text=(
                             "👢 ПОЛЬЗОВАТЕЛЬ ИСКЛЮЧЁН ИЗ КОНФЕРЕНЦИИ\n"
                             "━━━━━━━━━━━━━━━━━\n"
@@ -2959,7 +3436,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"📻 Позывной: `{user_data['callsign']}`\n"
                 f"🎫 Жетон: `{user_data['token']}`\n"
                 f"⭐ Ранг: *{permissions['name']}*\n"
-                f"📁 Отдел: _{user_data['department']}_\n\n"
+                f"📁 Отдел: _{user_data['departments_str']}_\n\n"
             )
         else:
             bot_username = (await context.bot.get_me()).username
@@ -3043,7 +3520,7 @@ async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📻 Позывной: `{user_data['callsign']}`\n"
             f"🎫 Жетон: `{user_data['token']}`\n"
             f"⭐ Ранг: *{permissions['name']}*\n"
-            f"📁 Отдел: _{user_data['department']}_\n\n"
+            f"📁 Отдел: _{user_data['departments_str']}_\n\n"
         )
     else:
         welcome_text = f"👋 *{user.first_name}*, добро пожаловать в конференцию!\n\n⚠️ Вы не зарегистрированы.\n\n"
@@ -3172,10 +3649,10 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                if disconnected else "")
         )
         # Системное сообщение в конфу (если кикнули не из самой конфы — продублируем)
-        if CONFERENCE_CHAT_ID and update.effective_chat.id != CONFERENCE_CHAT_ID:
+        if conf_chat() and not _in_conf_chat(update):
             try:
                 await context.bot.send_message(
-                    chat_id=CONFERENCE_CHAT_ID,
+                    chat_id=conf_chat(),
                     text=(
                         "👢 Кик из конференции\n"
                         f"👤 {target_nick} ({target_name})\n"
@@ -3304,7 +3781,7 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Глобальный бан"""
     user_id = update.effective_user.id
-    if not has_special_access(user_id):
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
         await update.message.reply_text("❌ Недоступно.")
         return
     
@@ -3346,7 +3823,10 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # вызвал (reply в тот же чат: конфа, топик или ЛС — без принудительного
     # перенаправления в отдельную личку).
     add_gban(target_id, reason, user_id)
-    await kick_user_from_chat(update, context, target_id)
+    # Кикаем тихо из чатов всех связанных конф
+    for conf in linked_confs():
+        with using_conf(conf, global_run=True):
+            await kick_user_from_chat(update, context, target_id)
 
     target_data = get_user_data(target_id)
     target_name = target_data['nick'] if target_data else f"User {target_id}"
@@ -4047,6 +4527,7 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 1 <= num <= len(depts):
             name = depts[num - 1]
             c.execute('DELETE FROM departments WHERE name = ?', (name,))
+            c.execute('DELETE FROM user_departments WHERE department = ?', (name,))
             conn.commit()
             await update.message.reply_text(f"✅ Отдел '{name}' удалён.")
         else:
@@ -4068,6 +4549,7 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             old_name = depts[num - 1]
             new_name = ' '.join(context.args[2:])
             c.execute('UPDATE users SET department = ? WHERE department = ?', (new_name, old_name))
+            c.execute('UPDATE user_departments SET department = ? WHERE department = ?', (new_name, old_name))
             c.execute('UPDATE departments SET name = ? WHERE name = ?', (new_name, old_name))
             conn.commit()
             await update.message.reply_text(f"✅ '{old_name}' → '{new_name}'")
@@ -4122,10 +4604,10 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Тянем участников: сортируем по рангу убыванию, потом по нику
         c.execute(
-            '''SELECT user_id, game_nick, callsign, rank, ban_status
-               FROM users WHERE department = ?
+            f'''SELECT user_id, game_nick, callsign, rank, ban_status
+               FROM users WHERE {IN_DEPT_SQL}
                ORDER BY rank DESC, game_nick''',
-            (target_dept,),
+            (target_dept, target_dept),
         )
         members = c.fetchall()
         
@@ -4345,10 +4827,10 @@ async def weekly_rank_check(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.debug(f"weekly_rank_check send to {user_id} failed: {e}")
 
-    if CONFERENCE_CHAT_ID:
+    if conf_chat():
         try:
             await context.bot.send_message(
-                chat_id=CONFERENCE_CHAT_ID,
+                chat_id=conf_chat(),
                 text=f"📢 Отправлена еженедельная проверка ({sent} получателей).",
             )
         except Exception:
@@ -5463,17 +5945,13 @@ async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = text[:3997] + "..."
     await update.message.reply_text(text)
 
-async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Руководящий состав. Отделы группируются по department_groups и сортируются по sort_order."""
-    # В чате-ветке /find показывает состав ветки (свои отделы, листается).
-    if _is_branch_chat(update):
-        await bfind(update, context)
-        return
-    user_data = get_user_data(update.effective_user.id)
-    if not user_data:
-        await update.message.reply_text("❌ Вы не зарегистрированы.")
-        return
-    
+FIND_PAGE_SIZE = 10   # человек на одной странице /find
+
+
+def _find_pages() -> list:
+    """Руководящий состав текущей конфы, нарезанный на страницы по FIND_PAGE_SIZE
+    человек. Отделы группируются по department_groups и сортируются по sort_order;
+    человек с несколькими отделами показывается в каждом."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -5483,45 +5961,101 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
            ORDER BY so, id'''
     )
     depts = c.fetchall()
-    
+
     # Группы — для заголовков
     c.execute('SELECT id, name FROM department_groups ORDER BY COALESCE(sort_order, id), id')
     groups = {gid: gname for gid, gname in c.fetchall()}
-    
+
     # Группируем отделы по group_id (сохраняя порядок sort_order)
     sections = {}
     section_order = []
     for dept_id, name, so, group_id in depts:
-        key = group_id  # может быть None
-        if key not in sections:
-            sections[key] = []
-            section_order.append(key)
-        sections[key].append((name, dept_id))
-    
-    text = "👥 РУКОВОДЯЩИЙ СОСТАВ:\n\n"
-    total = 0
-    
+        if group_id not in sections:
+            sections[group_id] = []
+            section_order.append(group_id)
+        sections[group_id].append(name)
+
+    entries = []   # (группа | None, отдел, строка)
+    people = set()
     for group_id in section_order:
-        if group_id is not None and group_id in groups:
-            text += f"━━━━━━━━━━━━━━━━━\n📁 {groups[group_id]}\n━━━━━━━━━━━━━━━━━\n"
-        for dept_name, _did in sections[group_id]:
+        group_name = groups.get(group_id) if group_id is not None else None
+        for dept_name in sections[group_id]:
             c.execute(
-                'SELECT game_nick, callsign, rank FROM users WHERE department = ? ORDER BY rank DESC',
-                (dept_name,),
+                f'SELECT user_id, game_nick, rank FROM users WHERE {IN_DEPT_SQL} ORDER BY rank DESC, game_nick',
+                (dept_name, dept_name),
             )
-            members = c.fetchall()
-            if members:
-                text += f"📁 {dept_name}:\n"
-                for m in members:
-                    text += f"├ {m[1]} ({m[0]}) — {RANKS.get(m[2], RANKS[0])['name']}\n"
-                text += "\n"
-                total += len(members)
-    
+            for uid, nick, rank in c.fetchall():
+                people.add(uid)
+                entries.append((group_name, dept_name, f"├ {nick} — {RANKS.get(rank, RANKS[0])['name']}"))
     conn.close()
-    text += f"👥 Всего в руководстве: {total}"
-    if len(text) > 4000:
-        text = text[:3997] + "..."
-    await update.message.reply_text(text)
+
+    chunks = [entries[i:i + FIND_PAGE_SIZE] for i in range(0, len(entries), FIND_PAGE_SIZE)] or [[]]
+    pages = []
+    for num, chunk in enumerate(chunks, 1):
+        text = "👥 РУКОВОДЯЩИЙ СОСТАВ:\n\n"
+        if not chunk:
+            text += "Пока никого нет.\n\n"
+        prev_group, prev_dept = object(), None
+        for group_name, dept_name, line in chunk:
+            if group_name != prev_group:
+                if group_name:
+                    text += f"━━━━━━━━━━━━━━━━━\n📁 {group_name}\n━━━━━━━━━━━━━━━━━\n"
+                prev_group, prev_dept = group_name, None
+            if dept_name != prev_dept:
+                if prev_dept is not None:
+                    text += "\n"
+                text += f"📁 {dept_name}:\n"
+                prev_dept = dept_name
+            text += line + "\n"
+        text += f"\n👥 Всего в руководстве: {len(people)}"
+        if len(chunks) > 1:
+            text += f"\n📄 Страница {num}/{len(chunks)}"
+        pages.append(text[:4096])
+    return pages
+
+
+def _find_kb(page: int, pages_count: int):
+    """Кнопки листания /find; None, если страница одна."""
+    if pages_count <= 1:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("◀️", callback_data=f"findpg:{(page - 1) % pages_count}"),
+        InlineKeyboardButton(f"{page + 1}/{pages_count}", callback_data="findpg:noop"),
+        InlineKeyboardButton("▶️", callback_data=f"findpg:{(page + 1) % pages_count}"),
+    ]])
+
+
+async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Руководящий состав текущей конфы, по 10 человек на страницу."""
+    if not get_user_data(update.effective_user.id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    pages = _find_pages()
+    await update.message.reply_text(pages[0], reply_markup=_find_kb(0, len(pages)))
+
+
+async def find_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки ◀️ / ▶️ под /find. Состав перечитывается при каждом нажатии."""
+    query = update.callback_query
+    arg = (query.data or "").split(":", 1)[-1]
+    if arg == 'noop':
+        await query.answer()
+        return
+    if not get_user_data(query.from_user.id):
+        await query.answer("❌ Вы не зарегистрированы.", show_alert=True)
+        return
+    try:
+        page = int(arg)
+    except ValueError:
+        await query.answer()
+        return
+    pages = _find_pages()
+    page = max(0, min(page, len(pages) - 1))
+    await query.answer()
+    try:
+        await query.edit_message_text(pages[page], reply_markup=_find_kb(page, len(pages)))
+    except Exception:
+        pass  # «message is not modified» — состав не изменился
 
 
 def _get_departments_with_visibility() -> list:
@@ -5633,352 +6167,6 @@ async def afindsetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
 
-# ============ ВЕТКА: ВТОРАЯ КОНФЕРЕНЦИЯ СО СВОИМИ ОТДЕЛАМИ ============
-# Тот же бот и та же БД, но в чате-ветке /find показывает свой состав:
-# отделы из branch_departments, отдел человека — users.branch_department.
-# Чат-ветка привязывается командой /branch set прямо в этом чате.
-
-BRANCH_FIND_PAGE_SIZE = 10          # человек на одной странице /find ветки
-
-# ID чата-ветки в памяти, чтобы не лезть в БД на каждый /find. None = не привязан.
-branch_chat_id = None
-
-
-def reload_branch_chat():
-    """Перечитать ID чата-ветки из bot_settings в память."""
-    global branch_chat_id
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT value FROM bot_settings WHERE key = 'branch_chat_id'")
-        row = c.fetchone()
-        conn.close()
-        branch_chat_id = int(row[0]) if row and row[0] else None
-    except Exception as e:
-        logger.error(f"reload_branch_chat error: {e}")
-        branch_chat_id = None
-
-
-def _set_branch_chat(chat_id):
-    """Сохранить (или сбросить при None) ID чата-ветки."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM bot_settings WHERE key = 'branch_chat_id'")
-    if chat_id is not None:
-        c.execute("INSERT INTO bot_settings (key, value) VALUES ('branch_chat_id', ?)", (str(chat_id),))
-    conn.commit()
-    conn.close()
-    reload_branch_chat()
-
-
-def _is_branch_chat(update: Update) -> bool:
-    chat = update.effective_chat
-    return branch_chat_id is not None and chat is not None and chat.id == branch_chat_id
-
-
-def get_branch_departments() -> list:
-    """Отделы ветки в порядке отображения."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT name FROM branch_departments ORDER BY COALESCE(sort_order, id), id')
-    depts = [r[0] for r in c.fetchall()]
-    conn.close()
-    return depts
-
-
-def _branch_find_pages() -> tuple:
-    """Состав ветки, нарезанный на страницы по BRANCH_FIND_PAGE_SIZE человек.
-    Возвращает (pages, total), где pages — список готовых текстов."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    entries = []  # (отдел, ник, название ранга)
-    for dept in get_branch_departments():
-        c.execute(
-            '''SELECT game_nick, rank FROM users
-               WHERE branch_department = ? AND ban_status = 'Нет'
-               ORDER BY rank DESC, game_nick''',
-            (dept,),
-        )
-        for nick, rank in c.fetchall():
-            entries.append((dept, nick, RANKS.get(rank, RANKS[0])['name']))
-    conn.close()
-
-    total = len(entries)
-    chunks = [entries[i:i + BRANCH_FIND_PAGE_SIZE]
-              for i in range(0, total, BRANCH_FIND_PAGE_SIZE)] or [[]]
-    pages = []
-    for num, chunk in enumerate(chunks, 1):
-        text = "👥 СОСТАВ\n━━━━━━━━━━━━━━━━━\n"
-        if not chunk:
-            text += "Пока никого нет.\n"
-        prev_dept = None
-        for dept, nick, rank_name in chunk:
-            if dept != prev_dept:
-                if prev_dept is not None:
-                    text += "\n"
-                text += f"📁 {dept}:\n"
-                prev_dept = dept
-            text += f"├ {nick} — {rank_name}\n"
-        text += (
-            "━━━━━━━━━━━━━━━━━\n"
-            f"📄 Страница {num}/{len(chunks)} · 👥 Всего: {total}"
-        )
-        pages.append(text)
-    return pages, total
-
-
-def _branch_find_kb(page: int, pages_count: int):
-    """Кнопки листания; None, если страница одна."""
-    if pages_count <= 1:
-        return None
-    prev_page = (page - 1) % pages_count
-    next_page = (page + 1) % pages_count
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("◀️", callback_data=f"bfind:{prev_page}"),
-        InlineKeyboardButton(f"{page + 1}/{pages_count}", callback_data="bfind:noop"),
-        InlineKeyboardButton("▶️", callback_data=f"bfind:{next_page}"),
-    ]])
-
-
-async def bfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Состав ветки с листанием по страницам. В чате-ветке вызывается и через /find."""
-    if not get_user_data(update.effective_user.id):
-        await update.message.reply_text("❌ Вы не зарегистрированы.")
-        return
-    pages, _total = _branch_find_pages()
-    await update.message.reply_text(pages[0], reply_markup=_branch_find_kb(0, len(pages)))
-
-
-async def bfind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопки ◀️ / ▶️ под /find ветки. Состав перечитывается при каждом нажатии."""
-    query = update.callback_query
-    arg = (query.data or "").split(":", 1)[-1]
-    if arg == 'noop':
-        await query.answer()
-        return
-    if not get_user_data(query.from_user.id):
-        await query.answer("❌ Вы не зарегистрированы.", show_alert=True)
-        return
-    try:
-        page = int(arg)
-    except ValueError:
-        await query.answer()
-        return
-    pages, _total = _branch_find_pages()
-    page = max(0, min(page, len(pages) - 1))
-    await query.answer()
-    try:
-        await query.edit_message_text(pages[page], reply_markup=_branch_find_kb(page, len(pages)))
-    except Exception:
-        pass  # «message is not modified» — состав не изменился
-
-
-async def abranch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Привязка чата-ветки: /branch set (в самом чате), /branch off, /branch — статус."""
-    user_id = update.effective_user.id
-    if not (is_main_admin(user_id) or has_special_access(user_id)):
-        await update.message.reply_text("❌ Команда доступна главному админу или со спецдоступом.")
-        return
-
-    action = (context.args[0].lower() if context.args else '')
-    chat = update.effective_chat
-
-    if action == 'set':
-        if chat.type == 'private':
-            await update.message.reply_text("❌ Выполните /branch set в самом чате, который станет веткой.")
-            return
-        if chat.id == CONFERENCE_CHAT_ID:
-            await update.message.reply_text("❌ Основная конференция не может быть веткой.")
-            return
-        _set_branch_chat(chat.id)
-        log_action(user_id, 'branch_set', None, f"chat_id={chat.id}")
-        await update.message.reply_text(
-            "🌿 ВЕТКА ПРИВЯЗАНА\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"💬 Чат: {chat.title or chat.id}\n"
-            "📁 /find здесь показывает отделы ветки\n"
-            "📣 /tagall здесь тегает только состав ветки\n"
-            "━━━━━━━━━━━━━━━━━"
-        )
-        return
-
-    if action == 'off':
-        _set_branch_chat(None)
-        log_action(user_id, 'branch_off', None, "")
-        await update.message.reply_text("✅ Ветка отвязана. /find везде показывает основной состав.")
-        return
-
-    status = f"🆔 {branch_chat_id}" if branch_chat_id else "не привязана"
-    await update.message.reply_text(
-        "🌿 ВЕТКА\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"💬 Чат-ветка: {status}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "/branch set — сделать веткой текущий чат\n"
-        "/branch off — отвязать\n"
-        "/bdept — отделы ветки\n"
-        "/bsetdept <user> <номер|0> — отдел человека в ветке\n"
-        "/bfind — состав ветки"
-    )
-
-
-async def abdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отделы ветки: list/add/remove/rename/move."""
-    user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'bdept'):
-        await update.message.reply_text("❌ С 5 ранга.")
-        return
-
-    usage = (
-        "📁 ОТДЕЛЫ ВЕТКИ\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        "/bdept list — список\n"
-        "/bdept add <название>\n"
-        "/bdept remove <номер>\n"
-        "/bdept rename <номер> <новое название>\n"
-        "/bdept move <номер> <новая позиция>"
-    )
-    if not context.args:
-        await update.message.reply_text(usage)
-        return
-
-    action = context.args[0].lower()
-    depts = get_branch_departments()
-
-    def _num(i):
-        try:
-            n = int(context.args[i])
-        except (IndexError, ValueError):
-            return None
-        return n if 1 <= n <= len(depts) else None
-
-    if action == 'list':
-        if not depts:
-            await update.message.reply_text("ℹ️ Отделов ветки пока нет. /bdept add <название>")
-            return
-        text = "📁 ОТДЕЛЫ ВЕТКИ\n━━━━━━━━━━━━━━━━━\n"
-        text += "\n".join(f"{i}. {d}" for i, d in enumerate(depts, 1))
-        await update.message.reply_text(text)
-        return
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    try:
-        if action == 'add' and len(context.args) >= 2:
-            name = ' '.join(context.args[1:]).strip()
-            if name in depts:
-                await update.message.reply_text("❌ Такой отдел уже есть.")
-                return
-            # Новый отдел — в конец списка
-            c.execute('SELECT COALESCE(MAX(sort_order), 0) FROM branch_departments')
-            next_order = (c.fetchone()[0] or 0) + 1
-            c.execute('INSERT INTO branch_departments (name, sort_order) VALUES (?, ?)',
-                      (name, next_order))
-            conn.commit()
-            log_action(user_id, 'branch_dept_add', None, name)
-            await update.message.reply_text(f"✅ Отдел ветки «{name}» добавлен.")
-
-        elif action == 'remove' and _num(1):
-            name = depts[_num(1) - 1]
-            c.execute("UPDATE users SET branch_department = '' WHERE branch_department = ?", (name,))
-            c.execute('DELETE FROM branch_departments WHERE name = ?', (name,))
-            conn.commit()
-            log_action(user_id, 'branch_dept_remove', None, name)
-            await update.message.reply_text(f"✅ Отдел ветки «{name}» удалён, его состав выведен из ветки.")
-
-        elif action == 'rename' and _num(1) and len(context.args) >= 3:
-            old_name = depts[_num(1) - 1]
-            new_name = ' '.join(context.args[2:]).strip()
-            if new_name in depts:
-                await update.message.reply_text("❌ Такой отдел уже есть.")
-                return
-            c.execute('UPDATE users SET branch_department = ? WHERE branch_department = ?', (new_name, old_name))
-            c.execute('UPDATE branch_departments SET name = ? WHERE name = ?', (new_name, old_name))
-            conn.commit()
-            log_action(user_id, 'branch_dept_rename', None, f"{old_name} → {new_name}")
-            await update.message.reply_text(f"✅ «{old_name}» → «{new_name}»")
-
-        elif action == 'move' and _num(1) and _num(2):
-            order = list(depts)
-            name = order.pop(_num(1) - 1)
-            order.insert(_num(2) - 1, name)
-            for pos, d in enumerate(order, 1):
-                c.execute('UPDATE branch_departments SET sort_order = ? WHERE name = ?', (pos, d))
-            conn.commit()
-            await update.message.reply_text(
-                "✅ Порядок обновлён:\n" + "\n".join(f"{i}. {d}" for i, d in enumerate(order, 1))
-            )
-
-        else:
-            await update.message.reply_text(usage)
-    finally:
-        conn.close()
-
-
-async def absetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Назначить отдел ветки: /bsetdept <user> <номер>, 0 — убрать из ветки. Работает и ответом."""
-    user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'bsetdept'):
-        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
-        return
-
-    args = list(context.args or [])
-    depts = get_branch_departments()
-    deps_text = "\n".join(f"{i}. {d}" for i, d in enumerate(depts, 1)) or "— пока нет, /bdept add"
-
-    if _is_real_reply(update.message):
-        target_id = update.message.reply_to_message.from_user.id
-        dept_num = _first_int_in_args(args)
-    elif len(args) >= 2:
-        target_id = extract_user_id(update, context, args[0])
-        dept_num = _first_int_in_args(args[1:])
-    else:
-        target_id, dept_num = None, None
-
-    if dept_num is None:
-        await update.message.reply_text(
-            "❌ Использование: /bsetdept <@user|ID> <номер>\n"
-            "   (или ответом на сообщение) /bsetdept <номер>\n"
-            "   0 — убрать из ветки\n\n"
-            f"📁 Отделы ветки:\n{deps_text}"
-        )
-        return
-
-    if isinstance(target_id, str) and target_id.startswith('@'):
-        target_id = await get_target_id(update, context, target_id)
-    if target_id is None:
-        await update.message.reply_text("❌ Пользователь не найден. Укажите @username, ID, или ответьте на сообщение.")
-        return
-    if target_id == -1:
-        await update.message.reply_text("❌ Несколько совпадений по нику. Уточните @username или ID.")
-        return
-
-    if dept_num != 0 and not (1 <= dept_num <= len(depts)):
-        await update.message.reply_text(f"❌ Неверный номер отдела. Допустимо: 0..{len(depts)}.")
-        return
-
-    target_data = get_user_data(target_id)
-    if not target_data:
-        await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
-        return
-
-    new_dept = depts[dept_num - 1] if dept_num else ''
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('UPDATE users SET branch_department = ? WHERE user_id = ?', (new_dept, target_id))
-    conn.commit()
-    conn.close()
-
-    log_action(user_id, 'branch_dept_change', target_id, new_dept or '— (убран из ветки)')
-    await update.message.reply_text(
-        "🌿 ОТДЕЛ В ВЕТКЕ\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"👤 {target_data['nick']}\n"
-        f"📁 {new_dept or 'убран из ветки'}\n"
-        "━━━━━━━━━━━━━━━━━"
-    )
-
-
 # ============ УПРАВЛЕНИЕ ОТДЕЛАМИ И ГРУППАМИ ============
 # Все команды доступны только главному админу (или со спецдоступом).
 
@@ -6065,6 +6253,7 @@ async def adept_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute('UPDATE departments SET name = ? WHERE id = ?', (new_name, dept_id))
         # Синхронизируем привязку юзеров
         c.execute('UPDATE users SET department = ? WHERE department = ?', (new_name, old_name))
+        c.execute('UPDATE user_departments SET department = ? WHERE department = ?', (new_name, old_name))
         affected = c.rowcount
         conn.commit()
     except sqlite3.IntegrityError as e:
@@ -6276,6 +6465,7 @@ async def adept_apply_template(update: Update, context: ContextTypes.DEFAULT_TYP
             if old_name != new_name:
                 c.execute('UPDATE departments SET name = ? WHERE id = ?', (new_name, did))
                 c.execute('UPDATE users SET department = ? WHERE department = ?', (new_name, old_name))
+                c.execute('UPDATE user_departments SET department = ? WHERE department = ?', (new_name, old_name))
                 actions['users_synced'] += c.rowcount
                 actions['renamed'] += 1
             c.execute('UPDATE departments SET sort_order = ? WHERE id = ?', (new_so, did))
@@ -6355,7 +6545,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 ПРОФИЛЬ\n\n"
         f"🎮 Ник: {user_data['nick']}\n📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n"
-        f"📁 Отдел: {user_data['department']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
+        f"📁 Отдел: {user_data['departments_str']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
         f"🏅 Наград: {award_count}\n{special_text}{notes_line}🆔 ID: {user_data['user_id']}\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
@@ -6559,7 +6749,7 @@ async def _is_conference_tg_admin(context: ContextTypes.DEFAULT_TYPE, user_id: i
     через /tgadmin, при /mute и особенно при /unmute.
     """
     try:
-        member = await context.bot.get_chat_member(chat_id=CONFERENCE_CHAT_ID, user_id=user_id)
+        member = await context.bot.get_chat_member(chat_id=conf_chat(), user_id=user_id)
         return member.status in ('administrator', 'creator')
     except Exception as e:
         logger.debug(f"_is_conference_tg_admin check failed for {user_id}: {e}")
@@ -6583,7 +6773,7 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Мутить можно только в самой конференции — это ограничение Telegram
-    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+    if not _in_conf_chat(update):
         await update.message.reply_text(
             "❌ Мутить можно только внутри конференции. Напишите команду там."
         )
@@ -6656,7 +6846,7 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Применяем ограничения
     try:
         await context.bot.restrict_chat_member(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             user_id=target_id,
             permissions=ChatPermissions(
                 can_send_messages=False,
@@ -6716,7 +6906,7 @@ async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_permission(user_id, 'ban', 'unmute'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
-    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+    if not _in_conf_chat(update):
         await update.message.reply_text("❌ Работает только внутри конференции.")
         return
     
@@ -6745,7 +6935,7 @@ async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Восстанавливаем стандартные права участника чата
     try:
         await context.bot.restrict_chat_member(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             user_id=target_id,
             permissions=ChatPermissions(
                 can_send_messages=True,
@@ -6884,7 +7074,7 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     if not update.message or not update.message.text:
         return
-    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+    if not _in_conf_chat(update):
         return
     parts = update.message.text.strip().split()
     if not parts:
@@ -7141,7 +7331,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
         until_utc = datetime.now(timezone.utc) + duration
         try:
             await context.bot.restrict_chat_member(
-                chat_id=CONFERENCE_CHAT_ID,
+                chat_id=conf_chat(),
                 user_id=target_id,
                 permissions=ChatPermissions(
                     can_send_messages=False, can_send_audios=False, can_send_documents=False,
@@ -7371,7 +7561,7 @@ async def aunban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снятие глобального бана"""
     user_id = update.effective_user.id
-    if not has_special_access(user_id):
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
         await update.message.reply_text("❌ Недоступно.")
         return
     
@@ -7402,7 +7592,7 @@ async def ungban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def gban_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список ЧС"""
     user_id = update.effective_user.id
-    if not has_special_access(user_id):
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
         await update.message.reply_text("❌ Команда доступна только со спецдопуском.")
         return
     
@@ -7598,7 +7788,7 @@ async def atgadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         perms = {key: bool(mask & (1 << idx)) for idx, (key, _label) in enumerate(TG_ADMIN_PERMS)}
         try:
             await context.bot.promote_chat_member(
-                chat_id=CONFERENCE_CHAT_ID,
+                chat_id=conf_chat(),
                 user_id=target_id,
                 **perms,
             )
@@ -7619,7 +7809,7 @@ async def atgadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if title:
             try:
                 await context.bot.set_chat_administrator_custom_title(
-                    chat_id=CONFERENCE_CHAT_ID, user_id=target_id, custom_title=title
+                    chat_id=conf_chat(), user_id=target_id, custom_title=title
                 )
                 title_note = f"\n🏷 Должность: {title}"
             except Exception as e:
@@ -7680,7 +7870,7 @@ async def atgunadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Снятие прав = выдача пустого набора
         await context.bot.promote_chat_member(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             user_id=target_id,
             can_manage_chat=False,
             can_delete_messages=False,
@@ -7726,7 +7916,7 @@ async def atgadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        admins = await context.bot.get_chat_administrators(CONFERENCE_CHAT_ID)
+        admins = await context.bot.get_chat_administrators(conf_chat())
     except Exception as e:
         await update.message.reply_text(f"❌ Не удалось получить список: {e}")
         return
@@ -8008,7 +8198,7 @@ async def atag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out_chat = update.effective_chat.id
     going_to_conf = False
     if update.effective_chat.type == 'private':
-        out_chat = CONFERENCE_CHAT_ID
+        out_chat = conf_chat()
         going_to_conf = True
     
     try:
@@ -8093,8 +8283,8 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        'SELECT user_id FROM users WHERE department = ? AND ban_status = "Нет"',
-        (dept_name,),
+        f'SELECT user_id FROM users WHERE {IN_DEPT_SQL} AND ban_status = "Нет"',
+        (dept_name, dept_name),
     )
     members = [r[0] for r in c.fetchall()]
     conn.close()
@@ -8124,7 +8314,7 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out_chat = update.effective_chat.id
     going_to_conf = False
     if update.effective_chat.type == 'private':
-        out_chat = CONFERENCE_CHAT_ID
+        out_chat = conf_chat()
         going_to_conf = True
     
     try:
@@ -8215,7 +8405,6 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Гиперссылки и форматирование из текста сохраняются. Если ответить /tagall
     на сообщение с документом/фото/видео — вложение уйдёт вместе с обращением.
-    В чате-ветке тегается только состав ветки (у кого есть отдел ветки).
 
     Использование: /tagall <текст>  или ответом на файл: /tagall [текст]
     """
@@ -8233,22 +8422,14 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    in_branch = _is_branch_chat(update)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    if in_branch:
-        c.execute("""SELECT user_id FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'
-                     AND COALESCE(branch_department, '') <> ''""")
-    else:
-        c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
     members = [r[0] for r in c.fetchall()]
     conn.close()
 
     if not members:
-        await update.message.reply_text(
-            "❌ Некого тегать — нет активных пользователей"
-            + (" с отделом ветки (/bsetdept)." if in_branch else ".")
-        )
+        await update.message.reply_text("❌ Некого тегать — нет активных пользователей.")
         return
 
     issuer_name = get_admin_nick(user_id)
@@ -8260,7 +8441,7 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out_chat = update.effective_chat.id
     going_to_conf = False
     if update.effective_chat.type == 'private':
-        out_chat = CONFERENCE_CHAT_ID
+        out_chat = conf_chat()
         going_to_conf = True
 
     try:
@@ -8296,7 +8477,7 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ ТЕГ ВСЕХ ОТПРАВЛЕН\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👥 {'Состав ветки' if in_branch else 'Активных пользователей'}: {len(members)}\n"
+        f"👥 Активных пользователей: {len(members)}\n"
         f"📤 Сообщение → {summary_chat}\n"
         f"📎 Вложение: {'да' if attachment else 'нет'}\n"
         f"📨 В ЛС доставлено: {delivered}\n"
@@ -9338,7 +9519,7 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
     # Дублирование в топик «Вердикты»
     try:
         await context.bot.send_message(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             text=(
                 f"📋 ВЕРДИКТ #{report_id}{reopen_tag}\n"
                 f"👤 Подал: {report['reporter_nick']}\n"
@@ -9349,14 +9530,14 @@ async def handle_moderator_comment(update: Update, context: ContextTypes.DEFAULT
                 f"💬 {comment}"
                 + history_block
             ),
-            message_thread_id=VERDICT_TOPIC_ID,
+            message_thread_id=conf_topic('verdict'),
         )
         # Доказательства (фото/видео и т.д.) тоже шлём в тот же топик после карточки
         media = report.get('media_files') or []
         if media:
             await forward_report_media(
-                context, CONFERENCE_CHAT_ID, media,
-                message_thread_id=VERDICT_TOPIC_ID,
+                context, conf_chat(), media,
+                message_thread_id=conf_topic('verdict'),
             )
     except Exception:
         pass
@@ -9486,7 +9667,7 @@ async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🔍 ПОЛНАЯ ИНФОРМАЦИЯ\n\n"
         f"🎮 {user_data['nick']}\n📻 {user_data['callsign']}\n🎫 {user_data['token']}\n"
-        f"⭐ {RANKS[user_data['rank']]['name']}\n📁 {user_data['department']}\n"
+        f"⭐ {RANKS[user_data['rank']]['name']}\n📁 {user_data['departments_str']}\n"
         f"⚠️ {user_data['warns']}\n"
         f"🔐 Спецдопуск: {'Да' if has_special_access(target_id) else 'Нет'}\n"
         f"🚫 ЧС: {'Да' if gban['is_banned'] else 'Нет'}\n🆔 {user_data['user_id']}"
@@ -9494,30 +9675,96 @@ async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ РЕГИСТРАЦИЯ ============
 
-async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало регистрации"""
-    if get_user_data(update.effective_user.id):
-        await update.message.reply_text("❌ Уже зарегистрированы!")
-        return ConversationHandler.END
-
-    user_id = update.effective_user.id
+async def _is_chat_member(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id: int) -> bool:
+    """Состоит ли пользователь в чате конфы прямо сейчас."""
+    if not chat_id:
+        return False
     try:
-        member = await context.bot.get_chat_member(chat_id=CONFERENCE_CHAT_ID, user_id=user_id)
-        in_conference = member.status not in ('left', 'kicked')
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return member.status not in ('left', 'kicked')
     except Exception as e:
         # Для тех, кто вообще не состоит в конфе, Telegram нередко отвечает
         # ошибкой (а не статусом 'left') — трактуем это тоже как "не в конфе".
-        logger.debug(f"start_registration: get_chat_member failed for {user_id}: {e}")
-        in_conference = False
+        logger.debug(f"get_chat_member {chat_id}/{user_id} failed: {e}")
+        return False
 
-    if not in_conference:
-        await update.message.reply_text(
-            "❌ Регистрация доступна только участникам конференции.\n"
-            "Сначала вступите в конференцию, затем повторите попытку."
-        )
+
+async def _registrable_confs(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> tuple:
+    """(доступные, закрытые_где_состоит): конфы с открытой регистрацией, где человек
+    состоит в чате и ещё не зарегистрирован."""
+    available, closed = [], []
+    for conf in all_conferences():
+        if is_registered_in(conf, user_id):
+            continue
+        if not await _is_chat_member(context, conf['chat_id'], user_id):
+            continue
+        (available if conf.get('reg_open') else closed).append(conf)
+    return available, closed
+
+
+async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало регистрации: сначала выбор конференции (только те, где человек состоит)."""
+    user_id = update.effective_user.id
+    query = update.callback_query
+    if query:
+        await query.answer()
+    reply = update.effective_message.reply_text
+
+    available, closed = await _registrable_confs(context, user_id)
+    if not available:
+        if confs_of_user(user_id):
+            text = "ℹ️ Нет конференций, в которых вы ещё не зарегистрированы.\nПереключиться между своими — /conf"
+        elif closed:
+            text = "❌ Регистрация в вашей конференции сейчас закрыта."
+        else:
+            text = ("❌ Регистрация доступна только участникам конференции.\n"
+                    "Сначала вступите в конференцию, затем повторите попытку.")
+        await reply(text)
         return ConversationHandler.END
 
-    await update.message.reply_text("📝 Шаг 1/2 — Игровой ник:")
+    keyboard = [[InlineKeyboardButton(f"🏛 {conf_title(conf)}", callback_data=f"regconf:{conf['id']}")]
+                for conf in available]
+    await reply(
+        "📝 РЕГИСТРАЦИЯ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Выберите конференцию.\n"
+        "Показаны только те, где вы состоите.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return REG_CONF
+
+
+async def reg_choose_conf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка выбора конференции при регистрации."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    try:
+        conf = get_conf(int(query.data.split(":", 1)[1]))
+    except (ValueError, IndexError):
+        conf = None
+    if not conf:
+        await query.answer("❌ Конференция не найдена.", show_alert=True)
+        return REG_CONF
+    # Перепроверяем: список мог устареть, пока человек думал
+    if is_registered_in(conf, user_id):
+        await query.answer("Вы уже зарегистрированы в этой конференции.", show_alert=True)
+        return REG_CONF
+    if not conf.get('reg_open'):
+        await query.answer("❌ Регистрация в этой конференции закрыта.", show_alert=True)
+        return REG_CONF
+    if not await _is_chat_member(context, conf['chat_id'], user_id):
+        await query.answer("❌ Вы не состоите в этой конференции.", show_alert=True)
+        return REG_CONF
+
+    await query.answer()
+    set_active_conf(user_id, conf['id'])
+    activate_conf(conf)
+    context.user_data['reg_conf_id'] = conf['id']
+    try:
+        await query.edit_message_text(f"📝 РЕГИСТРАЦИЯ\n━━━━━━━━━━━━━━━━━\n🏛 Конференция: {conf_title(conf)}")
+    except Exception:
+        pass
+    await query.message.reply_text("📝 Шаг 1/2 — Игровой ник:")
     return GAME_NICK
 
 async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9560,12 +9807,18 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     callsign = update.message.text
     user_id = update.effective_user.id
     tg_username = update.effective_user.username or ""
+    conf = get_conf(context.user_data.get('reg_conf_id'))
+    if conf:
+        activate_conf(conf)
+    if get_user_data(user_id):
+        await update.message.reply_text("❌ Вы уже зарегистрированы в этой конференции.")
+        return ConversationHandler.END
     token = add_user(user_id, context.user_data['game_nick'], callsign, tg_username=tg_username)
     if not token:
         await update.message.reply_text("❌ Ошибка регистрации. Попробуйте позже.")
         return ConversationHandler.END
     await update.message.reply_text(
-        f"✅ Готово!\n\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}"
+        f"✅ Готово!\n\n🏛 {conf_title()}\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}"
     )
     
     # Уведомление в лог-группу и генералам (6+)
@@ -9573,6 +9826,7 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     await notify_new_registration(context, (
         "🆕 НОВАЯ РЕГИСТРАЦИЯ\n"
         "━━━━━━━━━━━━━━━━━\n"
+        f"🏛 Конференция: {conf_title()}\n"
         f"🎮 Ник: {context.user_data['game_nick']}\n"
         f"📻 Позывной: {callsign}\n"
         f"🎫 Жетон: {token}\n"
@@ -9591,7 +9845,6 @@ async def atest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Chat ID: {update.effective_chat.id}\nChat type: {update.effective_chat.type}")
 # ============= ГОЛОСОВАНИЕ ТЕСТ ТЕСТ ==============
 
-POLL_TOPIC_ID = 10677
 # ============ СИСТЕМА ГОЛОСОВАНИЙ ============
 # Голосование анонимное: кто как проголосовал — не показывается НИГДЕ (ни в
 # конфе, ни модераторам в ЛС, ни в /poll_info), только агрегированные цифры.
@@ -9646,7 +9899,7 @@ async def _poll_update_topic_tally(context: ContextTypes.DEFAULT_TYPE, poll_id: 
         return
     try:
         await context.bot.edit_message_text(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             message_id=poll['topic_message_id'],
             text=_poll_topic_text(poll),
             reply_markup=_poll_vote_kb(poll_id) if poll['status'] == 'active' else None,
@@ -9787,10 +10040,10 @@ async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conf_text = _poll_topic_text(poll)
     kb = _poll_vote_kb(poll_id)
     try:
-        msg = await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=conf_text,
-                                              message_thread_id=POLL_TOPIC_ID, reply_markup=kb)
+        msg = await context.bot.send_message(chat_id=conf_chat(), text=conf_text,
+                                              message_thread_id=conf_topic('poll'), reply_markup=kb)
     except:
-        msg = await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=conf_text, reply_markup=kb)
+        msg = await context.bot.send_message(chat_id=conf_chat(), text=conf_text, reply_markup=kb)
     set_poll_topic_message(poll_id, msg.message_id)
 
     await update.message.reply_text(f"✅ Голосование #{poll_id} создано в топике.")
@@ -9883,9 +10136,9 @@ async def aadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # === В КОНФУ ===
     try:
-        await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID,
+        await context.bot.send_message(chat_id=conf_chat(),
             text=f"📝 Дополнение к голосованию #{poll_id} (про {candidate})\n👤 {user_data['nick']}: {addition}",
-            message_thread_id=POLL_TOPIC_ID)
+            message_thread_id=conf_topic('poll'))
     except: pass
     
     # === В ЛС ВСЕМ ===
@@ -10330,10 +10583,12 @@ def _is_in_games_topic(update) -> bool:
     """
     if not update or not update.message:
         return True
-    if update.effective_chat.id != CONFERENCE_CHAT_ID:
+    if not _in_conf_chat(update):
         return True  # вне конфы — без ограничений
+    if conf_topic('games') is None:
+        return True  # у конфы не задан игровой топик — играть можно везде
     thread_id = getattr(update.message, 'message_thread_id', None)
-    return thread_id == GAMES_ALLOWED_TOPIC_ID
+    return thread_id == conf_topic('games')
 
 
 async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> bool:
@@ -10408,7 +10663,7 @@ async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_
         try:
             until = datetime.now(timezone.utc) + timedelta(minutes=mute_min)
             await context.bot.restrict_chat_member(
-                chat_id=CONFERENCE_CHAT_ID,
+                chat_id=conf_chat(),
                 user_id=user_id,
                 permissions=ChatPermissions(
                     can_send_messages=False,
@@ -10453,8 +10708,8 @@ async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_
         sanction_lines.append(f"⚠️ {warn_msg}")
     
     # Ссылка на правильный топик (deep-link для супергрупп)
-    cid_short = str(CONFERENCE_CHAT_ID).replace('-100', '', 1)
-    topic_url = f"https://t.me/c/{cid_short}/{GAMES_ALLOWED_TOPIC_ID}"
+    cid_short = str(conf_chat()).replace('-100', '', 1)
+    topic_url = f"https://t.me/c/{cid_short}/{conf_topic('games')}"
     
     text = (
         f"🚫 НАРУШЕНИЕ ТОПИКА\n"
@@ -10472,7 +10727,7 @@ async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_
     target_thread = getattr(update.message, 'message_thread_id', None)
     try:
         await context.bot.send_message(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             text=text,
             message_thread_id=target_thread,
             parse_mode='Markdown',
@@ -10483,7 +10738,7 @@ async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_
         # Фоллбэк без Markdown — на случай, если в нике есть проблемные символы
         try:
             await context.bot.send_message(
-                chat_id=CONFERENCE_CHAT_ID,
+                chat_id=conf_chat(),
                 text=text.replace('[этом топике]', f'этом топике ({topic_url})').replace('(' + topic_url + ')', '', 1),
                 message_thread_id=target_thread,
                 disable_web_page_preview=True,
@@ -10988,7 +11243,7 @@ async def aukrating(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневно в 21:00 МСК постит главного преступника дня в конференцию."""
-    if not CONFERENCE_CHAT_ID:
+    if not conf_chat():
         return
     since = now_msk() - timedelta(hours=24)
     top = _get_article_top(since=since, limit=3)
@@ -11023,9 +11278,9 @@ async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     
     try:
         await context.bot.send_message(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             text="\n".join(lines),
-            message_thread_id=GAMES_ALLOWED_TOPIC_ID,
+            message_thread_id=conf_topic('games'),
         )
     except Exception as e:
         logger.error(f"daily_criminal_job send error: {e}")
@@ -11033,7 +11288,7 @@ async def daily_criminal_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def weekly_criminal_job(context: ContextTypes.DEFAULT_TYPE):
     """Еженедельно (воскресенье 22:00 МСК) постит топ-5 преступников недели."""
-    if not CONFERENCE_CHAT_ID:
+    if not conf_chat():
         return
     since = now_msk() - timedelta(days=7)
     top = _get_article_top(since=since, limit=5)
@@ -11052,9 +11307,9 @@ async def weekly_criminal_job(context: ContextTypes.DEFAULT_TYPE):
         text = text[:3997] + "..."
     try:
         await context.bot.send_message(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             text=text,
-            message_thread_id=GAMES_ALLOWED_TOPIC_ID,
+            message_thread_id=conf_topic('games'),
         )
     except Exception as e:
         logger.error(f"weekly_criminal_job send error: {e}")
@@ -11299,7 +11554,7 @@ async def aduel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Тайм-аут автоотмены для pending
     if context.job_queue:
         context.job_queue.run_once(
-            _duel_pending_timeout_job,
+            conf_bound(_duel_pending_timeout_job),
             when=DUEL_PENDING_TIMEOUT_MIN * 60,
             data={'duel_id': duel_id},
             name=f"duel_pending_{duel_id}",
@@ -11371,7 +11626,7 @@ def _schedule_turn_timeout(context: ContextTypes.DEFAULT_TYPE, duel_id: int, tur
     if not context.job_queue:
         return
     context.job_queue.run_once(
-        _duel_turn_timeout_job,
+        conf_bound(_duel_turn_timeout_job),
         when=DUEL_TURN_TIMEOUT_MIN * 60,
         data={'duel_id': duel_id, 'expected_turn': turn_user_id},
         name=f"duel_turn_{duel_id}_{turn_user_id}_{int(now_msk().timestamp())}",
@@ -11841,7 +12096,7 @@ async def acubes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if context.job_queue:
         context.job_queue.run_once(
-            _cube_pending_timeout_job,
+            conf_bound(_cube_pending_timeout_job),
             when=CUBE_PENDING_TIMEOUT_MIN * 60,
             data={'cube_id': cube_id},
             name=f"cube_pending_{cube_id}",
@@ -11888,7 +12143,7 @@ async def _run_cube_battle(context: ContextTypes.DEFAULT_TYPE, cube_id: int):
     n2 = p2['nick'] if p2 else f"id {cube['p2_id']}"
     chat_id = cube['chat_id']
     # В конференции броски летят в игровой топик; в ЛС — без указания топика.
-    dice_extra = {'message_thread_id': GAMES_ALLOWED_TOPIC_ID} if chat_id == CONFERENCE_CHAT_ID else {}
+    dice_extra = {'message_thread_id': conf_topic('games')} if chat_id == conf_chat() else {}
     
     # === Этап 1: сообщение про первый бросок ===
     stage1_text = f"🎲 Первый бросок кубика совершает {n1}"
@@ -12473,7 +12728,7 @@ async def achangelog_publish(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Шлём в конференцию
     published_message_id = None
     try:
-        sent = await context.bot.send_message(chat_id=CONFERENCE_CHAT_ID, text=text)
+        sent = await context.bot.send_message(chat_id=conf_chat(), text=text)
         published_message_id = sent.message_id
     except Exception as e:
         logger.error(f"changelog publish to conference failed: {e}")
@@ -13227,7 +13482,7 @@ async def startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
     # в боте (кто-то в конфе не регистрировался, кто-то зарегистрирован, но вышел).
     conf_line = ""
     try:
-        conf_count = await context.bot.get_chat_member_count(CONFERENCE_CHAT_ID)
+        conf_count = await context.bot.get_chat_member_count(conf_chat())
         conf_line = f"\n🏛 Участников в конфе: {conf_count}"
     except Exception as e:
         logger.debug(f"startup conf member count failed: {e}")
@@ -13598,16 +13853,16 @@ async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     message_id = None
     try:
         sent = await context.bot.send_message(
-            chat_id=CONFERENCE_CHAT_ID,
+            chat_id=conf_chat(),
             text=card_text,
-            message_thread_id=VERDICT_TOPIC_ID,
+            message_thread_id=conf_topic('verdict'),
         )
         message_id = sent.message_id
         if media:
             # Медиа летят в тот же топик, что и карточка
             await forward_report_media(
-                context, CONFERENCE_CHAT_ID, media,
-                message_thread_id=VERDICT_TOPIC_ID,
+                context, conf_chat(), media,
+                message_thread_id=conf_topic('verdict'),
             )
     except Exception as e:
         logger.error(f"apunish publish failed: {e}")
@@ -14766,6 +15021,624 @@ def run_webapp():
         logger.error(f"webapp: не удалось запустить сервер: {e}")
 
 
+# ============ МУЛЬТИКОНФЕРЕНЦИИ: КОМАНДЫ ============
+
+def _can_manage_conf(user_id: int) -> bool:
+    """Настройки текущей конфы — главный админ или спецдопуск в ЭТОЙ конфе."""
+    return is_main_admin(user_id) or has_special_access(user_id)
+
+
+def _conf_kb(user_id: int) -> InlineKeyboardMarkup:
+    active_id = current_conf()['id']
+    rows = []
+    for conf in confs_of_user(user_id):
+        mark = "✅ " if conf['id'] == active_id else ""
+        rows.append([InlineKeyboardButton(f"{mark}🏛 {conf_title(conf)}", callback_data=f"conf:sw:{conf['id']}")])
+    rows.append([InlineKeyboardButton("➕ Регистрация в другой конференции", callback_data="conf:reg")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def aconf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Мои конференции: в ЛС — переключение активной, в группе — какая это конфа."""
+    user_id = update.effective_user.id
+    if not is_private_chat(update):
+        conf = conf_for_chat(update.effective_chat.id)
+        if not conf:
+            await update.message.reply_text("ℹ️ Этот чат не подключён как конференция (/confnew).")
+            return
+        await update.message.reply_text(
+            "🏛 КОНФЕРЕНЦИЯ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📛 {conf_title(conf)} (#{conf['id']})\n"
+            f"📝 Регистрация: {'открыта' if conf.get('reg_open') else 'закрыта'}\n"
+            f"🔗 Связка: {('#' + str(conf['link_group'])) if conf.get('link_group') else 'нет'}"
+        )
+        return
+
+    mine = confs_of_user(user_id)
+    text = "🌐 МОИ КОНФЕРЕНЦИИ\n━━━━━━━━━━━━━━━━━\n"
+    if mine:
+        text += (f"Сейчас активна: {conf_title()}\n"
+                 "Команды в ЛС (/profile, жалобы и т.д.) относятся к активной.\n"
+                 "Нажмите на конференцию, чтобы переключиться.")
+    else:
+        text += "Вы пока не зарегистрированы ни в одной конференции."
+    await update.message.reply_text(text, reply_markup=_conf_kb(user_id))
+
+
+async def aconf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """conf:sw:<id> — переключить активную конфу."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    try:
+        conf = get_conf(int(query.data.split(":")[2]))
+    except (ValueError, IndexError):
+        conf = None
+    if not conf or not is_registered_in(conf, user_id):
+        await query.answer("❌ Вы не зарегистрированы в этой конференции.", show_alert=True)
+        return
+    set_active_conf(user_id, conf['id'])
+    activate_conf(conf)
+    await query.answer(f"Активна: {conf_title(conf)}")
+    try:
+        await query.edit_message_text(
+            "🌐 МОИ КОНФЕРЕНЦИИ\n━━━━━━━━━━━━━━━━━\n"
+            f"✅ Активна: {conf_title(conf)}\n"
+            "Меню обновлено — /start",
+            reply_markup=_conf_kb(user_id),
+        )
+    except Exception:
+        pass
+
+
+async def aconfnew(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/confnew [название] — подключить текущий чат как новую конференцию."""
+    user_id = update.effective_user.id
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Только главный админ.")
+        return
+    chat = update.effective_chat
+    if chat.type == 'private':
+        await update.message.reply_text("❌ Выполните /confnew в чате, который станет конференцией.")
+        return
+    if conf_for_chat(chat.id):
+        await update.message.reply_text("❌ Этот чат уже подключён как конференция.")
+        return
+    title = ' '.join(context.args or []).strip() or (chat.title or f"Конфа {chat.id}")
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # schema_name заполняем временным уникальным значением, потом — conf_<id>
+    c.execute('''INSERT INTO public.g_conferences (chat_id, title, schema_name, reg_open, created_at)
+                 VALUES (?, ?, ?, 1, ?)''', (chat.id, title, f"pending_{abs(chat.id)}", now_msk_str()))
+    c.execute('SELECT id FROM public.g_conferences WHERE chat_id = ?', (chat.id,))
+    conf_id = c.fetchone()[0]
+    schema = f"conf_{conf_id}"
+    c.execute('UPDATE public.g_conferences SET schema_name = ? WHERE id = ?', (schema, conf_id))
+    conn.commit()
+    conn.close()
+
+    try:
+        sqlite3.create_schema(schema)
+        reload_conferences()
+        with using_conf(get_conf(conf_id)):
+            init_database()
+            reload_blocked_users()
+        sqlite3.invalidate_table_cache()
+    except Exception as e:
+        logger.error(f"confnew: {e}")
+        await update.message.reply_text(f"❌ Не удалось создать базу конференции: {e}")
+        return
+
+    log_action(user_id, 'conf_new', None, f"#{conf_id} {title} chat={chat.id}")
+    await update.message.reply_text(
+        "🏛 КОНФЕРЕНЦИЯ ПОДКЛЮЧЕНА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📛 {title} (#{conf_id})\n"
+        "📦 Своя база: пользователи, ранги, отделы, жалобы — всё отдельно\n"
+        "📝 Регистрация открыта (в ЛС бота → «📝 Регистрация»)\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Дальше:\n"
+        "/department add <название> — отделы\n"
+        "/rankname <0-7> <название> — названия рангов\n"
+        "/confset — топики, название, регистрация\n"
+        "/global — связать с другими конференциями"
+    )
+
+
+_TOPIC_KEYS = {'verdict': 'verdict_topic', 'games': 'games_topic', 'poll': 'poll_topic'}
+
+
+async def aconfset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/confset — настройки текущей конференции."""
+    user_id = update.effective_user.id
+    if not _can_manage_conf(user_id):
+        await update.message.reply_text("❌ Главный админ или спецдопуск.")
+        return
+    conf = current_conf()
+    args = list(context.args or [])
+
+    def topic_str(v):
+        return f"топик {v}" if v else "общий чат"
+
+    if not args:
+        await update.message.reply_text(
+            "⚙️ НАСТРОЙКИ КОНФЕРЕНЦИИ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📛 Название: {conf_title(conf)}\n"
+            f"📝 Регистрация: {'открыта' if conf.get('reg_open') else 'закрыта'}\n"
+            f"⚖️ Вердикты/выговоры: {topic_str(conf.get('verdict_topic'))}\n"
+            f"🎮 Игры: {topic_str(conf.get('games_topic')) if conf.get('games_topic') else 'везде'}\n"
+            f"🗳 Голосования: {topic_str(conf.get('poll_topic'))}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "/confset title <название>\n"
+            "/confset reg on|off\n"
+            "/confset verdict|games|poll here|off|<id топика>\n"
+            "   here — топик, в котором написана команда"
+        )
+        return
+
+    key = args[0].lower()
+    if key == 'title' and len(args) >= 2:
+        column, value = 'title', ' '.join(args[1:]).strip()
+        shown = value
+    elif key == 'reg' and len(args) >= 2 and args[1].lower() in ('on', 'off'):
+        column, value = 'reg_open', 1 if args[1].lower() == 'on' else 0
+        shown = 'открыта' if value else 'закрыта'
+    elif key in _TOPIC_KEYS and len(args) >= 2:
+        column = _TOPIC_KEYS[key]
+        arg = args[1].lower()
+        if arg == 'here':
+            value = update.message.message_thread_id if update.message.is_topic_message else None
+            if value is None:
+                await update.message.reply_text("❌ Команда написана не в топике. Напишите её в нужном топике.")
+                return
+        elif arg == 'off':
+            value = None
+        elif arg.isdigit():
+            value = int(arg)
+        else:
+            await update.message.reply_text("❌ Укажите here, off или номер топика.")
+            return
+        shown = topic_str(value)
+    else:
+        await update.message.reply_text("❌ Неизвестный параметр. /confset — список.")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(f'UPDATE public.g_conferences SET {column} = ? WHERE id = ?', (value, conf['id']))
+    conn.commit()
+    conn.close()
+    reload_conferences()
+    activate_conf(get_conf(conf['id']))
+    log_action(user_id, 'conf_set', None, f"#{conf['id']} {column}={value}")
+    await update.message.reply_text(f"✅ {conf_title()}: {key} → {shown}")
+
+
+async def aconflist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Все конференции бота (главный админ)."""
+    if not is_main_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Только главный админ.")
+        return
+    lines = ["🏛 КОНФЕРЕНЦИИ", "━━━━━━━━━━━━━━━━━"]
+    for conf in all_conferences():
+        with using_conf(conf):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('SELECT COUNT(*) FROM users')
+            n = c.fetchone()[0]
+            conn.close()
+        link = f"🔗 #{conf['link_group']}" if conf.get('link_group') else "🔗 —"
+        reg = "📝 откр." if conf.get('reg_open') else "📝 закр."
+        main = " ⭐" if is_main_conf(conf) else ""
+        lines.append(f"#{conf['id']} {conf_title(conf)}{main}\n   👥 {n} · {reg} · {link} · 🆔 {conf['chat_id']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ─── Глобальные связки ───
+
+def _link_group_title(group_id) -> str:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT title FROM public.g_link_groups WHERE id = ?', (group_id,))
+    row = c.fetchone()
+    conn.close()
+    return (row[0] if row and row[0] else f"Связка #{group_id}")
+
+
+def _set_conf_link(conf_id: int, group_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE public.g_conferences SET link_group = ? WHERE id = ?', (group_id, conf_id))
+    conn.commit()
+    conn.close()
+    reload_conferences()
+
+
+async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Глобальные связки конференций. Связанные конфы делят ЧС (/gban) и
+    глобальные команды (/gwarn, /gmute …). Всё остальное у каждой своё.
+      /global create [название] — создать связку и добавить в неё эту беседу
+      /global add <id связки>   — добавить эту беседу в связку
+      /global remove            — убрать эту беседу из связки
+      /global info              — информация о связке
+    В ЛС команды действуют на активную конфу.
+    """
+    user_id = update.effective_user.id
+    args = list(context.args or [])
+    action = args[0].lower() if args else ''
+    conf = current_conf()
+
+    if action == 'info' or not action:
+        if not action:
+            await update.message.reply_text(
+                "🔗 ГЛОБАЛЬНЫЕ СВЯЗКИ\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "/global create [название] — создать глобальную связку\n"
+                "/global add <id> — добавить беседу в глобальную связку\n"
+                "/global remove — удалить беседу из глобальной связки\n"
+                "/global info — информация о глобальной связке\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Связанные беседы делят ЧС (/gban) и глобальные команды:\n"
+                "/gwarn /gunwarn /gmute /gunmute /gkick /gunban /gblock /gunblock /gbinfo"
+            )
+            return
+        if not conf.get('link_group'):
+            await update.message.reply_text(f"ℹ️ «{conf_title(conf)}» не состоит в глобальной связке.")
+            return
+        gid = conf['link_group']
+        members = linked_confs(conf)
+        lines = [
+            "🔗 ГЛОБАЛЬНАЯ СВЯЗКА",
+            "━━━━━━━━━━━━━━━━━",
+            f"📛 {_link_group_title(gid)} (id {gid})",
+            f"🏛 Бесед: {len(members)}",
+            "━━━━━━━━━━━━━━━━━",
+        ]
+        lines += [f"{'▶️' if m['id'] == conf['id'] else '•'} {conf_title(m)} (#{m['id']})" for m in members]
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if not is_main_admin(user_id):
+        await update.message.reply_text("❌ Создавать и менять связки может только главный админ.")
+        return
+    if not conf.get('id'):
+        await update.message.reply_text("❌ Конференция не определена.")
+        return
+
+    if action == 'create':
+        if conf.get('link_group'):
+            await update.message.reply_text(
+                f"❌ «{conf_title(conf)}» уже в связке id {conf['link_group']}. Сначала /global remove."
+            )
+            return
+        title = ' '.join(args[1:]).strip()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO public.g_link_groups (title, created_by, created_at) VALUES (?, ?, ?)',
+                  (title, user_id, now_msk_str()))
+        c.execute('SELECT MAX(id) FROM public.g_link_groups')
+        gid = c.fetchone()[0]
+        conn.commit()
+        conn.close()
+        _set_conf_link(conf['id'], gid)
+        log_action(user_id, 'global_create', None, f"group={gid} conf=#{conf['id']}")
+        await update.message.reply_text(
+            "🔗 СВЯЗКА СОЗДАНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📛 {title or f'Связка #{gid}'}\n"
+            f"🆔 id связки: {gid}\n"
+            f"🏛 Добавлена: {conf_title(conf)}\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"В другой беседе: /global add {gid}"
+        )
+        return
+
+    if action == 'add':
+        if len(args) < 2 or not args[1].isdigit():
+            await update.message.reply_text("❌ /global add <id связки>")
+            return
+        gid = int(args[1])
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM public.g_link_groups WHERE id = ?', (gid,))
+        exists = c.fetchone() is not None
+        conn.close()
+        if not exists:
+            await update.message.reply_text("❌ Связки с таким id нет. /global create — создать.")
+            return
+        if conf.get('link_group') == gid:
+            await update.message.reply_text("ℹ️ Эта беседа уже в этой связке.")
+            return
+        _set_conf_link(conf['id'], gid)
+        sync_gban_group(gid)
+        log_action(user_id, 'global_add', None, f"group={gid} conf=#{conf['id']}")
+        members = [conf_title(m) for m in all_conferences() if m.get('link_group') == gid]
+        await update.message.reply_text(
+            "🔗 БЕСЕДА ДОБАВЛЕНА В СВЯЗКУ\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📛 {_link_group_title(gid)} (id {gid})\n"
+            f"🏛 В связке: {', '.join(members)}\n"
+            "🚫 ЧС бесед связки объединён"
+        )
+        return
+
+    if action == 'remove':
+        if not conf.get('link_group'):
+            await update.message.reply_text("ℹ️ Эта беседа не в связке.")
+            return
+        gid = conf['link_group']
+        _set_conf_link(conf['id'], None)
+        log_action(user_id, 'global_remove', None, f"group={gid} conf=#{conf['id']}")
+        await update.message.reply_text(
+            f"✅ «{conf_title(conf)}» удалена из связки «{_link_group_title(gid)}».\n"
+            "ЧС беседы сохранён как есть, новые баны связки сюда больше не приходят."
+        )
+        return
+
+    await update.message.reply_text("❌ /global create | add | remove | info")
+
+
+# ─── Глобальные команды ───
+
+async def _resolve_global_target(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str, confs: list):
+    """Найти user_id по @username / ID / нику — в любой из конф связки."""
+    if token.lstrip('-').isdigit():
+        return int(token)
+    for conf in confs:
+        with using_conf(conf):
+            found = extract_user_id(update, context, token, ignore_reply=True)
+        if isinstance(found, int) and found > 0:
+            return found
+    if token.startswith('@') or 't.me/' in token:
+        found = await get_target_id(update, context, '@' + token.split('t.me/')[-1].lstrip('@'))
+        if isinstance(found, int) and found > 0:
+            return found
+    return None
+
+
+def make_global_command(local_name: str, handler):
+    """Глобальная версия команды: выполняет handler в каждой конфе связки, где
+    цель зарегистрирована. Права проверяет сам handler — в каждой конфе свои
+    (нужен достаточный ранг в каждой беседе)."""
+    async def run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        confs = linked_confs()
+        if len(confs) < 2:
+            await update.message.reply_text(
+                f"ℹ️ Эта беседа не в глобальной связке — используйте /{local_name} (связки: /global)."
+            )
+            return
+        args = list(context.args or [])
+        is_reply = _is_real_reply(update.message) and update.message.reply_to_message.from_user
+        if is_reply:
+            target_id = update.message.reply_to_message.from_user.id
+            rest = args
+        elif args:
+            target_id = await _resolve_global_target(update, context, args[0], confs)
+            rest = args[1:]
+        else:
+            target_id, rest = None, []
+        if not target_id:
+            await update.message.reply_text(f"❌ Использование: /g{local_name} <@user|ID> … (или ответом на сообщение)")
+            return
+
+        skipped = []
+        try:
+            for conf in confs:
+                if not is_registered_in(conf, target_id):
+                    skipped.append(conf_title(conf))
+                    continue
+                await update.message.reply_text(f"🌐 {conf_title(conf)}:")
+                with using_conf(conf, global_run=True):
+                    context.args = rest if is_reply else [str(target_id)] + rest
+                    try:
+                        await handler(update, context)
+                    except Exception as e:
+                        logger.error(f"g{local_name} [{conf_title(conf)}]: {e}")
+                        await update.message.reply_text(f"❌ Ошибка: {e}")
+        finally:
+            context.args = args
+        if skipped:
+            await update.message.reply_text("⚪ Не зарегистрирован в: " + ", ".join(skipped))
+    run.__name__ = f"ag{local_name}"
+    return run
+
+
+async def agbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/gbinfo <user> — информация о пользователе во всех беседах, где он состоит."""
+    user_id = update.effective_user.id
+    if not (has_permission(user_id, 'warn', 'gbinfo') or is_main_admin(user_id)):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    # Главный админ видит все конфы бота, остальные — свою связку
+    confs = all_conferences() if is_main_admin(user_id) else linked_confs()
+    args = list(context.args or [])
+    if _is_real_reply(update.message) and update.message.reply_to_message.from_user:
+        target_id = update.message.reply_to_message.from_user.id
+    elif args:
+        target_id = await _resolve_global_target(update, context, args[0], confs)
+    else:
+        target_id = None
+    if not target_id:
+        await update.message.reply_text("❌ Использование: /gbinfo <@user|ID|ник> (или ответом на сообщение)")
+        return
+
+    blocks = []
+    for conf in confs:
+        with using_conf(conf):
+            ud = get_user_data(target_id)
+            if not ud:
+                continue
+            in_chat = await _is_chat_member(context, conf['chat_id'], target_id)
+            gb = check_gban(target_id)
+            flags = []
+            if ud['ban_status'] != 'Нет':
+                flags.append(f"⛔ Бан: {ud['ban_reason'] or 'да'}")
+            if gb['is_banned']:
+                flags.append(f"🚫 ЧС: {gb['reason']}")
+            if ud['bot_blocked'] == 'Да':
+                flags.append("🔌 Отключён от бота")
+            if ud['special_access'] == 'Да':
+                flags.append("🔐 Спецдопуск")
+            blocks.append(
+                f"🏛 {conf_title(conf)}\n"
+                f"👤 {ud['nick']} ({ud['callsign']})\n"
+                f"⭐ {RANKS.get(ud['rank'], RANKS[0])['name']}\n"
+                f"📁 {ud['departments_str']}\n"
+                f"⚠️ Предупреждения: {ud['warns']}\n"
+                f"💬 В беседе: {'да' if in_chat else 'нет'}"
+                + ("\n" + "\n".join(flags) if flags else "")
+            )
+    if not blocks:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован ни в одной доступной беседе.")
+        return
+    text = (
+        "🌐 ГЛОБАЛЬНАЯ ИНФОРМАЦИЯ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"🆔 {target_id} · бесед: {len(blocks)}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        + "\n━━━━━━━━━━━━━━━━━\n".join(blocks)
+    )
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
+# ─── Названия рангов конфы ───
+
+async def arankname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/rankname — названия рангов этой конфы; /rankname <0-7> <название|сброс>."""
+    user_id = update.effective_user.id
+    args = list(context.args or [])
+    if not args:
+        lines = [f"⭐ РАНГИ — {conf_title()}", "━━━━━━━━━━━━━━━━━"]
+        lines += [f"{k}. {v['name']}" for k, v in sorted(RANKS.items())]
+        lines += ["━━━━━━━━━━━━━━━━━", "/rankname <0-7> <название> — переименовать",
+                  "/rankname <0-7> сброс — вернуть стандартное",
+                  "Права по уровням одинаковы во всех конференциях."]
+        await update.message.reply_text("\n".join(lines))
+        return
+    if not _can_manage_conf(user_id):
+        await update.message.reply_text("❌ Главный админ или спецдопуск.")
+        return
+    if len(args) < 2 or not args[0].isdigit() or int(args[0]) not in DEFAULT_RANKS:
+        await update.message.reply_text("❌ /rankname <0-7> <название>")
+        return
+    rank = int(args[0])
+    name = ' '.join(args[1:]).strip()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM rank_names WHERE rank = ?', (rank,))
+    if name.lower() not in ('сброс', 'reset'):
+        c.execute('INSERT INTO rank_names (rank, name) VALUES (?, ?)', (rank, name))
+    conn.commit()
+    conn.close()
+    RANKS.invalidate()
+    log_action(user_id, 'rank_name', None, f"{rank} → {name}")
+    await update.message.reply_text(f"✅ Ранг {rank}: {RANKS[rank]['name']}")
+
+
+# ─── Дополнительные отделы ───
+
+async def _dept_target(update: Update, context: ContextTypes.DEFAULT_TYPE, usage: str):
+    """Разбор «<user> <номер>» или «(reply) <номер>». Возвращает (target_id, dept) или (None, None)."""
+    args = list(context.args or [])
+    depts = get_departments()
+    deps_text = "\n".join(f"{i}. {d}" for i, d in enumerate(depts, 1)) or "— нет отделов"
+    if _is_real_reply(update.message):
+        target_id = update.message.reply_to_message.from_user.id
+        num = _first_int_in_args(args)
+    elif len(args) >= 2:
+        target_id = extract_user_id(update, context, args[0])
+        num = _first_int_in_args(args[1:])
+    else:
+        target_id, num = None, None
+    if num is None:
+        await update.message.reply_text(f"❌ {usage}\n\n📁 Отделы:\n{deps_text}")
+        return None, None
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if not await validate_target(update, target_id):
+        return None, None
+    if not (1 <= num <= len(depts)):
+        await update.message.reply_text(f"❌ Неверный номер отдела. Допустимо: 1..{len(depts)}.")
+        return None, None
+    if not get_user_data(target_id):
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в этой конференции.")
+        return None, None
+    return target_id, depts[num - 1]
+
+
+async def aadddept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/adddept <user> <номер> — добавить человеку ещё один отдел (основной не меняется)."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks', 'adddept'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    target_id, dept = await _dept_target(update, context, "Использование: /adddept <@user|ID> <номер отдела>")
+    if not target_id:
+        return
+    td = get_user_data(target_id)
+    if dept in td['departments']:
+        await update.message.reply_text(f"ℹ️ {td['nick']} уже в отделе «{dept}».")
+        return
+    if td['department'] in ('', 'Не назначен', None):
+        # Основного отдела нет — новый становится основным
+        update_user_department(target_id, dept)
+    else:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO user_departments (user_id, department) VALUES (?, ?)', (target_id, dept))
+        conn.commit()
+        conn.close()
+    log_action(user_id, 'dept_add', target_id, dept)
+    td = get_user_data(target_id)
+    await update.message.reply_text(
+        "📁 ОТДЕЛ ДОБАВЛЕН\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {td['nick']}\n"
+        f"➕ {dept}\n"
+        f"📁 Все отделы: {td['departments_str']}"
+    )
+
+
+async def adeldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/deldept <user> <номер> — убрать человека из отдела."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks', 'deldept'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    target_id, dept = await _dept_target(update, context, "Использование: /deldept <@user|ID> <номер отдела>")
+    if not target_id:
+        return
+    td = get_user_data(target_id)
+    if dept not in td['departments']:
+        await update.message.reply_text(f"ℹ️ {td['nick']} не состоит в отделе «{dept}».")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if td['department'] == dept:
+        # Убираем основной: основным становится первый из дополнительных
+        extras = get_extra_departments(target_id)
+        new_primary = extras[0] if extras else 'Не назначен'
+        c.execute('UPDATE users SET department = ? WHERE user_id = ?', (new_primary, target_id))
+        c.execute('DELETE FROM user_departments WHERE user_id = ? AND department = ?', (target_id, new_primary))
+    else:
+        c.execute('DELETE FROM user_departments WHERE user_id = ? AND department = ?', (target_id, dept))
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'dept_del', target_id, dept)
+    td = get_user_data(target_id)
+    await update.message.reply_text(
+        "📁 ОТДЕЛ УБРАН\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {td['nick']}\n"
+        f"➖ {dept}\n"
+        f"📁 Отделы: {td['departments_str']}"
+    )
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -14792,17 +15665,31 @@ def main():
     except Exception as e:
         logger.error(f"Автоперенос не выполнен: {e}")
     
-    init_database()
-    reload_blocked_users()
-    reload_branch_chat()
+    # Реестр конференций, затем схема и миграции КАЖДОЙ конференции.
+    init_conference_registry()
+    for conf in all_conferences():
+        if conf['schema_name'] != MAIN_SCHEMA:
+            sqlite3.create_schema(conf['schema_name'])
+        with using_conf(conf):
+            init_database()
+            reload_blocked_users()
+    sqlite3.invalidate_table_cache()
+    logger.info(f"Конференций: {len(all_conferences())}")
     # Mini App «Личное дело» — отдельный поток, использует уже поднятый пул БД.
     threading.Thread(target=run_webapp, daemon=True, name="webapp").start()
-    application = Application.builder().token(BOT_TOKEN).build()
+    # ConfTrackingBot запоминает, из какой конфы ушли сообщения с кнопками в ЛС
+    application = Application.builder().bot(ConfTrackingBot(token=BOT_TOKEN)).build()
+    # Самым первым для каждого апдейта — выбор текущей конференции
+    application.add_handler(TypeHandler(Update, conf_router), group=-100)
     
     # Регистрация
     reg_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration)],
+        entry_points=[
+            MessageHandler(filters.Regex('^📝 Регистрация$'), start_registration),
+            CallbackQueryHandler(start_registration, pattern=r'^conf:reg$'),
+        ],
         states={
+            REG_CONF: [CallbackQueryHandler(reg_choose_conf, pattern=r'^regconf:\d+$')],
             GAME_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_game_nick)],
             CALLSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_registration)]
         },
@@ -14829,8 +15716,14 @@ def main():
         'department': adepartment, 'setalldept': asetalldept,
         'test': atest, 'find': find, 
         'findsetup': afindsetup,
-        'branch': abranch, 'bfind': bfind, 'bdept': abdept, 'bsetdept': absetdept,
         'pm': apm,
+        'conf': aconf, 'confnew': aconfnew, 'confset': aconfset, 'conflist': aconflist,
+        'global': aglobal, 'gbinfo': agbinfo, 'rankname': arankname,
+        'adddept': aadddept, 'deldept': adeldept,
+        'gwarn': make_global_command('warn', awarn), 'gunwarn': make_global_command('unwarn', aunwarn),
+        'gmute': make_global_command('mute', amute), 'gunmute': make_global_command('unmute', aunmute),
+        'gkick': make_global_command('kick', akick), 'gunban': make_global_command('unban', aunban),
+        'gblock': make_global_command('block', ablock), 'gunblock': make_global_command('unblock', aunblock),
         'tgadmin': atgadmin, 'tgunadmin': atgunadmin, 'tgadmins': atgadmins,
         'award': aaward, 'awards_of': aawards_of, 'award_del': aaward_del,
         'dept_list': adept_list, 'dept_rename': adept_rename, 'dept_move': adept_move,
@@ -15001,7 +15894,8 @@ def main():
     application.add_handler(CallbackQueryHandler(cube_callback, pattern=r'^cube:'))
     # Настройка видимости отделов в /find
     application.add_handler(CallbackQueryHandler(afindsetup_callback, pattern=r'^findsetup:'))
-    application.add_handler(CallbackQueryHandler(bfind_callback, pattern=r'^bfind:'))
+    application.add_handler(CallbackQueryHandler(find_page_callback, pattern=r'^findpg:'))
+    application.add_handler(CallbackQueryHandler(aconf_callback, pattern=r'^conf:sw:'))
     # Справка: переключение разделов кнопками
     application.add_handler(CallbackQueryHandler(ahelp_callback, pattern=r'^help:'))
     # Идеи: ответы юзеров и решения админов
@@ -15030,17 +15924,17 @@ def main():
     application.add_handler(CallbackQueryHandler(word_trigger_callback, pattern=r'^wtrig:'))
 
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
-    application.job_queue.run_repeating(expire_warnings_job, interval=3600, first=30)
+    application.job_queue.run_repeating(per_conf_job(expire_warnings_job), interval=3600, first=30)
     # Авто-разбан временных банов: проверяем каждые 5 минут.
-    application.job_queue.run_repeating(auto_unban_job, interval=300, first=45)
+    application.job_queue.run_repeating(per_conf_job(auto_unban_job), interval=300, first=45)
     # Главный преступник дня — ежедневно в 21:00 МСК
     application.job_queue.run_daily(
-        daily_criminal_job,
+        per_conf_job(daily_criminal_job),
         time=time(hour=21, minute=0, tzinfo=MSK),
     )
     # Итоги недели — воскресенье в 22:00 МСК (день 6 в datetime.weekday)
     application.job_queue.run_daily(
-        weekly_criminal_job,
+        per_conf_job(weekly_criminal_job),
         time=time(hour=22, minute=0, tzinfo=MSK),
         days=(6,),
     )
@@ -15049,7 +15943,7 @@ def main():
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
-        weekly_rank_check,
+        per_conf_job(weekly_rank_check),
         time=time(hour=8, minute=0, tzinfo=MSK),
         days=(6,),
     )
