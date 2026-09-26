@@ -1191,6 +1191,28 @@ def init_database():
             c.execute(col_sql)
         except sqlite3.OperationalError:
             pass
+
+    # Настройки бота «ключ → значение» (сейчас: ID чата-ветки).
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    # Отделы ветки — отдельный от основных departments набор, чтобы не
+    # затрагивать /setdept, /find основной конфы и Mini App.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS branch_departments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            sort_order INTEGER DEFAULT 0
+        )
+    ''')
+    # Отдел пользователя в ветке. '' = не состоит в ветке.
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN branch_department TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     
     # Заполняем начальные департаменты если таблица пуста
     c.execute('SELECT COUNT(*) FROM departments')
@@ -2180,7 +2202,7 @@ HELP_SECTIONS = [
         ("setdept",    "<user> <номер>",       "изменить отдел", 5),
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
         ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
-        ("tagall",     "<текст>",              "тегнуть всех активных", 5),
+        ("tagall",     "<текст>",              "тегнуть всех активных; гиперссылки сохраняются, ответом на файл — с вложением", 5),
         ("department", "add|remove|rename|list|find", "управление отделами", 5),
         ("setalldept", "<номер>",              "перевести всех в отдел", 5),
         ("setallrank", "<0-7>",                "выставить всем ранг", "main"),
@@ -2200,6 +2222,10 @@ HELP_SECTIONS = [
         ("dept_group_assign", "<dept_id> <group_id|0>", "привязать отдел к группе", "spec"),
         ("dept_apply_template", "confirm",     "применить шаблон отделов", "spec"),
         ("findsetup",  "",                     "настроить видимость отделов в /find", "main"),
+        ("bfind",      "",                     "состав ветки (листается по 10)", 0),
+        ("bdept",      "list|add|remove|rename|move", "отделы ветки", 5),
+        ("bsetdept",   "<user> <номер|0>",     "отдел в ветке; 0 — убрать из ветки", 5),
+        ("branch",     "set|off",              "привязать чат-ветку (выполнять в нём)", "spec"),
     ]),
 
     ("system", "⚙️", "Система", [
@@ -5439,6 +5465,10 @@ async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Руководящий состав. Отделы группируются по department_groups и сортируются по sort_order."""
+    # В чате-ветке /find показывает состав ветки (свои отделы, листается).
+    if _is_branch_chat(update):
+        await bfind(update, context)
+        return
     user_data = get_user_data(update.effective_user.id)
     if not user_data:
         await update.message.reply_text("❌ Вы не зарегистрированы.")
@@ -5601,6 +5631,352 @@ async def afindsetup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     await query.answer()
+
+
+# ============ ВЕТКА: ВТОРАЯ КОНФЕРЕНЦИЯ СО СВОИМИ ОТДЕЛАМИ ============
+# Тот же бот и та же БД, но в чате-ветке /find показывает свой состав:
+# отделы из branch_departments, отдел человека — users.branch_department.
+# Чат-ветка привязывается командой /branch set прямо в этом чате.
+
+BRANCH_FIND_PAGE_SIZE = 10          # человек на одной странице /find ветки
+
+# ID чата-ветки в памяти, чтобы не лезть в БД на каждый /find. None = не привязан.
+branch_chat_id = None
+
+
+def reload_branch_chat():
+    """Перечитать ID чата-ветки из bot_settings в память."""
+    global branch_chat_id
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT value FROM bot_settings WHERE key = 'branch_chat_id'")
+        row = c.fetchone()
+        conn.close()
+        branch_chat_id = int(row[0]) if row and row[0] else None
+    except Exception as e:
+        logger.error(f"reload_branch_chat error: {e}")
+        branch_chat_id = None
+
+
+def _set_branch_chat(chat_id):
+    """Сохранить (или сбросить при None) ID чата-ветки."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM bot_settings WHERE key = 'branch_chat_id'")
+    if chat_id is not None:
+        c.execute("INSERT INTO bot_settings (key, value) VALUES ('branch_chat_id', ?)", (str(chat_id),))
+    conn.commit()
+    conn.close()
+    reload_branch_chat()
+
+
+def _is_branch_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return branch_chat_id is not None and chat is not None and chat.id == branch_chat_id
+
+
+def get_branch_departments() -> list:
+    """Отделы ветки в порядке отображения."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT name FROM branch_departments ORDER BY COALESCE(sort_order, id), id')
+    depts = [r[0] for r in c.fetchall()]
+    conn.close()
+    return depts
+
+
+def _branch_find_pages() -> tuple:
+    """Состав ветки, нарезанный на страницы по BRANCH_FIND_PAGE_SIZE человек.
+    Возвращает (pages, total), где pages — список готовых текстов."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    entries = []  # (отдел, ник, название ранга)
+    for dept in get_branch_departments():
+        c.execute(
+            '''SELECT game_nick, rank FROM users
+               WHERE branch_department = ? AND ban_status = 'Нет'
+               ORDER BY rank DESC, game_nick''',
+            (dept,),
+        )
+        for nick, rank in c.fetchall():
+            entries.append((dept, nick, RANKS.get(rank, RANKS[0])['name']))
+    conn.close()
+
+    total = len(entries)
+    chunks = [entries[i:i + BRANCH_FIND_PAGE_SIZE]
+              for i in range(0, total, BRANCH_FIND_PAGE_SIZE)] or [[]]
+    pages = []
+    for num, chunk in enumerate(chunks, 1):
+        text = "👥 СОСТАВ\n━━━━━━━━━━━━━━━━━\n"
+        if not chunk:
+            text += "Пока никого нет.\n"
+        prev_dept = None
+        for dept, nick, rank_name in chunk:
+            if dept != prev_dept:
+                if prev_dept is not None:
+                    text += "\n"
+                text += f"📁 {dept}:\n"
+                prev_dept = dept
+            text += f"├ {nick} — {rank_name}\n"
+        text += (
+            "━━━━━━━━━━━━━━━━━\n"
+            f"📄 Страница {num}/{len(chunks)} · 👥 Всего: {total}"
+        )
+        pages.append(text)
+    return pages, total
+
+
+def _branch_find_kb(page: int, pages_count: int):
+    """Кнопки листания; None, если страница одна."""
+    if pages_count <= 1:
+        return None
+    prev_page = (page - 1) % pages_count
+    next_page = (page + 1) % pages_count
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("◀️", callback_data=f"bfind:{prev_page}"),
+        InlineKeyboardButton(f"{page + 1}/{pages_count}", callback_data="bfind:noop"),
+        InlineKeyboardButton("▶️", callback_data=f"bfind:{next_page}"),
+    ]])
+
+
+async def bfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Состав ветки с листанием по страницам. В чате-ветке вызывается и через /find."""
+    if not get_user_data(update.effective_user.id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    pages, _total = _branch_find_pages()
+    await update.message.reply_text(pages[0], reply_markup=_branch_find_kb(0, len(pages)))
+
+
+async def bfind_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки ◀️ / ▶️ под /find ветки. Состав перечитывается при каждом нажатии."""
+    query = update.callback_query
+    arg = (query.data or "").split(":", 1)[-1]
+    if arg == 'noop':
+        await query.answer()
+        return
+    if not get_user_data(query.from_user.id):
+        await query.answer("❌ Вы не зарегистрированы.", show_alert=True)
+        return
+    try:
+        page = int(arg)
+    except ValueError:
+        await query.answer()
+        return
+    pages, _total = _branch_find_pages()
+    page = max(0, min(page, len(pages) - 1))
+    await query.answer()
+    try:
+        await query.edit_message_text(pages[page], reply_markup=_branch_find_kb(page, len(pages)))
+    except Exception:
+        pass  # «message is not modified» — состав не изменился
+
+
+async def abranch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Привязка чата-ветки: /branch set (в самом чате), /branch off, /branch — статус."""
+    user_id = update.effective_user.id
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
+        await update.message.reply_text("❌ Команда доступна главному админу или со спецдоступом.")
+        return
+
+    action = (context.args[0].lower() if context.args else '')
+    chat = update.effective_chat
+
+    if action == 'set':
+        if chat.type == 'private':
+            await update.message.reply_text("❌ Выполните /branch set в самом чате, который станет веткой.")
+            return
+        if chat.id == CONFERENCE_CHAT_ID:
+            await update.message.reply_text("❌ Основная конференция не может быть веткой.")
+            return
+        _set_branch_chat(chat.id)
+        log_action(user_id, 'branch_set', None, f"chat_id={chat.id}")
+        await update.message.reply_text(
+            "🌿 ВЕТКА ПРИВЯЗАНА\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"💬 Чат: {chat.title or chat.id}\n"
+            "📁 /find здесь показывает отделы ветки\n"
+            "📣 /tagall здесь тегает только состав ветки\n"
+            "━━━━━━━━━━━━━━━━━"
+        )
+        return
+
+    if action == 'off':
+        _set_branch_chat(None)
+        log_action(user_id, 'branch_off', None, "")
+        await update.message.reply_text("✅ Ветка отвязана. /find везде показывает основной состав.")
+        return
+
+    status = f"🆔 {branch_chat_id}" if branch_chat_id else "не привязана"
+    await update.message.reply_text(
+        "🌿 ВЕТКА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"💬 Чат-ветка: {status}\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "/branch set — сделать веткой текущий чат\n"
+        "/branch off — отвязать\n"
+        "/bdept — отделы ветки\n"
+        "/bsetdept <user> <номер|0> — отдел человека в ветке\n"
+        "/bfind — состав ветки"
+    )
+
+
+async def abdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отделы ветки: list/add/remove/rename/move."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks', 'bdept'):
+        await update.message.reply_text("❌ С 5 ранга.")
+        return
+
+    usage = (
+        "📁 ОТДЕЛЫ ВЕТКИ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "/bdept list — список\n"
+        "/bdept add <название>\n"
+        "/bdept remove <номер>\n"
+        "/bdept rename <номер> <новое название>\n"
+        "/bdept move <номер> <новая позиция>"
+    )
+    if not context.args:
+        await update.message.reply_text(usage)
+        return
+
+    action = context.args[0].lower()
+    depts = get_branch_departments()
+
+    def _num(i):
+        try:
+            n = int(context.args[i])
+        except (IndexError, ValueError):
+            return None
+        return n if 1 <= n <= len(depts) else None
+
+    if action == 'list':
+        if not depts:
+            await update.message.reply_text("ℹ️ Отделов ветки пока нет. /bdept add <название>")
+            return
+        text = "📁 ОТДЕЛЫ ВЕТКИ\n━━━━━━━━━━━━━━━━━\n"
+        text += "\n".join(f"{i}. {d}" for i, d in enumerate(depts, 1))
+        await update.message.reply_text(text)
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        if action == 'add' and len(context.args) >= 2:
+            name = ' '.join(context.args[1:]).strip()
+            if name in depts:
+                await update.message.reply_text("❌ Такой отдел уже есть.")
+                return
+            # Новый отдел — в конец списка
+            c.execute('SELECT COALESCE(MAX(sort_order), 0) FROM branch_departments')
+            next_order = (c.fetchone()[0] or 0) + 1
+            c.execute('INSERT INTO branch_departments (name, sort_order) VALUES (?, ?)',
+                      (name, next_order))
+            conn.commit()
+            log_action(user_id, 'branch_dept_add', None, name)
+            await update.message.reply_text(f"✅ Отдел ветки «{name}» добавлен.")
+
+        elif action == 'remove' and _num(1):
+            name = depts[_num(1) - 1]
+            c.execute("UPDATE users SET branch_department = '' WHERE branch_department = ?", (name,))
+            c.execute('DELETE FROM branch_departments WHERE name = ?', (name,))
+            conn.commit()
+            log_action(user_id, 'branch_dept_remove', None, name)
+            await update.message.reply_text(f"✅ Отдел ветки «{name}» удалён, его состав выведен из ветки.")
+
+        elif action == 'rename' and _num(1) and len(context.args) >= 3:
+            old_name = depts[_num(1) - 1]
+            new_name = ' '.join(context.args[2:]).strip()
+            if new_name in depts:
+                await update.message.reply_text("❌ Такой отдел уже есть.")
+                return
+            c.execute('UPDATE users SET branch_department = ? WHERE branch_department = ?', (new_name, old_name))
+            c.execute('UPDATE branch_departments SET name = ? WHERE name = ?', (new_name, old_name))
+            conn.commit()
+            log_action(user_id, 'branch_dept_rename', None, f"{old_name} → {new_name}")
+            await update.message.reply_text(f"✅ «{old_name}» → «{new_name}»")
+
+        elif action == 'move' and _num(1) and _num(2):
+            order = list(depts)
+            name = order.pop(_num(1) - 1)
+            order.insert(_num(2) - 1, name)
+            for pos, d in enumerate(order, 1):
+                c.execute('UPDATE branch_departments SET sort_order = ? WHERE name = ?', (pos, d))
+            conn.commit()
+            await update.message.reply_text(
+                "✅ Порядок обновлён:\n" + "\n".join(f"{i}. {d}" for i, d in enumerate(order, 1))
+            )
+
+        else:
+            await update.message.reply_text(usage)
+    finally:
+        conn.close()
+
+
+async def absetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Назначить отдел ветки: /bsetdept <user> <номер>, 0 — убрать из ветки. Работает и ответом."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'manage_ranks', 'bsetdept'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+
+    args = list(context.args or [])
+    depts = get_branch_departments()
+    deps_text = "\n".join(f"{i}. {d}" for i, d in enumerate(depts, 1)) or "— пока нет, /bdept add"
+
+    if _is_real_reply(update.message):
+        target_id = update.message.reply_to_message.from_user.id
+        dept_num = _first_int_in_args(args)
+    elif len(args) >= 2:
+        target_id = extract_user_id(update, context, args[0])
+        dept_num = _first_int_in_args(args[1:])
+    else:
+        target_id, dept_num = None, None
+
+    if dept_num is None:
+        await update.message.reply_text(
+            "❌ Использование: /bsetdept <@user|ID> <номер>\n"
+            "   (или ответом на сообщение) /bsetdept <номер>\n"
+            "   0 — убрать из ветки\n\n"
+            f"📁 Отделы ветки:\n{deps_text}"
+        )
+        return
+
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id is None:
+        await update.message.reply_text("❌ Пользователь не найден. Укажите @username, ID, или ответьте на сообщение.")
+        return
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений по нику. Уточните @username или ID.")
+        return
+
+    if dept_num != 0 and not (1 <= dept_num <= len(depts)):
+        await update.message.reply_text(f"❌ Неверный номер отдела. Допустимо: 0..{len(depts)}.")
+        return
+
+    target_data = get_user_data(target_id)
+    if not target_data:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в боте.")
+        return
+
+    new_dept = depts[dept_num - 1] if dept_num else ''
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE users SET branch_department = ? WHERE user_id = ?', (new_dept, target_id))
+    conn.commit()
+    conn.close()
+
+    log_action(user_id, 'branch_dept_change', target_id, new_dept or '— (убран из ветки)')
+    await update.message.reply_text(
+        "🌿 ОТДЕЛ В ВЕТКЕ\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 {target_data['nick']}\n"
+        f"📁 {new_dept or 'убран из ветки'}\n"
+        "━━━━━━━━━━━━━━━━━"
+    )
 
 
 # ============ УПРАВЛЕНИЕ ОТДЕЛАМИ И ГРУППАМИ ============
@@ -7783,6 +8159,51 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Тексты [подпись](https://...) превращаем в гиперссылку — удобно, если
+# форматирование Telegram под рукой нет.
+_MD_LINK_RE = re.compile(r'\[([^\]\n]+)\]\((https?://[^\s)"<>]+)\)')
+
+
+def _tagall_body_html(message) -> str:
+    """Текст /tagall в HTML без самой команды. Сохраняет форматирование и
+    гиперссылки, которые автор сделал средствами Telegram (text_link и т.п.)."""
+    html = message.text_html or ""
+    html = re.sub(r'^/\S+\s*', '', html, count=1).strip()
+    return _MD_LINK_RE.sub(r'<a href="\2">\1</a>', html)
+
+
+def _tagall_attachment(message):
+    """Сообщение с вложением, на которое ответили /tagall, или None."""
+    if not _is_real_reply(message):
+        return None
+    src = message.reply_to_message
+    if any((src.document, src.photo, src.video, src.audio, src.voice, src.animation)):
+        return src
+    return None
+
+
+# Лимит подписи к медиа в Telegram. Длиннее — текст уходит отдельным сообщением.
+CAPTION_LIMIT = 1024
+
+
+async def _send_text_with_attachment(bot, chat_id, html_text: str, attachment=None, **kwargs):
+    """Отправить HTML-текст; если есть вложение — копией этого вложения с текстом
+    в подписи (или текст + файл отдельно, если подпись не влезает)."""
+    if attachment is None:
+        await bot.send_message(chat_id=chat_id, text=html_text, parse_mode='HTML',
+                               disable_web_page_preview=True, **kwargs)
+        return
+    if len(html_text) <= CAPTION_LIMIT:
+        await bot.copy_message(chat_id=chat_id, from_chat_id=attachment.chat_id,
+                               message_id=attachment.message_id,
+                               caption=html_text, parse_mode='HTML', **kwargs)
+        return
+    await bot.send_message(chat_id=chat_id, text=html_text, parse_mode='HTML',
+                           disable_web_page_preview=True, **kwargs)
+    await bot.copy_message(chat_id=chat_id, from_chat_id=attachment.chat_id,
+                           message_id=attachment.message_id, **kwargs)
+
+
 async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Тегнуть вообще всех активных пользователей.
@@ -7792,36 +8213,49 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     одно чистое сообщение в чат + личное уведомление каждому в ЛС — гарантированный
     пинг без флуда чата несколькими сообщениями подряд.
 
-    Использование: /tagall <текст>
+    Гиперссылки и форматирование из текста сохраняются. Если ответить /tagall
+    на сообщение с документом/фото/видео — вложение уйдёт вместе с обращением.
+    В чате-ветке тегается только состав ветки (у кого есть отдел ветки).
+
+    Использование: /tagall <текст>  или ответом на файл: /tagall [текст]
     """
     user_id = update.effective_user.id
     if not has_permission(user_id, 'warn', 'tagall'):
         await update.message.reply_text("❌ Команда доступна с 5 ранга.")
         return
 
-    message_text = ' '.join(context.args or []).strip()
-    if not message_text:
-        await update.message.reply_text("❌ Использование: /tagall <текст>")
+    body_html = _tagall_body_html(update.message)
+    attachment = _tagall_attachment(update.message)
+    if not body_html and attachment is None:
+        await update.message.reply_text(
+            "❌ Использование: /tagall <текст>\n"
+            "📎 Чтобы приложить документ — ответьте /tagall на сообщение с файлом."
+        )
         return
 
+    in_branch = _is_branch_chat(update)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    if in_branch:
+        c.execute("""SELECT user_id FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'
+                     AND COALESCE(branch_department, '') <> ''""")
+    else:
+        c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
     members = [r[0] for r in c.fetchall()]
     conn.close()
 
     if not members:
-        await update.message.reply_text("❌ Некого тегать — нет активных пользователей.")
+        await update.message.reply_text(
+            "❌ Некого тегать — нет активных пользователей"
+            + (" с отделом ветки (/bsetdept)." if in_branch else ".")
+        )
         return
 
     issuer_name = get_admin_nick(user_id)
-    safe_msg = _html_escape(message_text)
 
-    chat_text = (
-        f"📣 ОБРАЩЕНИЕ КО ВСЕМ ОТ <b>{_html_escape(issuer_name)}</b>\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"{safe_msg}"
-    )
+    chat_text = f"📣 ОБРАЩЕНИЕ КО ВСЕМ ОТ <b>{_html_escape(issuer_name)}</b>"
+    if body_html:
+        chat_text += f"\n━━━━━━━━━━━━━━━━━\n{body_html}"
 
     out_chat = update.effective_chat.id
     going_to_conf = False
@@ -7830,12 +8264,7 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         going_to_conf = True
 
     try:
-        await context.bot.send_message(
-            chat_id=out_chat,
-            text=chat_text,
-            parse_mode='HTML',
-            disable_web_page_preview=True,
-        )
+        await _send_text_with_attachment(context.bot, out_chat, chat_text, attachment)
     except Exception as e:
         logger.error(f"atagall send error: {e}")
         await update.message.reply_text(f"❌ Не удалось отправить в чат: {e}")
@@ -7846,17 +8275,30 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dm_text = (
         "📣 Обращение ко всем\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👮 От: {issuer_name}\n"
-        f"💬 {message_text}"
+        f"👮 От: {_html_escape(issuer_name)}"
     )
-    delivered, failed = await _send_mention_dms(context, members, dm_text)
+    if body_html:
+        dm_text += f"\n💬 {body_html}"
+    delivered, failed = 0, 0
+    for tid in members:
+        if is_user_blocked(tid):
+            continue
+        try:
+            await _send_text_with_attachment(context.bot, tid, dm_text, attachment)
+            delivered += 1
+        except Exception as e:
+            logger.debug(f"tagall DM to {tid} failed: {e}")
+            failed += 1
+        # Лёгкий троттлинг чтобы не упереться в флуд-лимит Telegram
+        await asyncio.sleep(0.05)
 
     summary_chat = "конференция" if going_to_conf else "текущий чат"
     await update.message.reply_text(
         "✅ ТЕГ ВСЕХ ОТПРАВЛЕН\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👥 Активных пользователей: {len(members)}\n"
+        f"👥 {'Состав ветки' if in_branch else 'Активных пользователей'}: {len(members)}\n"
         f"📤 Сообщение → {summary_chat}\n"
+        f"📎 Вложение: {'да' if attachment else 'нет'}\n"
         f"📨 В ЛС доставлено: {delivered}\n"
         f"⛔ Не доставлено в ЛС: {failed}"
     )
@@ -14352,6 +14794,7 @@ def main():
     
     init_database()
     reload_blocked_users()
+    reload_branch_chat()
     # Mini App «Личное дело» — отдельный поток, использует уже поднятый пул БД.
     threading.Thread(target=run_webapp, daemon=True, name="webapp").start()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -14386,6 +14829,7 @@ def main():
         'department': adepartment, 'setalldept': asetalldept,
         'test': atest, 'find': find, 
         'findsetup': afindsetup,
+        'branch': abranch, 'bfind': bfind, 'bdept': abdept, 'bsetdept': absetdept,
         'pm': apm,
         'tgadmin': atgadmin, 'tgunadmin': atgunadmin, 'tgadmins': atgadmins,
         'award': aaward, 'awards_of': aawards_of, 'award_del': aaward_del,
@@ -14557,6 +15001,7 @@ def main():
     application.add_handler(CallbackQueryHandler(cube_callback, pattern=r'^cube:'))
     # Настройка видимости отделов в /find
     application.add_handler(CallbackQueryHandler(afindsetup_callback, pattern=r'^findsetup:'))
+    application.add_handler(CallbackQueryHandler(bfind_callback, pattern=r'^bfind:'))
     # Справка: переключение разделов кнопками
     application.add_handler(CallbackQueryHandler(ahelp_callback, pattern=r'^help:'))
     # Идеи: ответы юзеров и решения админов
