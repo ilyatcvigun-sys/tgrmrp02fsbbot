@@ -21,11 +21,20 @@ db_pg.py — слой совместимости SQLite → PostgreSQL для bo
     чтобы существующие блоки `except` в боте продолжали работать.
 
 Подключение берётся из переменной окружения DATABASE_URL.
+
+Мультиконференции: у каждой конференции своя схема PostgreSQL с полным набором
+таблиц (основная — `public`). Текущая схема задаётся через `set_schema()` /
+`using_schema()` (contextvar — у каждого апдейта своя), а `connect()` выставляет
+соединению `search_path` на неё. Так весь существующий код бота без правок
+работает с таблицами «своей» конференции.
 """
 
 import os
 import re
 import logging
+import contextvars
+import weakref
+from contextlib import contextmanager
 import sqlite3 as _sqlite3  # только ради классов исключений
 
 import psycopg
@@ -43,7 +52,64 @@ _pool: ConnectionPool | None = None
 
 # Кэш: у каких таблиц есть колонка `id` — нужно, чтобы решать,
 # можно ли дописывать `RETURNING id` ради эмуляции lastrowid.
-_tables_with_id: set[str] | None = None
+_tables_with_id: dict[str, set[str]] = {}
+
+# Текущая схема (конференция). Основная конференция живёт в public.
+_schema_var: contextvars.ContextVar = contextvars.ContextVar("pg_schema", default="public")
+_SCHEMA_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+# Какой search_path уже выставлен на соединении пула — чтобы не гонять SET на
+# каждый connect(). Слабые ссылки: соединение, выкинутое пулом, не держим.
+_conn_schema: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _check_schema(schema: str) -> str:
+    if not _SCHEMA_NAME_RE.match(schema or ""):
+        raise ValueError(f"Недопустимое имя схемы: {schema!r}")
+    return schema
+
+
+def get_schema() -> str:
+    return _schema_var.get()
+
+
+def set_schema(schema: str):
+    """Сделать схему текущей для этого контекста (апдейта). Возвращает токен для reset_schema."""
+    return _schema_var.set(_check_schema(schema))
+
+
+def reset_schema(token):
+    _schema_var.reset(token)
+
+
+@contextmanager
+def using_schema(schema: str):
+    """with using_schema('conf_2'): ... — временно работать с другой конференцией."""
+    token = set_schema(schema)
+    try:
+        yield
+    finally:
+        _schema_var.reset(token)
+
+
+def create_schema(schema: str):
+    """Создать схему новой конференции (если её ещё нет)."""
+    _check_schema(schema)
+    if _pool is None:
+        init_pool()
+    raw = _pool.getconn()
+    try:
+        with raw.cursor() as cur:
+            cur.execute(_pgsql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(_pgsql.Identifier(schema)))
+        raw.commit()
+    finally:
+        _pool.putconn(raw)
+    _tables_with_id.pop(schema, None)
+
+
+def invalidate_table_cache():
+    """Сбросить кэш «у каких таблиц есть id» (после создания новых таблиц)."""
+    _tables_with_id.clear()
 
 
 def init_pool(dsn: str = None, min_size: int = 1, max_size: int = 10):
@@ -218,16 +284,18 @@ _RETURNING_RE = re.compile(r"\bRETURNING\b", re.IGNORECASE)
 
 
 def _load_tables_with_id(conn) -> set:
-    global _tables_with_id
-    if _tables_with_id is not None:
-        return _tables_with_id
+    schema = _conn_schema.get(conn) or get_schema()
+    cached = _tables_with_id.get(schema)
+    if cached is not None:
+        return cached
     with conn.cursor() as cur:
         cur.execute(
             "SELECT table_name FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND column_name = 'id'"
         )
-        _tables_with_id = {r[0] for r in cur.fetchall()}
-    return _tables_with_id
+        cached = {r[0] for r in cur.fetchall()}
+    _tables_with_id[schema] = cached
+    return cached
 
 
 class Cursor:
@@ -383,8 +451,26 @@ class Connection:
             init_pool()
         self._raw = _pool.getconn()
         self._closed = False
+        self._apply_schema()
         self._use_rows = False   # включается через .row_factory
         self._row_factory = None
+
+    def _apply_schema(self):
+        """Выставить search_path соединению на текущую схему. SET сразу коммитим:
+        иначе последующий rollback в коде бота откатил бы и его."""
+        schema = get_schema()
+        try:
+            if _conn_schema.get(self._raw) == schema:
+                return
+        except TypeError:
+            pass
+        with self._raw.cursor() as cur:
+            cur.execute(_pgsql.SQL("SET search_path TO {}").format(_pgsql.Identifier(schema)))
+        self._raw.commit()
+        try:
+            _conn_schema[self._raw] = schema
+        except TypeError:
+            pass
 
     # bot.py делает: conn.row_factory = sqlite3.Row
     @property
