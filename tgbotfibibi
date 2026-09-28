@@ -125,7 +125,8 @@ _global_run: contextvars.ContextVar = contextvars.ContextVar('global_run', defau
 _conferences: dict = {}
 
 _CONF_COLUMNS = ('id', 'chat_id', 'title', 'schema_name', 'reg_open', 'link_group',
-                 'verdict_topic', 'games_topic', 'poll_topic')
+                 'verdict_topic', 'games_topic', 'poll_topic',
+                 'token_enabled', 'token_prefix', 'token_digits')
 
 
 def init_conference_registry():
@@ -146,6 +147,17 @@ def init_conference_registry():
             created_at TEXT DEFAULT ''
         )
     ''')
+    # Жетоны конфы (/regfields token): выдавать ли и в каком формате.
+    # Значения по умолчанию = прежний формат ФСБ «52XXXX».
+    for col_sql in (
+        "ALTER TABLE public.g_conferences ADD COLUMN token_enabled INTEGER DEFAULT 1",
+        "ALTER TABLE public.g_conferences ADD COLUMN token_prefix TEXT DEFAULT '52'",
+        "ALTER TABLE public.g_conferences ADD COLUMN token_digits INTEGER DEFAULT 4",
+    ):
+        try:
+            c.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass
     # Активная конфа пользователя в ЛС
     c.execute('''
         CREATE TABLE IF NOT EXISTS public.g_active_conf (
@@ -210,7 +222,8 @@ def main_conf() -> dict:
     # Реестр ещё не загружен (самый старт) — ведём себя как основная конфа
     return {'id': 0, 'chat_id': CONFERENCE_CHAT_ID, 'title': 'ФСБ', 'schema_name': MAIN_SCHEMA,
             'reg_open': 1, 'link_group': None, 'verdict_topic': VERDICT_TOPIC_ID,
-            'games_topic': GAMES_ALLOWED_TOPIC_ID, 'poll_topic': POLL_TOPIC_ID}
+            'games_topic': GAMES_ALLOWED_TOPIC_ID, 'poll_topic': POLL_TOPIC_ID,
+            'token_enabled': 1, 'token_prefix': '52', 'token_digits': 4}
 
 
 def get_conf(conf_id) -> dict:
@@ -1610,6 +1623,12 @@ def init_database():
             PRIMARY KEY (user_id, department)
         )
     ''')
+    # Жетон необязателен: в конфе можно выключить выдачу (/regfields token off).
+    # UNIQUE остаётся — у всех без жетона NULL, это не конфликт.
+    try:
+        c.execute('ALTER TABLE users ALTER COLUMN token DROP NOT NULL')
+    except sqlite3.OperationalError:
+        pass
     # Поля регистрации конфы (/regfields). Встроенные — field_key 'nick' и
     # 'callsign' (пишутся в users), свои — field_key NULL, ответы в user_fields.
     c.execute('''
@@ -1695,21 +1714,42 @@ def get_departments() -> list:
     conn.close()
     return depts
 
+def token_settings() -> tuple:
+    """(выдавать ли, префикс, число случайных цифр) — для текущей конфы."""
+    conf = current_conf()
+    enabled = conf.get('token_enabled')
+    return (enabled is None or bool(enabled),
+            conf.get('token_prefix') if conf.get('token_prefix') is not None else '52',
+            conf.get('token_digits') or 4)
+
+
+def token_format_example() -> str:
+    _enabled, prefix, digits = token_settings()
+    return f"{prefix}{'X' * digits}"
+
+
 def generate_unique_token() -> str:
-    """Генерация уникального жетона"""
+    """Генерация уникального жетона в формате текущей конфы (префикс + N цифр)."""
+    _enabled, prefix, digits = token_settings()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    attempts = 0
     while True:
-        token = f"52{''.join([str(random.randint(0, 9)) for _ in range(4)])}"
+        # Если номера формата почти кончились — удлиняем, а не крутимся вечно
+        extra = attempts // 200
+        token = prefix + ''.join(str(random.randint(0, 9)) for _ in range(digits + extra))
         c.execute('SELECT token FROM users WHERE token = ?', (token,))
         if not c.fetchone():
             conn.close()
             return token
+        attempts += 1
 
 def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_username: str = "") -> str:
-    """Добавление пользователя"""
-    if not token:
+    """Добавление пользователя. Возвращает жетон ('—', если в конфе жетоны не
+    выдаются) или None при ошибке."""
+    if not token and token_settings()[0]:
         token = generate_unique_token()
+    token = token or None
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
@@ -1721,7 +1761,7 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
         conn.commit()
         conn.close()
         _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
-        return token
+        return token or '—'
     except sqlite3.IntegrityError:
         conn.close()
         return None
@@ -1735,7 +1775,7 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
             conn.commit()
             conn.close()
             _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
-            return token
+            return token or '—'
         except sqlite3.IntegrityError:
             conn.close()
             return None
@@ -1772,7 +1812,7 @@ def get_user_data(user_id: int) -> dict:
         "user_id": g('user_id'),
         "nick": g('game_nick'),
         "callsign": g('callsign'),
-        "token": g('token'),
+        "token": g('token') or '—',
         "rank": g('rank', 0) or 0,
         "department": g('department', 'Не назначен'),
         "warns": g('warns', '0/0'),
@@ -2697,7 +2737,7 @@ HELP_SECTIONS = [
         ("setallrank", "<0-7>",                "выставить всем ранг", "main"),
         ("register",   "<user> <ник> <позывной>", "зарегистрировать пользователя", 6),
         ("forcereg",   "<user> <ник> <позывной> <жетон>", "перерегистрировать", 6),
-        ("settoken",   "<user> <52****>",      "изменить жетон", 6),
+        ("settoken",   "<user> <жетон>",       "изменить жетон", 6),
         ("setnick",    "<user> <ник>",         "изменить ник", "spec"),
         ("special",    "<user>",               "переключить спецдопуск", 7),
         ("speciallist", "",                    "у кого есть спецдопуск", 7),
@@ -2719,7 +2759,7 @@ HELP_SECTIONS = [
         ("confset",    "[параметр значение]",  "название, регистрация, топики конференции", "spec"),
         ("conflist",   "",                     "все конференции бота", "main"),
         ("rankname",   "[0-7 название]",       "названия рангов этой конференции", 0),
-        ("regfields",  "[add|on|off|req|rename|move|del]", "вопросы регистрации этой конференции", "spec"),
+        ("regfields",  "[add|on|off|req|rename|move|del|token]", "вопросы регистрации и жетоны этой конференции", "spec"),
         ("global",     "create|add|remove|info", "глобальные связки бесед", 0),
         ("gbinfo",     "<user>",               "информация о человеке во всех беседах", 5),
         ("gwarn",      "<user> <причина>",     "варн во всех беседах связки", 5),
@@ -3312,7 +3352,7 @@ async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Поиск по жетону"""
     if not context.args:
-        await update.message.reply_text("❌ Использование: /search 52****")
+        await update.message.reply_text(f"❌ Использование: /search {token_format_example()}")
         return
     
     token = context.args[0]
@@ -5710,7 +5750,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_args = list(context.args or [])
     else:
         if not context.args:
-            await update.message.reply_text("❌ /forcereg @user Ник Позывной 52****")
+            await update.message.reply_text(f"❌ /forcereg @user Ник Позывной {token_format_example()}")
             return
         target_id = extract_user_id(update, context, context.args[0])
         if isinstance(target_id, str) and target_id.startswith('@'):
@@ -5720,7 +5760,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_args = list(context.args[1:])
     
     if len(rest_args) < 3:
-        await update.message.reply_text("❌ /forcereg @user Ник Позывной 52****")
+        await update.message.reply_text(f"❌ /forcereg @user Ник Позывной {token_format_example()}")
         return
     
     game_nick = rest_args[0]
@@ -5962,7 +6002,7 @@ async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u in users[:200]:
         uid, nick, callsign, token, rank, dept, blocked = u
         prefix = "🚫 ОТКЛЮЧЁН | " if (blocked or 'Нет') == 'Да' else ""
-        lines.append(f"{prefix}🆔 {uid} | {nick} | {callsign} | 🎫 {token} | ⭐ {rank} | 📁 {dept}")
+        lines.append(f"{prefix}🆔 {uid} | {nick} | {callsign} | 🎫 {token or '—'} | ⭐ {rank} | 📁 {dept}")
     
     text = header + "\n".join(lines)
     if len(users) > 200:
@@ -6593,7 +6633,7 @@ async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_token = context.args[0] if context.args else None
     else:
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /settoken @user 52****")
+            await update.message.reply_text(f"❌ /settoken @user {token_format_example()}")
             return
         target_id = extract_user_id(update, context, context.args[0])
         new_token = context.args[1]
@@ -9761,7 +9801,10 @@ def _regfields_text() -> str:
             tags.append("необяз.")
         tag = f" ({', '.join(tags)})" if tags else ""
         lines.append(f"{i}. {mark} {f['title']}{tag}\n    ❓ {f['prompt']}")
+    enabled, _prefix, _digits = token_settings()
     lines += [
+        "━━━━━━━━━━━━━━━━━",
+        f"🎫 Жетон: {'выдаётся автоматически, формат ' + token_format_example() if enabled else 'не выдаётся'}",
         "━━━━━━━━━━━━━━━━━",
         "/regfields add <название> | <вопрос>",
         "/regfields on|off <номер> — включить/выключить",
@@ -9769,9 +9812,47 @@ def _regfields_text() -> str:
         "/regfields rename <номер> <название> | <вопрос>",
         "/regfields move <номер> <позиция>",
         "/regfields del <номер> — удалить своё поле",
+        "/regfields token on|off — выдавать ли жетон",
+        "/regfields token format <префикс|-> <цифр> — формат жетона",
         "Ник выключен → берётся имя из Telegram.",
     ]
     return "\n".join(lines)
+
+
+async def _regfields_token(update: Update, args: list):
+    """/regfields token on|off  и  /regfields token format <префикс|-> <цифр>."""
+    conf = current_conf()
+    sub = args[0].lower() if args else ''
+    if sub in ('on', 'off'):
+        updates = {'token_enabled': 1 if sub == 'on' else 0}
+    elif sub == 'format' and len(args) >= 3 and args[2].isdigit():
+        prefix = '' if args[1] in ('-', '—') else args[1]
+        digits = int(args[2])
+        if not (2 <= digits <= 10) or len(prefix) > 10 or not re.fullmatch(r'[0-9A-Za-zА-Яа-яЁё_-]*', prefix):
+            await update.message.reply_text("❌ Префикс — до 10 букв/цифр (или «-» без префикса), цифр — от 2 до 10.")
+            return
+        updates = {'token_prefix': prefix, 'token_digits': digits}
+    else:
+        await update.message.reply_text(
+            "❌ /regfields token on|off\n"
+            "   /regfields token format <префикс|-> <цифр>\n"
+            "Пример: /regfields token format 77 4 → 77XXXX"
+        )
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    for column, value in updates.items():
+        c.execute(f'UPDATE public.g_conferences SET {column} = ? WHERE id = ?', (value, conf['id']))
+    conn.commit()
+    conn.close()
+    reload_conferences()
+    activate_conf(get_conf(conf['id']) or conf)
+    log_action(update.effective_user.id, 'reg_token', None, ' '.join(args)[:100])
+    enabled = token_settings()[0]
+    await update.message.reply_text(
+        f"✅ Жетон: {'выдаётся, формат ' + token_format_example() if enabled else 'не выдаётся'}.\n"
+        "Уже выданные жетоны не меняются."
+    )
 
 
 async def aregfields(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9786,6 +9867,9 @@ async def aregfields(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     action = args[0].lower()
+    if action == 'token':
+        await _regfields_token(update, args[1:])
+        return
     fields = get_reg_fields()
     rest = ' '.join(args[1:]).strip()
 
@@ -10046,7 +10130,9 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     if by_key.get('callsign'):
         lines.append(f"📻 {callsign}")
     lines += [f"📋 {f['title']}: {v}" for f, v in custom if v]
-    lines += [f"🎫 {token}", f"⭐ {RANKS[0]['name']}"]
+    if token != '—':
+        lines.append(f"🎫 {token}")
+    lines.append(f"⭐ {RANKS[0]['name']}")
     await reply("✅ Готово!\n\n" + "\n".join(lines))
 
     # Уведомление в лог-группу и генералам (6+)
