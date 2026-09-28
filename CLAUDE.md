@@ -319,6 +319,11 @@ PostgreSQL строже SQLite. Уже исправлено, не сломай �
 пишутся в `users` (можно выключить, нельзя удалить; ник выключен → имя из
 Telegram, позывной → `'—'`), свои — в `user_fields` и выводятся в профилях
 через `extra_fields_text()`. Необязательное поле пропускается ответом «-».
+Жетоны — тоже в `/regfields` (`token on|off`, `token format <префикс|-> <цифр>`),
+настройки в `public.g_conferences` (`token_enabled/prefix/digits`, по умолчанию
+`52` + 4 цифры), читать через `token_settings()`. Жетон выключен → в
+`users.token` пишется NULL (колонка без NOT NULL), `add_user` и
+`get_user_data` отдают `'—'`.
 
 **Ранги:** уровни 0–7 и права по ним общие, названия — свои в каждой конфе
 (`rank_names`, `/rankname`). `DEFAULT_RANKS` — названия по умолчанию.
