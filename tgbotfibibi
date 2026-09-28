@@ -49,9 +49,8 @@ def now_msk_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-GAME_NICK, CALLSIGN = range(2)
-# Шаг 0 регистрации — выбор конференции
-REG_CONF = 40
+# Регистрация: выбор конференции, затем поля этой конфы по очереди (/regfields)
+REG_CONF, REG_FIELD = 40, 41
 REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMAND = range(13, 18)
 # States для /punish (форма выдачи наказания, только в личке).
 PUNISH_VIOLATOR, PUNISH_VIOLATION, PUNISH_EVIDENCE, PUNISH_FACTION, PUNISH_WARNS, PUNISH_CONFIRM = range(20, 26)
@@ -1611,6 +1610,33 @@ def init_database():
             PRIMARY KEY (user_id, department)
         )
     ''')
+    # Поля регистрации конфы (/regfields). Встроенные — field_key 'nick' и
+    # 'callsign' (пишутся в users), свои — field_key NULL, ответы в user_fields.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS reg_fields (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            field_key TEXT UNIQUE,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            required INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0
+        )
+    ''')
+    c.execute('SELECT COUNT(*) FROM reg_fields')
+    if c.fetchone()[0] == 0:
+        c.execute('''INSERT INTO reg_fields (field_key, title, prompt, sort_order)
+                     VALUES ('nick', 'Игровой ник', 'Игровой ник:', 1)''')
+        c.execute('''INSERT INTO reg_fields (field_key, title, prompt, sort_order)
+                     VALUES ('callsign', 'Позывной', 'Позывной:', 2)''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_fields (
+            user_id INTEGER NOT NULL,
+            field_id INTEGER NOT NULL,
+            value TEXT DEFAULT '',
+            PRIMARY KEY (user_id, field_id)
+        )
+    ''')
 
     # Заполняем начальные департаменты если таблица пуста — только в основной
     # конфе: новые конфы заводят свои отделы сами (/department add).
@@ -2693,6 +2719,7 @@ HELP_SECTIONS = [
         ("confset",    "[параметр значение]",  "название, регистрация, топики конференции", "spec"),
         ("conflist",   "",                     "все конференции бота", "main"),
         ("rankname",   "[0-7 название]",       "названия рангов этой конференции", 0),
+        ("regfields",  "[add|on|off|req|rename|move|del]", "вопросы регистрации этой конференции", "spec"),
         ("global",     "create|add|remove|info", "глобальные связки бесед", 0),
         ("gbinfo",     "<user>",               "информация о человеке во всех беседах", 5),
         ("gwarn",      "<user> <причина>",     "варн во всех беседах связки", 5),
@@ -2953,6 +2980,7 @@ async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['departments_str']}\n"
         f"⚠️ Предупреждения: {user_data['warns']}\n"
+        f"{extra_fields_text(user_id)}"
         "━━━━━━━━━━━━━━━━━\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
@@ -6546,6 +6574,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎮 Ник: {user_data['nick']}\n📻 Позывной: {user_data['callsign']}\n"
         f"🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['departments_str']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
+        f"{extra_fields_text(target_id)}"
         f"🏅 Наград: {award_count}\n{special_text}{notes_line}🆔 ID: {user_data['user_id']}\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
     )
@@ -9675,6 +9704,160 @@ async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ РЕГИСТРАЦИЯ ============
 
+# ============ НАСТРАИВАЕМАЯ РЕГИСТРАЦИЯ ============
+# У каждой конфы свой список вопросов регистрации (таблица reg_fields).
+# Встроенные: 'nick' → users.game_nick, 'callsign' → users.callsign — их можно
+# выключить, но не удалить. Свои поля — любые, ответы в user_fields.
+
+def get_reg_fields(enabled_only: bool = False) -> list:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, field_key, title, prompt, enabled, required FROM reg_fields '
+              'ORDER BY COALESCE(sort_order, id), id')
+    rows = [dict(zip(('id', 'field_key', 'title', 'prompt', 'enabled', 'required'), r)) for r in c.fetchall()]
+    conn.close()
+    return [f for f in rows if f['enabled']] if enabled_only else rows
+
+
+def save_user_fields(user_id: int, values: dict):
+    """values: {field_id: ответ}. Пустые ответы не храним."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    for field_id, value in values.items():
+        c.execute('DELETE FROM user_fields WHERE user_id = ? AND field_id = ?', (user_id, field_id))
+        if value:
+            c.execute('INSERT INTO user_fields (user_id, field_id, value) VALUES (?, ?, ?)',
+                      (user_id, field_id, value))
+    conn.commit()
+    conn.close()
+
+
+def get_user_extra_fields(user_id: int) -> list:
+    """[(название, ответ)] своих полей регистрации — для профилей."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''SELECT f.title, uf.value FROM user_fields uf
+                 JOIN reg_fields f ON f.id = uf.field_id
+                 WHERE uf.user_id = ? AND uf.value <> ''
+                 ORDER BY COALESCE(f.sort_order, f.id), f.id''', (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def extra_fields_text(user_id: int) -> str:
+    """Строки «📋 Поле: ответ» с переводом строки в конце (или пустая строка)."""
+    return "".join(f"📋 {t}: {v}\n" for t, v in get_user_extra_fields(user_id))
+
+
+def _regfields_text() -> str:
+    lines = [f"📝 ПОЛЯ РЕГИСТРАЦИИ — {conf_title()}", "━━━━━━━━━━━━━━━━━"]
+    for i, f in enumerate(get_reg_fields(), 1):
+        mark = "✅" if f['enabled'] else "⬜"
+        tags = []
+        if f['field_key']:
+            tags.append("встроенное")
+        if not f['required']:
+            tags.append("необяз.")
+        tag = f" ({', '.join(tags)})" if tags else ""
+        lines.append(f"{i}. {mark} {f['title']}{tag}\n    ❓ {f['prompt']}")
+    lines += [
+        "━━━━━━━━━━━━━━━━━",
+        "/regfields add <название> | <вопрос>",
+        "/regfields on|off <номер> — включить/выключить",
+        "/regfields req <номер> — обязательное/необязательное",
+        "/regfields rename <номер> <название> | <вопрос>",
+        "/regfields move <номер> <позиция>",
+        "/regfields del <номер> — удалить своё поле",
+        "Ник выключен → берётся имя из Telegram.",
+    ]
+    return "\n".join(lines)
+
+
+async def aregfields(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройка вопросов регистрации текущей конфы."""
+    user_id = update.effective_user.id
+    if not _can_manage_conf(user_id):
+        await update.message.reply_text("❌ Главный админ или спецдопуск.")
+        return
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text(_regfields_text())
+        return
+
+    action = args[0].lower()
+    fields = get_reg_fields()
+    rest = ' '.join(args[1:]).strip()
+
+    def pick(i=1):
+        try:
+            n = int(args[i])
+        except (IndexError, ValueError):
+            return None
+        return fields[n - 1] if 1 <= n <= len(fields) else None
+
+    def split_title_prompt(text):
+        title, _, prompt = text.partition('|')
+        title, prompt = title.strip(), prompt.strip()
+        return title, (prompt or f"{title}:")
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        if action == 'add' and rest:
+            title, prompt = split_title_prompt(rest)
+            if not title:
+                await update.message.reply_text("❌ /regfields add <название> | <вопрос>")
+                return
+            c.execute('SELECT COALESCE(MAX(sort_order), 0) FROM reg_fields')
+            next_order = (c.fetchone()[0] or 0) + 1
+            c.execute('INSERT INTO reg_fields (title, prompt, sort_order) VALUES (?, ?, ?)',
+                      (title, prompt, next_order))
+            done = f"✅ Поле «{title}» добавлено."
+
+        elif action in ('on', 'off') and pick():
+            f = pick()
+            c.execute('UPDATE reg_fields SET enabled = ? WHERE id = ?', (1 if action == 'on' else 0, f['id']))
+            done = f"✅ «{f['title']}» {'включено' if action == 'on' else 'выключено'}."
+
+        elif action == 'req' and pick():
+            f = pick()
+            c.execute('UPDATE reg_fields SET required = 1 - COALESCE(required, 1) WHERE id = ?', (f['id'],))
+            done = f"✅ «{f['title']}»: {'необязательное' if f['required'] else 'обязательное'}."
+
+        elif action == 'rename' and pick() and len(args) >= 3:
+            f = pick()
+            title, prompt = split_title_prompt(' '.join(args[2:]))
+            c.execute('UPDATE reg_fields SET title = ?, prompt = ? WHERE id = ?', (title, prompt, f['id']))
+            done = f"✅ «{f['title']}» → «{title}»."
+
+        elif action == 'move' and pick() and pick(2):
+            order = [f['id'] for f in fields]
+            moved = order.pop(order.index(pick()['id']))
+            order.insert(int(args[2]) - 1, moved)
+            for pos, fid in enumerate(order, 1):
+                c.execute('UPDATE reg_fields SET sort_order = ? WHERE id = ?', (pos, fid))
+            done = "✅ Порядок обновлён."
+
+        elif action == 'del' and pick():
+            f = pick()
+            if f['field_key']:
+                await update.message.reply_text("❌ Встроенное поле нельзя удалить — только выключить: /regfields off <номер>")
+                return
+            c.execute('DELETE FROM user_fields WHERE field_id = ?', (f['id'],))
+            c.execute('DELETE FROM reg_fields WHERE id = ?', (f['id'],))
+            done = f"✅ Поле «{f['title']}» и ответы на него удалены."
+
+        else:
+            await update.message.reply_text(_regfields_text())
+            return
+        conn.commit()
+    finally:
+        conn.close()
+    log_action(user_id, 'reg_fields', None, ' '.join(args)[:200])
+    await update.message.reply_text(done + "\n\n" + _regfields_text())
+
+
 async def _is_chat_member(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id: int) -> bool:
     """Состоит ли пользователь в чате конфы прямо сейчас."""
     if not chat_id:
@@ -9760,17 +9943,48 @@ async def reg_choose_conf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_active_conf(user_id, conf['id'])
     activate_conf(conf)
     context.user_data['reg_conf_id'] = conf['id']
+    context.user_data['reg_fields'] = get_reg_fields(enabled_only=True)
+    context.user_data['reg_answers'] = {}
     try:
         await query.edit_message_text(f"📝 РЕГИСТРАЦИЯ\n━━━━━━━━━━━━━━━━━\n🏛 Конференция: {conf_title(conf)}")
     except Exception:
         pass
-    await query.message.reply_text("📝 Шаг 1/2 — Игровой ник:")
-    return GAME_NICK
+    return await _reg_next(update, context)
 
-async def get_game_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['game_nick'] = update.message.text
-    await update.message.reply_text("Шаг 2/2 — Позывной:")
-    return CALLSIGN
+
+async def _reg_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Задать следующий вопрос регистрации или завершить, если вопросы кончились."""
+    fields = context.user_data.get('reg_fields') or []
+    answers = context.user_data.get('reg_answers') or {}
+    idx = len(answers)
+    if idx >= len(fields):
+        return await complete_registration(update, context)
+    field = fields[idx]
+    text = f"📝 Шаг {idx + 1}/{len(fields)} — {field['prompt']}"
+    if not field['required']:
+        text += "\n(необязательно — отправьте «-», чтобы пропустить)"
+    await update.effective_message.reply_text(text)
+    return REG_FIELD
+
+
+async def reg_field_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответ на очередной вопрос регистрации."""
+    fields = context.user_data.get('reg_fields') or []
+    answers = context.user_data.setdefault('reg_answers', {})
+    if len(answers) >= len(fields):
+        return await complete_registration(update, context)
+    field = fields[len(answers)]
+    value = (update.message.text or '').strip()
+    if value in ('-', '—') and not field['required']:
+        value = ''
+    elif not value or value in ('-', '—'):
+        await update.message.reply_text("❌ Это поле обязательное. Введите ответ:")
+        return REG_FIELD
+    if len(value) > 200:
+        await update.message.reply_text("❌ Слишком длинно (максимум 200 символов). Ещё раз:")
+        return REG_FIELD
+    answers[field['id']] = value
+    return await _reg_next(update, context)
 
 async def notify_new_registration(context: ContextTypes.DEFAULT_TYPE, text: str):
     """
@@ -9803,38 +10017,59 @@ async def notify_new_registration(context: ContextTypes.DEFAULT_TYPE, text: str)
 
 
 async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершение регистрации"""
-    callsign = update.message.text
+    """Завершение регистрации: встроенные поля — в users, свои — в user_fields."""
     user_id = update.effective_user.id
     tg_username = update.effective_user.username or ""
     conf = get_conf(context.user_data.get('reg_conf_id'))
     if conf:
         activate_conf(conf)
+    reply = update.effective_message.reply_text
     if get_user_data(user_id):
-        await update.message.reply_text("❌ Вы уже зарегистрированы в этой конференции.")
+        await reply("❌ Вы уже зарегистрированы в этой конференции.")
         return ConversationHandler.END
-    token = add_user(user_id, context.user_data['game_nick'], callsign, tg_username=tg_username)
+
+    fields = context.user_data.get('reg_fields') or []
+    answers = context.user_data.get('reg_answers') or {}
+    by_key = {f['field_key']: answers.get(f['id'], '') for f in fields if f['field_key']}
+    # Поле ника выключено или пропущено — берём имя из Telegram
+    game_nick = by_key.get('nick') or update.effective_user.full_name or f"User {user_id}"
+    callsign = by_key.get('callsign') or '—'
+
+    token = add_user(user_id, game_nick, callsign, tg_username=tg_username)
     if not token:
-        await update.message.reply_text("❌ Ошибка регистрации. Попробуйте позже.")
+        await reply("❌ Ошибка регистрации. Попробуйте позже.")
         return ConversationHandler.END
-    await update.message.reply_text(
-        f"✅ Готово!\n\n🏛 {conf_title()}\n🎮 {context.user_data['game_nick']}\n📻 {callsign}\n🎫 {token}\n⭐ {RANKS[0]['name']}"
-    )
-    
+    custom = [(f, answers.get(f['id'], '')) for f in fields if not f['field_key']]
+    save_user_fields(user_id, {f['id']: v for f, v in custom})
+
+    lines = [f"🏛 {conf_title()}", f"🎮 {game_nick}"]
+    if by_key.get('callsign'):
+        lines.append(f"📻 {callsign}")
+    lines += [f"📋 {f['title']}: {v}" for f, v in custom if v]
+    lines += [f"🎫 {token}", f"⭐ {RANKS[0]['name']}"]
+    await reply("✅ Готово!\n\n" + "\n".join(lines))
+
     # Уведомление в лог-группу и генералам (6+)
     uname = f"@{tg_username}" if tg_username else "—"
+    extra = "".join(f"📋 {f['title']}: {v or '—'}\n" for f, v in custom)
     await notify_new_registration(context, (
         "🆕 НОВАЯ РЕГИСТРАЦИЯ\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"🏛 Конференция: {conf_title()}\n"
-        f"🎮 Ник: {context.user_data['game_nick']}\n"
+        f"🎮 Ник: {game_nick}\n"
         f"📻 Позывной: {callsign}\n"
+        f"{extra}"
         f"🎫 Жетон: {token}\n"
         f"🔗 {uname} · 🆔 {user_id}\n"
         f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
     ))
-    
-    await start(update, context)
+    for key in ('reg_fields', 'reg_answers', 'reg_conf_id'):
+        context.user_data.pop(key, None)
+
+    if update.message:
+        await start(update, context)
+    else:
+        await reply("Главное меню — /start")
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15141,6 +15376,7 @@ async def aconfnew(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Дальше:\n"
         "/department add <название> — отделы\n"
         "/rankname <0-7> <название> — названия рангов\n"
+        "/regfields — вопросы регистрации\n"
         "/confset — топики, название, регистрация\n"
         "/global — связать с другими конференциями"
     )
@@ -15488,6 +15724,7 @@ async def agbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⭐ {RANKS.get(ud['rank'], RANKS[0])['name']}\n"
                 f"📁 {ud['departments_str']}\n"
                 f"⚠️ Предупреждения: {ud['warns']}\n"
+                f"{extra_fields_text(target_id)}"
                 f"💬 В беседе: {'да' if in_chat else 'нет'}"
                 + ("\n" + "\n".join(flags) if flags else "")
             )
@@ -15690,8 +15927,7 @@ def main():
         ],
         states={
             REG_CONF: [CallbackQueryHandler(reg_choose_conf, pattern=r'^regconf:\d+$')],
-            GAME_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_game_nick)],
-            CALLSIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, complete_registration)]
+            REG_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_field_answer)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
@@ -15717,7 +15953,7 @@ def main():
         'test': atest, 'find': find, 
         'findsetup': afindsetup,
         'pm': apm,
-        'conf': aconf, 'confnew': aconfnew, 'confset': aconfset, 'conflist': aconflist,
+        'conf': aconf, 'confnew': aconfnew, 'regfields': aregfields, 'confset': aconfset, 'conflist': aconflist,
         'global': aglobal, 'gbinfo': agbinfo, 'rankname': arankname,
         'adddept': aadddept, 'deldept': adeldept,
         'gwarn': make_global_command('warn', awarn), 'gunwarn': make_global_command('unwarn', aunwarn),
