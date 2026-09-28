@@ -1855,6 +1855,57 @@ def departments_display(user_id: int, primary: str) -> str:
     return ", ".join(user_departments_list(user_id, primary))
 
 
+# ─── Что показывать о человеке: позывной и жетон — только если они есть в
+# регистрации этой конфы (/regfields). Выключены → строки не выводятся.
+
+_builtin_fields_cache = {}   # схема → {'nick': 1, 'callsign': 0, ...}
+
+
+def _builtin_field_enabled(key: str) -> bool:
+    schema = sqlite3.get_schema()
+    fields = _builtin_fields_cache.get(schema)
+    if fields is None:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('SELECT field_key, enabled FROM reg_fields WHERE field_key IS NOT NULL')
+            fields = {k: v for k, v in c.fetchall()}
+            conn.close()
+        except Exception:
+            return True   # таблицы ещё нет — ведём себя как раньше
+        _builtin_fields_cache[schema] = fields
+    return bool(fields.get(key, 1))
+
+
+def invalidate_builtin_fields_cache():
+    _builtin_fields_cache.pop(sqlite3.get_schema(), None)
+
+
+def callsign_shown() -> bool:
+    return _builtin_field_enabled('callsign')
+
+
+def token_shown() -> bool:
+    return token_settings()[0]
+
+
+def with_callsign(nick, callsign) -> str:
+    """«Ник (Позывной)» или просто «Ник», если позывного в этой конфе нет."""
+    if callsign_shown() and callsign and callsign != '—':
+        return f"{nick} ({callsign})"
+    return f"{nick}"
+
+
+def cs_line(callsign, label: str = "📻 Позывной: ", suffix: str = "") -> str:
+    """Строка с позывным (с \\n) или пустая строка."""
+    return f"{label}{callsign}{suffix}\n" if callsign_shown() else ""
+
+
+def tk_line(token, label: str = "🎫 Жетон: ", suffix: str = "") -> str:
+    """Строка с жетоном (с \\n) или пустая строка."""
+    return f"{label}{token}{suffix}\n" if token_shown() else ""
+
+
 # SQL-условие «человек состоит в отделе ?» с учётом дополнительных отделов.
 # Параметр отдела передаётся ДВАЖДЫ: (dept, dept).
 IN_DEPT_SQL = "(department = ? OR user_id IN (SELECT user_id FROM user_departments WHERE department = ?))"
@@ -2625,8 +2676,8 @@ async def ainfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎮 БОТ КОНФЕРЕНЦИИ\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"📻 Позывной: {user_data['callsign']}\n"
-        f"🎫 Жетон: {user_data['token']}\n"
+        f"{cs_line(user_data['callsign'])}"
+        f"{tk_line(user_data['token'])}"
         f"⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['departments_str']}"
         f"{flags_line}"
@@ -2858,7 +2909,7 @@ def _help_header(user_id: int, user_data: dict, sections, special: bool) -> str:
     if user_data:
         name = user_data['nick']
         callsign = user_data.get('callsign')
-        who = f"{name}" + (f" ({callsign})" if callsign else "")
+        who = with_callsign(name, callsign)
         rank_name = RANKS.get(user_data['rank'], RANKS[0])['name']
     else:
         who = "не зарегистрирован"
@@ -3015,8 +3066,8 @@ async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 ВАШ ПРОФИЛЬ\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"🎮 Ник: {user_data['nick']}\n"
-        f"📻 Позывной: {user_data['callsign']}\n"
-        f"🎫 Жетон: {user_data['token']}\n"
+        f"{cs_line(user_data['callsign'])}"
+        f"{tk_line(user_data['token'])}"
         f"⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['departments_str']}\n"
         f"⚠️ Предупреждения: {user_data['warns']}\n"
@@ -3294,7 +3345,7 @@ async def anick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"🔍 ПОИСК: «{nickname}»\n━━━━━━━━━━━━━━━━━\n"
         for u in users[:20]:
             text += (
-                f"🎮 {u[1]} | 📻 {u[2]}\n"
+                f"🎮 {u[1]}{(' | 📻 ' + str(u[2])) if callsign_shown() else ''}\n"
                 f"⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
                 f"📁 {u[5]}\n"
                 f"🆔 {u[0]}\n"
@@ -3323,8 +3374,8 @@ async def auserlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     header = f"📋 СПИСОК УЧАСТНИКОВ ({len(users)})\n━━━━━━━━━━━━━━━━━\n"
     blocks = [
-        f"🎮 {u[1]} | 📻 {u[2]}\n"
-        f"🎫 {u[3]} | ⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
+        f"🎮 {u[1]}{(' | 📻 ' + str(u[2])) if callsign_shown() else ''}\n"
+        f"{('🎫 ' + str(u[3] or '—') + ' | ') if token_shown() else ''}⭐ {RANKS.get(u[4], RANKS[0])['name']}\n"
         f"🆔 {u[0]} | 📁 {u[5]}\n"
         "─────────────────\n"
         for u in users
@@ -3369,7 +3420,7 @@ async def asearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎫 ЖЕТОН {token}\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"🎮 Ник: {row['game_nick']}\n"
-            f"📻 Позывной: {row['callsign']}\n"
+            f"{cs_line(row['callsign'])}"
             f"⭐ Ранг: {RANKS.get(rank, RANKS[0])['name']}\n"
             f"📁 Отдел: {departments_display(row['user_id'], row['department'])}"
         )
@@ -3454,7 +3505,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         text=(
                             "👢 ПОЛЬЗОВАТЕЛЬ ИСКЛЮЧЁН ИЗ КОНФЕРЕНЦИИ\n"
                             "━━━━━━━━━━━━━━━━━\n"
-                            f"👤 {user_data['nick']} ({user_data['callsign']})\n"
+                            f"👤 {with_callsign(user_data['nick'], user_data['callsign'])}\n"
                             f"🆔 {user.id}\n"
                             f"👮 Кто исключил: {actor_name}\n"
                             "━━━━━━━━━━━━━━━━━\n"
@@ -3501,8 +3552,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             permissions = get_user_permissions(user_id)
             welcome_text = (
                 f"👋 *{user_data['nick']}*, добро пожаловать в конференцию!\n\n"
-                f"📻 Позывной: `{user_data['callsign']}`\n"
-                f"🎫 Жетон: `{user_data['token']}`\n"
+                f"{cs_line(user_data['callsign'], '📻 Позывной: `', '`')}"
+                f"{tk_line(user_data['token'], '🎫 Жетон: `', '`')}"
                 f"⭐ Ранг: *{permissions['name']}*\n"
                 f"📁 Отдел: _{user_data['departments_str']}_\n\n"
             )
@@ -3585,8 +3636,8 @@ async def atestwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         permissions = get_user_permissions(user_id)
         welcome_text = (
             f"👋 *{user_data['nick']}*, добро пожаловать в конференцию!\n\n"
-            f"📻 Позывной: `{user_data['callsign']}`\n"
-            f"🎫 Жетон: `{user_data['token']}`\n"
+            f"{cs_line(user_data['callsign'], '📻 Позывной: `', '`')}"
+            f"{tk_line(user_data['token'], '🎫 Жетон: `', '`')}"
             f"⭐ Ранг: *{permissions['name']}*\n"
             f"📁 Отдел: _{user_data['departments_str']}_\n\n"
         )
@@ -3709,7 +3760,7 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👢 ПОЛЬЗОВАТЕЛЬ КИКНУТ\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"👤 {target_nick} ({target_name})\n"
+            f"👤 {with_callsign(target_nick, target_name)}\n"
             f"👮 Кикнул: {issuer_name}\n"
             + (f"📝 Причина: {reason}\n" if reason else "")
             + ("━━━━━━━━━━━━━━━━━\n"
@@ -3723,7 +3774,7 @@ async def akick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=conf_chat(),
                     text=(
                         "👢 Кик из конференции\n"
-                        f"👤 {target_nick} ({target_name})\n"
+                        f"👤 {with_callsign(target_nick, target_name)}\n"
                         f"👮 {issuer_name}"
                         + (f"\n📝 {reason}" if reason else "")
                     ),
@@ -3829,7 +3880,7 @@ async def aban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = (
             "🚫 БАН\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"👤 {target_nick} ({target_name})\n"
+            f"👤 {with_callsign(target_nick, target_name)}\n"
             f"📝 Причина: {reason}\n"
             f"⏰ Срок: {duration_label}\n"
             f"👮 Забанил: {issuer_name}"
@@ -4440,7 +4491,7 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚫 ОТКЛЮЧЕНИЕ ОТ БОТА\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"👤 Пользователь: {target_data['nick']}\n"
-        f"📻 Позывной: {target_data['callsign']}\n"
+        f"{cs_line(target_data['callsign'])}"
         f"🆔 ID: {target_id}\n"
         f"👮 Отключил: {issuer_name}\n"
         f"🕐 Когда: {now_msk_str()}\n"
@@ -4486,7 +4537,7 @@ async def aunblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ ПОДКЛЮЧЕНИЕ К БОТУ\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"👤 Пользователь: {target_data['nick']}\n"
-        f"📻 Позывной: {target_data['callsign']}\n"
+        f"{cs_line(target_data['callsign'])}"
         f"🆔 ID: {target_id}\n"
         f"👮 Подключил: {issuer_name}"
     )
@@ -4523,7 +4574,7 @@ async def ablocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows[:80]:
         uid, nick, callsign, created_at, blocked_at, last_kick_at, last_kick_reason = r
         entry = (
-            f"👤 {nick} | 📻 {callsign}\n"
+            f"👤 {nick}{(' | 📻 ' + str(callsign)) if callsign_shown() else ''}\n"
             f"   🆔 {uid}\n"
             f"   🕐 отключён: {blocked_at or '—'}"
         )
@@ -4702,7 +4753,7 @@ async def adepartment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid, nick, callsign, rk, ban_status = m
             ban_mark = "  🚫" if (ban_status or 'Нет') != 'Нет' else ""
             lines.append(
-                f"👤 {nick} | 📻 {callsign}{ban_mark}\n"
+                f"👤 {nick}{(' | 📻 ' + str(callsign)) if callsign_shown() else ''}{ban_mark}\n"
                 f"   ⭐ {RANKS.get(rk or 0, RANKS[0])['name']}\n"
                 f"   🆔 {uid}"
             )
@@ -5038,7 +5089,7 @@ def _format_request_card(req: dict, user_data: dict) -> str:
             "📥 ЗАЯВКА НА ИЗМЕНЕНИЕ РАНГА\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"#{req['id']} | 📅 {req['created_at']}\n"
-            f"👤 {nick} ({callsign})\n"
+            f"👤 {with_callsign(nick, callsign)}\n"
             f"🆔 {req['user_id']}\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"⭐ Сейчас: {cur}\n"
@@ -5049,7 +5100,7 @@ def _format_request_card(req: dict, user_data: dict) -> str:
             "📥 ЗАЯВКА НА ИЗМЕНЕНИЕ ОТДЕЛА\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"#{req['id']} | 📅 {req['created_at']}\n"
-            f"👤 {nick} ({callsign})\n"
+            f"👤 {with_callsign(nick, callsign)}\n"
             f"🆔 {req['user_id']}\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"📁 Сейчас: {req['current_value']}\n"
@@ -5591,7 +5642,7 @@ async def ahistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = (
         "📜 ИСТОРИЯ ПОЛЬЗОВАТЕЛЯ\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+        f"👤 {with_callsign(target_data['nick'], target_data['callsign'])}\n"
         f"🆔 {target_id}\n"
         f"⭐ Сейчас: {RANKS.get(target_data['rank'], RANKS[0])['name']}\n"
         f"📁 Сейчас: {target_data['department']}\n"
@@ -5666,11 +5717,26 @@ async def asetnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"📢 Ваш ник изменён!\n🎮 Было: {old_nick}\n🎮 Стало: {new_nick}\n👮 Изменил: {get_admin_nick(user_id)}")
     await update.message.reply_text(f"✅ Ник изменён!\n🎮 {old_nick} → {new_nick}")
 
+def _register_arg_count(with_token: bool = False) -> int:
+    """Сколько аргументов после цели ждут /register (и /forcereg с жетоном)."""
+    return 1 + int(callsign_shown()) + int(with_token and token_shown())
+
+
+def _register_usage(with_token: bool = False) -> str:
+    parts = ["Ник"]
+    if callsign_shown():
+        parts.append("Позывной")
+    if with_token and token_shown():
+        parts.append(token_format_example())
+    return " ".join(parts)
+
+
 async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Регистрация пользователя (6+ ранг). 
     Использование:
       /register @user Ник Позывной
       reply на сообщение + /register Ник Позывной
+    Если позывной в регистрации конфы выключен (/regfields) — только Ник.
     """
     user_id = update.effective_user.id
     if not has_permission(user_id, 'register', 'register'):
@@ -5684,8 +5750,8 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = update.message.reply_to_message.from_user.id
         rest_args = list(context.args or [])
     else:
-        if not context.args or len(context.args) < 3:
-            await update.message.reply_text("❌ /register @user Ник Позывной")
+        if not context.args or len(context.args) < 1 + _register_arg_count():
+            await update.message.reply_text(f"❌ /register @user {_register_usage()}")
             return
         target_id = extract_user_id(update, context, context.args[0])
         if isinstance(target_id, str) and target_id.startswith('@'):
@@ -5694,8 +5760,8 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rest_args = list(context.args[1:])
     
-    if len(rest_args) < 2:
-        await update.message.reply_text("❌ Укажите Ник и Позывной.\nПример: /register @user Ник Позывной")
+    if len(rest_args) < _register_arg_count():
+        await update.message.reply_text(f"❌ Пример: /register @user {_register_usage()}")
         return
     
     if get_user_data(target_id):
@@ -5703,7 +5769,7 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     game_nick = rest_args[0]
-    callsign = rest_args[1]
+    callsign = rest_args[1] if callsign_shown() else '—'
     
     # Подхватываем tg_username, если возможно
     tg_uname = ""
@@ -5718,17 +5784,17 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = add_user(target_id, game_nick, callsign, tg_username=tg_uname)
     
     if token:
-        await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
+        await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n{cs_line(callsign, '📻 ')}{tk_line(token, '🎫 ')}")
         await notify_user(context, target_id,
-                         f"✅ Вас зарегистрировал {get_admin_nick(user_id)}!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {token}")
+                         f"✅ Вас зарегистрировал {get_admin_nick(user_id)}!\n🎮 {game_nick}\n{cs_line(callsign, '📻 ')}{tk_line(token, '🎫 ')}")
         # Уведомление в лог-группу и генералам (6+)
         uname_view = f"@{tg_uname}" if tg_uname else "—"
         await notify_new_registration(context, (
             "🆕 НОВАЯ РЕГИСТРАЦИЯ (через /register)\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"🎮 Ник: {game_nick}\n"
-            f"📻 Позывной: {callsign}\n"
-            f"🎫 Жетон: {token}\n"
+            f"{cs_line(callsign)}"
+            f"{tk_line(token)}"
             f"🔗 {uname_view} · 🆔 {target_id}\n"
             f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
             f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
@@ -5750,7 +5816,7 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rest_args = list(context.args or [])
     else:
         if not context.args:
-            await update.message.reply_text(f"❌ /forcereg @user Ник Позывной {token_format_example()}")
+            await update.message.reply_text(f"❌ /forcereg @user {_register_usage(True)}")
             return
         target_id = extract_user_id(update, context, context.args[0])
         if isinstance(target_id, str) and target_id.startswith('@'):
@@ -5759,13 +5825,14 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rest_args = list(context.args[1:])
     
-    if len(rest_args) < 3:
-        await update.message.reply_text(f"❌ /forcereg @user Ник Позывной {token_format_example()}")
+    if len(rest_args) < _register_arg_count(True):
+        await update.message.reply_text(f"❌ /forcereg @user {_register_usage(True)}")
         return
     
-    game_nick = rest_args[0]
-    callsign = rest_args[1]
-    token = rest_args[2]
+    rest = list(rest_args)
+    game_nick = rest.pop(0)
+    callsign = rest.pop(0) if callsign_shown() else '—'
+    token = rest.pop(0) if token_shown() else None
     
     # Подхватываем tg_username
     tg_uname = ""
@@ -5786,15 +5853,15 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     new_token = add_user(target_id, game_nick, callsign, token, tg_username=tg_uname)
     if new_token:
-        await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n📻 {callsign}\n🎫 {new_token}")
+        await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n{cs_line(callsign, '📻 ')}{tk_line(new_token, '🎫 ')}")
         # Уведомление в лог-группу и генералам (6+)
         uname_view = f"@{tg_uname}" if tg_uname else "—"
         await notify_new_registration(context, (
             "🆕 РЕГИСТРАЦИЯ (через /forcereg)\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"🎮 Ник: {game_nick}\n"
-            f"📻 Позывной: {callsign}\n"
-            f"🎫 Жетон: {new_token}\n"
+            f"{cs_line(callsign)}"
+            f"{tk_line(new_token)}"
             f"🔗 {uname_view} · 🆔 {target_id}\n"
             f"👮 Зарегистрировал: {get_admin_nick(user_id)}\n"
             f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
@@ -6002,7 +6069,9 @@ async def abackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u in users[:200]:
         uid, nick, callsign, token, rank, dept, blocked = u
         prefix = "🚫 ОТКЛЮЧЁН | " if (blocked or 'Нет') == 'Да' else ""
-        lines.append(f"{prefix}🆔 {uid} | {nick} | {callsign} | 🎫 {token or '—'} | ⭐ {rank} | 📁 {dept}")
+        cs_part = f" | {callsign}" if callsign_shown() else ""
+        tk_part = f" | 🎫 {token or '—'}" if token_shown() else ""
+        lines.append(f"{prefix}🆔 {uid} | {nick}{cs_part}{tk_part} | ⭐ {rank} | 📁 {dept}")
     
     text = header + "\n".join(lines)
     if len(users) > 200:
@@ -6611,8 +6680,8 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"👤 ПРОФИЛЬ\n\n"
-        f"🎮 Ник: {user_data['nick']}\n📻 Позывной: {user_data['callsign']}\n"
-        f"🎫 Жетон: {user_data['token']}\n⭐ Ранг: {permissions['name']}\n"
+        f"🎮 Ник: {user_data['nick']}\n{cs_line(user_data['callsign'])}"
+        f"{tk_line(user_data['token'])}⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['departments_str']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
         f"{extra_fields_text(target_id)}"
         f"🏅 Наград: {award_count}\n{special_text}{notes_line}🆔 ID: {user_data['user_id']}\n"
@@ -6721,7 +6790,7 @@ async def asetrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⭐ ИЗМЕНЕНИЕ РАНГА\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+        f"👤 {with_callsign(target_data['nick'], target_data['callsign'])}\n"
         f"⭐ Новый ранг: {RANKS[new_rank]['name']}\n"
         f"👮 Изменил: {issuer_name}"
     )
@@ -6800,7 +6869,7 @@ async def asetdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📁 ИЗМЕНЕНИЕ ОТДЕЛА\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+        f"👤 {with_callsign(target_data['nick'], target_data['callsign'])}\n"
         f"📁 Новый отдел: {new_dept}\n"
         f"👮 Изменил: {issuer_name}"
     )
@@ -7335,7 +7404,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 "⭐ ИЗМЕНЕНИЕ РАНГА\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+                f"👤 {with_callsign(target_data['nick'], target_data['callsign'])}\n"
                 f"⭐ Новый ранг: {RANKS[new_rank]['name']}\n"
                 f"👮 Изменил: {issuer_name}"
             )
@@ -7375,7 +7444,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 "📁 ИЗМЕНЕНИЕ ОТДЕЛА\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"👤 {target_data['nick']} ({target_data['callsign']})\n"
+                f"👤 {with_callsign(target_data['nick'], target_data['callsign'])}\n"
                 f"📁 Новый отдел: {new_dept}\n"
                 f"👮 Изменил: {issuer_name}"
             )
@@ -7476,7 +7545,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 "👢 ПОЛЬЗОВАТЕЛЬ КИКНУТ\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"👤 {target_nick} ({target_name})\n"
+                f"👤 {with_callsign(target_nick, target_name)}\n"
                 f"👮 Кикнул: {issuer_name}"
                 + ("\n━━━━━━━━━━━━━━━━━\n🚫 Авто-отключён от бота, ранг и отдел сняты."
                    if disconnected else "")
@@ -7561,7 +7630,7 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(
                 "🚫 БАН\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"👤 {target_nick} ({target_name})\n"
+                f"👤 {with_callsign(target_nick, target_name)}\n"
                 f"⏰ Срок: {duration_label}\n"
                 f"👮 Забанил: {issuer_name}"
             )
@@ -9322,7 +9391,7 @@ async def report_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     media = context.user_data.get('report_media') or []
     report_id = save_report(
         user_id,
-        user_data['callsign'],
+        user_data['callsign'] if callsign_shown() else user_data['nick'],
         context.user_data.get('report_violator', '—'),
         context.user_data.get('report_faction', '—'),
         context.user_data.get('report_violation', '—'),
@@ -9735,7 +9804,7 @@ async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gban = check_gban(target_id)
     await update.message.reply_text(
         f"🔍 ПОЛНАЯ ИНФОРМАЦИЯ\n\n"
-        f"🎮 {user_data['nick']}\n📻 {user_data['callsign']}\n🎫 {user_data['token']}\n"
+        f"🎮 {user_data['nick']}\n{cs_line(user_data['callsign'], '📻 ')}{tk_line(user_data['token'], '🎫 ')}"
         f"⭐ {RANKS[user_data['rank']]['name']}\n📁 {user_data['departments_str']}\n"
         f"⚠️ {user_data['warns']}\n"
         f"🔐 Спецдопуск: {'Да' if has_special_access(target_id) else 'Нет'}\n"
@@ -9938,6 +10007,7 @@ async def aregfields(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
     finally:
         conn.close()
+    invalidate_builtin_fields_cache()
     log_action(user_id, 'reg_fields', None, ' '.join(args)[:200])
     await update.message.reply_text(done + "\n\n" + _regfields_text())
 
@@ -10143,9 +10213,9 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
         "━━━━━━━━━━━━━━━━━\n"
         f"🏛 Конференция: {conf_title()}\n"
         f"🎮 Ник: {game_nick}\n"
-        f"📻 Позывной: {callsign}\n"
+        f"{cs_line(callsign)}"
         f"{extra}"
-        f"🎫 Жетон: {token}\n"
+        f"{tk_line(token)}"
         f"🔗 {uname} · 🆔 {user_id}\n"
         f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
     ))
@@ -13328,7 +13398,7 @@ def _format_idea_card(idea: dict, *, for_admin: bool) -> str:
     
     body = f"{head}\n━━━━━━━━━━━━━━━━━\n"
     body += f"👤 Автор: {author_name}"
-    if for_admin and author and author.get('callsign'):
+    if for_admin and author and author.get('callsign') and callsign_shown():
         body += f" ({author['callsign']})"
     body += f"\n📅 Подано: {idea.get('created_at') or '—'}\n"
     if idea.get('poll_id'):
@@ -13448,7 +13518,7 @@ async def idea_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=admin_id,
                     text=(
                         f"💡 ОПРОС #{target_id}: ответ\n"
-                        f"👤 {user_data['nick']} ({user_data['callsign']}) — ✋ нет идей"
+                        f"👤 {with_callsign(user_data['nick'], user_data['callsign'])} — ✋ нет идей"
                     ),
                 )
             except Exception:
@@ -14278,7 +14348,7 @@ def _perms_kb_for_user(target_id: int, page: int = 0) -> InlineKeyboardMarkup:
 def _perms_text_for_user(target_id: int) -> str:
     ud = get_user_data(target_id)
     name = ud['nick'] if ud else f"id {target_id}"
-    callsign = f" ({ud['callsign']})" if ud and ud.get('callsign') else ""
+    callsign = f" ({ud['callsign']})" if ud and ud.get('callsign') and callsign_shown() else ""
     rank = ud['rank'] if ud else None
     rank_name = RANKS.get(rank, RANKS[0])['name'] if rank is not None else "—"
     granted_count = len(list_user_grants(target_id))
@@ -15806,7 +15876,7 @@ async def agbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 flags.append("🔐 Спецдопуск")
             blocks.append(
                 f"🏛 {conf_title(conf)}\n"
-                f"👤 {ud['nick']} ({ud['callsign']})\n"
+                f"👤 {with_callsign(ud['nick'], ud['callsign'])}\n"
                 f"⭐ {RANKS.get(ud['rank'], RANKS[0])['name']}\n"
                 f"📁 {ud['departments_str']}\n"
                 f"⚠️ Предупреждения: {ud['warns']}\n"
