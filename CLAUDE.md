@@ -218,13 +218,13 @@ PostgreSQL строже SQLite. Уже исправлено, не сломай �
 
 ---
 
-## Схема БД (24 таблицы в каждой конфе + глобальные `public.g_*`)
+## Схема БД (26 таблиц в каждой конфе + глобальные `public.g_*`)
 
 `users` `warnings` `awards` `reports` `gban` `departments` `department_groups`
 `polls` `poll_votes` `command_grants` `change_requests` `audit_log`
 `article_history` `duels` `cube_games` `changelogs` `idea_polls` `ideas`
 `topic_violations` `punishments` `marriages` `user_notes`
-`rank_names` `user_departments`
+`rank_names` `user_departments` `reg_fields` `user_fields`
 
 Заметки по данным:
 
@@ -314,6 +314,11 @@ PostgreSQL строже SQLite. Уже исправлено, не сломай �
 
 **Регистрация:** сначала выбор конфы (`REG_CONF`), в списке только конфы с
 открытой регистрацией, где человек реально состоит в чате (`get_chat_member`).
+Дальше вопросы из `reg_fields` этой конфы по очереди (`REG_FIELD`,
+`reg_field_answer`), настройка — `/regfields`. Встроенные поля `nick`/`callsign`
+пишутся в `users` (можно выключить, нельзя удалить; ник выключен → имя из
+Telegram, позывной → `'—'`), свои — в `user_fields` и выводятся в профилях
+через `extra_fields_text()`. Необязательное поле пропускается ответом «-».
 
 **Ранги:** уровни 0–7 и права по ним общие, названия — свои в каждой конфе
 (`rank_names`, `/rankname`). `DEFAULT_RANKS` — названия по умолчанию.
@@ -353,7 +358,7 @@ PostgreSQL строже SQLite. Уже исправлено, не сломай �
 с учётом прав.
 
 Проверка покрытия — сверь список из словарей `commands` и `no_prefix` в `main()`
-с реестром. На момент написания: 134 команды, пропущенных нет.
+с реестром. На момент написания: 135 команд, пропущенных нет.
 
 ---
 
