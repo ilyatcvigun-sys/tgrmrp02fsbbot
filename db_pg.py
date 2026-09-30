@@ -132,7 +132,13 @@ def init_pool(dsn: str = None, min_size: int = 1, max_size: int = 10):
         max_size=max_size,
         max_idle=300,
         timeout=30,
-        kwargs={"autocommit": False},
+        # prepare_threshold=None — без серверных prepared statements. psycopg
+        # «подготавливает» запрос после 5 повторов; если это совпадает с pipeline,
+        # в котором упал запрос (типичный `try: ALTER … except: pass`), PREPARE
+        # на сервере не выполняется, а клиент считает его сделанным — и следующий
+        # такой запрос падает с «prepared statement "_pg3_N" does not exist».
+        # Ловили на старте бота в init_database. Выигрыша от prepare у бота нет.
+        kwargs={"autocommit": False, "prepare_threshold": None},
     )
     _pool.wait(timeout=30)
     logger.info("PostgreSQL: пул соединений готов")
