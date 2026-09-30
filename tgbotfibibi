@@ -1930,6 +1930,37 @@ def update_user_department(user_id: int, department: str) -> bool:
     conn.close()
     return ok
 
+# Лимиты: устных (предов) до WARN_VERBAL_MAX, дальше письменные (выговоры);
+# WARN_WRITTEN_MAX-й выговор = автокик.
+WARN_VERBAL_MAX = 2
+WARN_WRITTEN_MAX = 3
+
+# Подпись в начале объявления о преде/выговоре — именно так, не имя бота.
+WARN_ANNOUNCE_PREFIX = "ExBot"
+
+# Слова в начале причины /warn, после которых выдаётся сразу выговор.
+WARN_WRITTEN_WORDS = {'выг', 'выговор', 'письм', 'письменное', 'письменный'}
+
+
+def warn_counts_text(warns: str) -> str:
+    """'1/0' → '1/2 0/3' — преды из лимита, выговоры из лимита."""
+    parts = (warns or '0/0').split('/')
+    verbal = parts[0] if len(parts) == 2 else '0'
+    written = parts[1] if len(parts) == 2 else '0'
+    return f"{verbal}/{WARN_VERBAL_MAX} {written}/{WARN_WRITTEN_MAX}"
+
+
+def warn_announce_text(bot_name: str, nick: str, written: bool, warns: str, reason: str) -> str:
+    """Объявление о выдаче: «Бот » Пользователь Ник получил 1 предупреждение.»"""
+    what = "1 выговор" if written else "1 предупреждение"
+    return (
+        f"{bot_name} » Пользователь {nick} получил {what}.\n"
+        f"Текущее кол-во: {warn_counts_text(warns)}\n"
+        "\n"
+        f"Причина: {reason}"
+    )
+
+
 def add_warning(user_id: int, issuer_id: int, reason: str, force_written: bool = False) -> tuple:
     """
     Добавление предупреждения. Первые 2 — устные, дальше — письменные (3-е
@@ -1951,13 +1982,13 @@ def add_warning(user_id: int, issuer_id: int, reason: str, force_written: bool =
     written = int(parts[1]) if len(parts) == 2 else 0
     kicked = False
 
-    if not force_written and verbal < 2:
+    if not force_written and verbal < WARN_VERBAL_MAX:
         verbal += 1
         warn_type = "Устное"
-    elif written < 3:
+    elif written < WARN_WRITTEN_MAX:
         written += 1
         warn_type = "Письменное"
-        if written == 3:
+        if written == WARN_WRITTEN_MAX:
             kicked = True
     else:
         conn.close()
@@ -2745,7 +2776,7 @@ HELP_SECTIONS = [
     ]),
 
     ("moderation", "🛡", "Модерация", [
-        ("warn",       "<user> <причина>",     "выдать предупреждение", 5),
+        ("warn",       "<user> [выг] <причина>", "предупреждение; «выг» — сразу выговор", 5),
         ("unwarn",     "<user>",               "снять одно предупреждение", 5),
         ("unwarnall",  "<user>",               "снять все предупреждения", 5),
         ("warnlist",   "[user]",               "предупреждения пользователя", 5),
@@ -3959,7 +3990,10 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ ВАРНЫ ============
 
 async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выдача предупреждения"""
+    """Выдача предупреждения.
+    /warn @user причина         — пред (или выговор, если преды кончились)
+    /warn @user выг причина     — сразу выговор, минуя преды
+    """
     user_id = update.effective_user.id
     if not has_permission(user_id, 'warn', 'warn'):
         await update.message.reply_text("❌ С 5 ранга.")
@@ -3972,7 +4006,7 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason = ' '.join(context.args) if context.args else "Без причины"
     else:
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /warn @user причина")
+            await update.message.reply_text("❌ /warn @user причина\n   /warn @user выг причина — сразу выговор")
             return
         target_id = extract_user_id(update, context, context.args[0])
         reason = ' '.join(context.args[1:])
@@ -3988,17 +4022,38 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось найти.")
         return
     
-    success, message, kicked = add_warning(target_id, user_id, reason)
+    # «выг» первым словом причины — сразу выговор
+    reason_words = reason.split()
+    force_written = bool(reason_words) and reason_words[0].lower().rstrip('.,:') in WARN_WRITTEN_WORDS
+    if force_written:
+        reason = ' '.join(reason_words[1:]) or "Без причины"
+
+    success, message, kicked = add_warning(target_id, user_id, reason, force_written=force_written)
     target_data = get_user_data(target_id)
     target_name = target_data['nick'] if target_data else f"User {target_id}"
     
     if success:
-        log_action(user_id, 'warn', target_id, reason or '')
-        await update.message.reply_text(f"⚠️ {message}\n👤 {target_name}\n📝 {reason}")
-        await notify_user(context, target_id,
-                         f"⚠️ Вам выдан пред!\n📊 {message}\n📝 {reason}\n👮 Выдал: {get_admin_nick(user_id)}")
+        log_action(user_id, 'warn', target_id, (('[выговор] ' if force_written else '') + (reason or ''))[:500])
+        is_written = message.startswith("Выдано письменное")
+        announce = warn_announce_text(WARN_ANNOUNCE_PREFIX, target_name, is_written,
+                                      target_data['warns'] if target_data else '', reason)
+        # Объявление — в чат конфы. Если команду написали в самой конфе —
+        # ответом туда же, иначе (ЛС, /gwarn из другой беседы) — в чат конфы
+        # и короткое подтверждение вызвавшему.
+        in_conf = (not _global_run.get() and update.effective_chat is not None
+                   and update.effective_chat.id == conf_chat())
+        if in_conf:
+            await update.message.reply_text(announce)
+        else:
+            try:
+                await context.bot.send_message(chat_id=conf_chat(), text=announce)
+            except Exception as e:
+                logger.debug(f"warn announce → conf: {e}")
+            await update.message.reply_text(f"⚠️ {message}\n👤 {target_name}\n📝 {reason}")
+        await notify_user(context, target_id, announce + f"\n👮 Выдал: {get_admin_nick(user_id)}")
         if kicked:
-            await send_action_message(update, context, target_id, "warn_kick", "Лимит (3/3)")
+            await send_action_message(update, context, target_id, "warn_kick",
+                                      f"Лимит ({WARN_WRITTEN_MAX}/{WARN_WRITTEN_MAX})")
             await kick_user_from_chat(update, context, target_id)
     else:
         await update.message.reply_text(f"❌ {message}")
