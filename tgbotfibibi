@@ -1650,6 +1650,17 @@ def init_database():
     c.execute("UPDATE command_rank_access SET command = 'get' WHERE command = 'who' AND rank NOT IN "
               "(SELECT rank FROM command_rank_access WHERE command = 'get')")
     c.execute("DELETE FROM command_rank_access WHERE command = 'who'")
+    # Для /get: счётчик сообщений в конфе и точное время начала периода службы
+    # (hired_at — только дата и правится из Mini App, его формат не трогаем).
+    for col_sql in (
+        "ALTER TABLE users ADD COLUMN msg_count INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN last_msg_at TEXT DEFAULT ''",
+        "ALTER TABLE service_periods ADD COLUMN started_at TEXT DEFAULT ''",
+    ):
+        try:
+            c.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass
     # Поинты (/point): каждая выдача/списание — отдельная строка, баланс = сумма.
     c.execute('''
         CREATE TABLE IF NOT EXISTS points_log (
@@ -1858,6 +1869,8 @@ def get_user_data(user_id: int) -> dict:
         "blocked_at": g('blocked_at', ''),
         "last_kick_at": g('last_kick_at', ''),
         "last_kick_reason": g('last_kick_reason', ''),
+        "msg_count": g('msg_count', 0) or 0,
+        "last_msg_at": g('last_msg_at', '') or '',
         "departments": depts,
         "departments_str": ", ".join(depts),
     }
@@ -2467,7 +2480,8 @@ def _open_service_period(user_id: int, hired_at: str = ""):
     if c.fetchone():
         conn.close()
         return
-    c.execute("INSERT INTO service_periods (user_id, hired_at, dismissed_at) VALUES (?, ?, '')", (user_id, hired_at))
+    c.execute("INSERT INTO service_periods (user_id, hired_at, dismissed_at, started_at) VALUES (?, ?, '', ?)",
+              (user_id, hired_at, now_msk_str()))
     conn.commit()
     conn.close()
 
@@ -6789,6 +6803,62 @@ async def adept_apply_template(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+def _parse_dt(value: str):
+    """Строка времени из БД → datetime (наивный, МСК) или None."""
+    value = (value or '').strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _fmt_dt(dt) -> str:
+    return dt.strftime("%d.%m.%Y %H:%M") if dt else "—"
+
+
+def _fmt_span(td) -> str:
+    """timedelta → «86 дней 15 часов 59 минут»."""
+    if td is None:
+        return "—"
+    total_min = max(0, int(td.total_seconds()) // 60)
+    days, rem = divmod(total_min, 1440)
+    hours, mins = divmod(rem, 60)
+    return (f"{days} {_plural(days, 'день', 'дня', 'дней')} "
+            f"{hours} {_plural(hours, 'час', 'часа', 'часов')} "
+            f"{mins} {_plural(mins, 'минута', 'минуты', 'минут')}")
+
+
+def _service_times(user_id: int, reg_date: str) -> tuple:
+    """(впервые в беседе, начало текущего периода, время с него, время за все периоды).
+    Периоды — service_periods: точное started_at, иначе дата hired_at; если
+    периодов нет — считаем от регистрации в боте."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT hired_at, dismissed_at, started_at FROM service_periods WHERE user_id = ? ORDER BY id', (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    now = now_msk().replace(tzinfo=None)
+    periods = []
+    for hired_at, dismissed_at, started_at in rows:
+        start = _parse_dt(started_at) or _parse_dt(hired_at)
+        if not start:
+            continue
+        end = _parse_dt(dismissed_at)   # None — период ещё идёт
+        periods.append((start, end))
+    if not periods:
+        start = _parse_dt(reg_date)
+        if not start:
+            return None, None, None, None
+        periods = [(start, None)]
+    first_at = min(p[0] for p in periods)
+    last_start, last_end = periods[-1]
+    since_join = (last_end or now) - last_start
+    total = sum(((end or now) - start for start, end in periods), timedelta())
+    return first_at, last_start, since_join, total
+
+
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Профиль другого пользователя"""
     user_id = update.effective_user.id
@@ -6833,15 +6903,51 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 notes_line += f" (📌 {len(pinned)})"
             notes_line += " — /notes @user\n"
     
-    await update.message.reply_text(
-        f"👤 ПРОФИЛЬ\n\n"
-        f"🎮 Ник: {user_data['nick']}\n{cs_line(user_data['callsign'])}"
-        f"{tk_line(user_data['token'])}⭐ Ранг: {permissions['name']}\n"
-        f"📁 Отдел: {user_data['departments_str']}\n⚠️ Выговоры/преды: {warn_counts_text(user_data['warns'])} (активных {warn_count})\n"
-        f"{extra_fields_text(target_id)}"
-        f"🏅 Наград: {award_count}\n{special_text}{notes_line}🆔 ID: {user_data['user_id']}\n"
-        f"📅 Зарегистрирован: {user_data['reg_date']}"
-    )
+    e = _html_escape
+    first_at, joined_at, since_join, total = _service_times(target_id, user_data['reg_date'])
+    conf = current_conf()
+
+    def row(label, value):
+        return f" – {label}: {e(str(value))}\n"
+
+    text = f"{WARN_ANNOUNCE_PREFIX} » Информация о {e(user_data['nick'])}\n\n"
+    text += "<b>Информация о конференции</b>\n"
+    text += f" – \"{e(conf_title(conf))}\" [ID: {conf.get('id')}]\n"
+    text += row("Впервые в беседе", _fmt_dt(first_at))
+    text += row("Принят в беседу", _fmt_dt(joined_at))
+
+    text += "\n<b>Информация о сообщениях</b>\n"
+    text += row("Количество", user_data['msg_count'])
+    text += row("Последнее", _fmt_dt(_parse_dt(user_data['last_msg_at'])))
+
+    text += "\n<b>Профиль пользователя</b>\n"
+    text += row("Ник", user_data['nick'])
+    if callsign_shown():
+        text += row("Позывной", user_data['callsign'])
+    if token_shown():
+        text += row("Жетон", user_data['token'])
+    text += row("Ранг", permissions['name'])
+    text += row("Отделы", user_data['departments_str'])
+    for title, value in get_user_extra_fields(target_id):
+        text += row(title, value)
+    text += row("Регистрация в боте", _fmt_dt(_parse_dt(user_data['reg_date'])))
+    uname = f"@{user_data['tg_username']} · " if user_data.get('tg_username') else ""
+    text += f" – Telegram: {e(uname)}ID <code>{target_id}</code>\n"
+
+    text += "\n<b>Наказания и заслуги</b>\n"
+    text += row("Выговоры/преды", f"{warn_counts_text(user_data['warns'])} (активных {warn_count})")
+    text += row("Поинты", get_points(target_id))
+    text += row("Наград", award_count)
+    if special_text:
+        text += row("Спецдопуск", "да")
+    if notes_line:
+        text += " – " + e(notes_line.replace("📝 ", "", 1))
+
+    text += "\n<b>Время нахождения в беседе</b>\n"
+    text += row("С приглашения", _fmt_span(since_join))
+    text += row("За всё время", _fmt_span(total))
+
+    await update.message.reply_text(text, parse_mode='HTML')
 
 async def asettoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача жетона"""
@@ -11002,6 +11108,15 @@ async def track_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if user and user.username and user.id:
             update_tg_username(user.id, user.username)
+        # Счётчик сообщений в чате конфы (для /get)
+        if (user and update.message and update.effective_chat
+                and update.effective_chat.id == conf_chat()):
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('UPDATE users SET msg_count = COALESCE(msg_count, 0) + 1, last_msg_at = ? WHERE user_id = ?',
+                      (now_msk_str(), user.id))
+            conn.commit()
+            conn.close()
     except Exception as e:
         logger.debug(f"track_username error: {e}")
 
