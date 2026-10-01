@@ -823,6 +823,7 @@ def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
             return override
     permissions = {
         "search": rank >= 4,
+        "points": rank >= 4,
         "award": rank >= 3,
         "warn": rank >= 5,
         "manage_ranks": rank >= 5,
@@ -1238,6 +1239,8 @@ def init_database():
     for col_sql in (
         "ALTER TABLE polls ADD COLUMN poll_type TEXT DEFAULT 'candidate'",
         "ALTER TABLE polls ADD COLUMN options TEXT DEFAULT ''",
+        # Срок голосования (МСК-строка). NULL — пока не закроют вручную.
+        "ALTER TABLE polls ADD COLUMN ends_at TEXT",
     ):
         try:
             c.execute(col_sql)
@@ -1640,6 +1643,24 @@ def init_database():
         c.execute('ALTER TABLE users ALTER COLUMN token DROP NOT NULL')
     except sqlite3.OperationalError:
         pass
+    # /who переименована в /get — переносим выданные на неё гранты и тумблеры /cmdrank
+    c.execute("UPDATE command_grants SET command = 'get' WHERE command = 'who' AND user_id NOT IN "
+              "(SELECT user_id FROM command_grants WHERE command = 'get')")
+    c.execute("DELETE FROM command_grants WHERE command = 'who'")
+    c.execute("UPDATE command_rank_access SET command = 'get' WHERE command = 'who' AND rank NOT IN "
+              "(SELECT rank FROM command_rank_access WHERE command = 'get')")
+    c.execute("DELETE FROM command_rank_access WHERE command = 'who'")
+    # Поинты (/point): каждая выдача/списание — отдельная строка, баланс = сумма.
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS points_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            reason TEXT DEFAULT '',
+            issued_by INTEGER,
+            date TEXT DEFAULT ''
+        )
+    ''')
     # Поля регистрации конфы (/regfields). Встроенные — field_key 'nick' и
     # 'callsign' (пишутся в users), свои — field_key NULL, ответы в user_fields.
     c.execute('''
@@ -1954,11 +1975,25 @@ WARN_WRITTEN_WORDS = {'выг', 'выговор', 'письм', 'письмен�
 
 
 def warn_counts_text(warns: str) -> str:
-    """'1/0' → '1/2 0/3' — преды из лимита, выговоры из лимита."""
+    """users.warns '<преды>/<выговоры>' → «2/3 1/2»: СНАЧАЛА выговоры из лимита,
+    потом преды из лимита (так хочет владелец). В БД порядок прежний."""
     parts = (warns or '0/0').split('/')
     verbal = parts[0] if len(parts) == 2 else '0'
     written = parts[1] if len(parts) == 2 else '0'
-    return f"{verbal}/{WARN_VERBAL_MAX} {written}/{WARN_WRITTEN_MAX}"
+    return f"{written}/{WARN_WRITTEN_MAX} {verbal}/{WARN_VERBAL_MAX}"
+
+
+def _warn_kind_arg(words: list):
+    """Первое слово причины: «1» → пред, «2»/«выг» → выговор. Возвращает
+    ('verbal'|'written'|None, оставшиеся слова)."""
+    if not words:
+        return None, words
+    first = words[0].lower().rstrip('.,:')
+    if first == '1':
+        return 'verbal', words[1:]
+    if first == '2' or first in WARN_WRITTEN_WORDS:
+        return 'written', words[1:]
+    return None, words
 
 
 def ban_label(duration_label: str) -> str:
@@ -2766,12 +2801,15 @@ HELP_SECTIONS = [
         ("profile",   "",                      "полный профиль", 0),
         ("awards",    "<user?>",               "ваши награды (или чужие — по нику/@/reply)", 0),
         ("perms",     "",                      "ваши индивидуальные доступы", 0),
-        ("warns",     "",                      "ваши предупреждения", 0),
+        ("mywarns",   "",                      "ваши выговоры и преды", 0),
         ("stats",     "",                      "статистика бота", 0),
         ("help",      "[текст]",               "эта справка (с текстом — поиск команды)", 0),
         ("cancel",     "",                      "прервать начатую форму", 0),
         ("callsign",  "<новый позывной>",      "сменить себе позывной", 0),
-        ("who",       "<user>",                "профиль другого пользователя", 5),
+        ("get",       "<user>",                "информация о пользователе", 5),
+        ("id",        "[user]",                "Telegram ID (свой или чужой)", 0),
+        ("pointlist", "[user]",                "поинты и их история", 0),
+        ("points",    "",                      "у кого есть поинты", 0),
         ("whois",     "<id>",                  "полная информация по ID", "spec"),
     ]),
 
@@ -2813,11 +2851,14 @@ HELP_SECTIONS = [
     ]),
 
     ("moderation", "🛡", "Модерация", [
-        ("warn",       "<user> [выг] <причина>", "предупреждение; «выг» — сразу выговор", 5),
-        ("unwarn",     "<user>",               "снять одно предупреждение", 5),
+        ("warn",       "<user> [1|2] <причина>", "1 — пред, 2 — выговор (без числа — по очереди)", 5),
+        ("unwarn",     "<user> [1|2] [причина]", "снять пред (1) или выговор (2)", 5),
+        ("warns",      "",                     "все, у кого есть выговоры и преды", 5),
         ("unwarnall",  "<user>",               "снять все предупреждения", 5),
-        ("warnlist",   "[user]",               "предупреждения пользователя", 5),
+        ("warnlist",   "[user]",               "история выговоров и предов (свою — всем)", 0),
         ("mute",       "<user> [срок] [причина]", "мут; срок 30m · 2ч · 7 дней · число = минуты", 5),
+        ("amode",      "[on|off]",             "закрыть/открыть чат для всех (пишут только админы)", 5),
+        ("point",      "<user> <±кол-во> [причина]", "начислить или списать поинты", 4),
         ("unmute",     "<user>",               "снять мут", 5),
         ("kick",       "<user> [причина]",     "кик из конференции", 5),
         ("ban",        "<user> [срок] [причина]", "бан; без срока — бессрочно", 5),
@@ -2892,8 +2933,8 @@ HELP_SECTIONS = [
     ]),
 
     ("system", "⚙️", "Система", [
-        ("poll_create", "<кандидат> <описание>", "создать голосование", 6),
-        ("poll_multi", "<вопрос> | <вариант> | <вариант> …", "голосование с вариантами ответа", 6),
+        ("poll_create", "[срок] <кандидат> <описание>", "создать голосование; срок — 2ч, 1d…", 6),
+        ("poll_multi", "[срок] <вопрос> | <вариант> | <вариант> …", "голосование с вариантами ответа", 6),
         ("polls",      "",                     "активные голосования", "spec"),
         ("poll_info",  "<id>",                 "результаты голосования", "spec"),
         ("poll_close", "<id>",                 "закрыть голосование", "spec"),
@@ -3139,7 +3180,7 @@ async def aprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{tk_line(user_data['token'])}"
         f"⭐ Ранг: {permissions['name']}\n"
         f"📁 Отдел: {user_data['departments_str']}\n"
-        f"⚠️ Предупреждения: {user_data['warns']}\n"
+        f"⚠️ Выговоры/преды: {warn_counts_text(user_data['warns'])}\n"
         f"{extra_fields_text(user_id)}"
         "━━━━━━━━━━━━━━━━━\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
@@ -3979,7 +4020,8 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выдача предупреждения.
     /warn @user причина         — пред (или выговор, если преды кончились)
-    /warn @user выг причина     — сразу выговор, минуя преды
+    /warn @user 1 причина       — пред
+    /warn @user 2 причина       — сразу выговор, минуя преды (так же «выг»)
     """
     user_id = update.effective_user.id
     if not has_permission(user_id, 'warn', 'warn'):
@@ -3993,7 +4035,7 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason = ' '.join(context.args) if context.args else "Без причины"
     else:
         if len(context.args) < 2:
-            await update.message.reply_text("❌ /warn @user причина\n   /warn @user выг причина — сразу выговор")
+            await update.message.reply_text("❌ /warn @user [1|2] причина\n   1 — пред, 2 — выговор")
             return
         target_id = extract_user_id(update, context, context.args[0])
         reason = ' '.join(context.args[1:])
@@ -4009,11 +4051,11 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось найти.")
         return
     
-    # «выг» первым словом причины — сразу выговор
-    reason_words = reason.split()
-    force_written = bool(reason_words) and reason_words[0].lower().rstrip('.,:') in WARN_WRITTEN_WORDS
-    if force_written:
-        reason = ' '.join(reason_words[1:]) or "Без причины"
+    # «1» / «2» (или «выг») первым словом: 1 — пред, 2 — сразу выговор
+    kind, rest_words = _warn_kind_arg(reason.split())
+    force_written = kind == 'written'
+    if kind:
+        reason = ' '.join(rest_words) or "Без причины"
 
     success, message, kicked = add_warning(target_id, user_id, reason, force_written=force_written)
     target_data = get_user_data(target_id)
@@ -4033,39 +4075,111 @@ async def awarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ {message}")
 
-async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Просмотр предупреждений"""
-    user_id = update.effective_user.id
+def _warn_history(user_id: int) -> list:
+    """Вся история предупреждений человека, включая снятые и истёкшие."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''SELECT warn_type, counter, reason, date, issued_by FROM warnings
+                 WHERE user_id = ? ORDER BY id DESC''', (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def _warn_kind_label(warn_type: str) -> str:
+    return "Выговор" if warn_type == "Письменное" else "Пред"
+
+
+async def _send_long(update: Update, text: str):
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
+async def _warns_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Цель из reply / первого аргумента, иначе — сам вызвавший."""
     target_id = extract_user_id(update, context)
-    
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
-    if not target_id:
-        target_id = user_id
-    
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
-    
-    if not target_id:
-        await update.message.reply_text("❌ Не удалось найти.")
+    return target_id or update.effective_user.id
+
+
+async def awarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/warns — все, у кого есть выговоры или преды (сначала больше выговоров)."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'warns'):
+        await update.message.reply_text("❌ С 5 ранга. Свои — /mywarns")
         return
-    
-    if target_id != user_id and not has_permission(user_id, 'warn', 'warns'):
-        await update.message.reply_text("❌ С 5 ранга.")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id, game_nick, warns FROM users WHERE warns IS NOT NULL AND warns <> '0/0'")
+    rows = []
+    for uid, nick, warns in c.fetchall():
+        parts = (warns or '0/0').split('/')
+        verbal = int(parts[0]) if len(parts) == 2 and parts[0].isdigit() else 0
+        written = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 0
+        if verbal or written:
+            rows.append((written, verbal, nick, uid, warns))
+    conn.close()
+    if not rows:
+        await update.message.reply_text("✅ Ни у кого нет выговоров и предов.")
         return
-    
-    target_data = get_user_data(target_id)
-    target_name = target_data['nick'] if target_data else f"User {target_id}"
-    current_warns = target_data['warns']
-    warns = get_warn_list(target_id)
-    
-    if warns:
-        text = f"⚠️ Предупреждения: {target_name}\n📊 Счёт: {current_warns}\n\n"
-        for w in warns:
-            text += f"📅 {w[6]} | {w[3]}\n📝 {w[5]}\n\n"
-        await update.message.reply_text(text)
+    rows.sort(key=lambda r: (-r[0], -r[1], (r[2] or '').lower()))
+    lines = [f"⚠️ ВЫГОВОРЫ И ПРЕДЫ ({len(rows)})", "━━━━━━━━━━━━━━━━━",
+             "Выговоры/преды · ник"]
+    lines += [f"{warn_counts_text(w)} · {nick}" for _w, _v, nick, _uid, w in rows]
+    await _send_long(update, "\n".join(lines))
+
+
+async def amywarns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mywarns — свои выговоры и преды (активные)."""
+    user_id = update.effective_user.id
+    ud = get_user_data(user_id)
+    if not ud:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    active = get_warn_list(user_id)
+    lines = ["⚠️ МОИ ВЫГОВОРЫ И ПРЕДЫ", "━━━━━━━━━━━━━━━━━",
+             f"📊 Выговоры/преды: {warn_counts_text(ud['warns'])}"]
+    if active:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        for w in active:
+            exp = f" · до {w[8][:10]}" if len(w) > 8 and w[8] else ""
+            lines.append(f"• {_warn_kind_label(w[3])} — {w[6]}{exp}\n  📝 {w[5] or '—'}")
     else:
-        await update.message.reply_text(f"⚠️ {target_name}\n📊 Счёт: {current_warns}\n✅ Активных предупреждений нет.")
+        lines.append("✅ Активных нет.")
+    lines.append("━━━━━━━━━━━━━━━━━\nВся история — /warnlist")
+    await _send_long(update, "\n".join(lines))
+
+
+async def awarnlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/warnlist [user] — вся история выговоров и предов (вместе со снятыми и истёкшими)."""
+    user_id = update.effective_user.id
+    target_id = await _warns_target(update, context)
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+        return
+    if target_id != user_id and not has_permission(user_id, 'warn', 'warnlist'):
+        await update.message.reply_text("❌ Чужую историю — с 5 ранга. Свою — /warnlist без аргументов.")
+        return
+    td = get_user_data(target_id)
+    if not td:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован.")
+        return
+    history = _warn_history(target_id)
+    lines = [f"📜 ИСТОРИЯ ВЫГОВОРОВ И ПРЕДОВ — {td['nick']}", "━━━━━━━━━━━━━━━━━",
+             f"📊 Сейчас: {warn_counts_text(td['warns'])}"]
+    if not history:
+        lines.append("✅ Записей нет.")
+    else:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        for warn_type, counter, reason, date, issued_by in history:
+            status = {"0/0": " · снят", "EXPIRED": " · истёк"}.get(counter or '', "")
+            lines.append(f"• {_warn_kind_label(warn_type)} — {date}{status}\n"
+                         f"  📝 {reason or '—'} · 👮 {get_admin_nick(issued_by) if issued_by else '—'}")
+    await _send_long(update, "\n".join(lines))
+
 
 async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снятие одного предупреждения"""
@@ -4080,7 +4194,7 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = extract_user_id(update, context, context.args[0])
         reason = ' '.join(context.args[1:])
     if not target_id:
-        await update.message.reply_text("❌ /unwarn @user [причина]")
+        await update.message.reply_text("❌ /unwarn @user [1|2] [причина]\n   1 — снять пред, 2 — снять выговор")
         return
     
     if isinstance(target_id, str) and target_id.startswith('@'):
@@ -4103,11 +4217,21 @@ async def aunwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = current_warns.split('/')
     verbal = int(parts[0]) if len(parts) == 2 else 0
     written = int(parts[1]) if len(parts) == 2 else 0
+
+    # «1» — снять пред, «2» — снять выговор; без числа — сначала выговор
+    kind, rest_words = _warn_kind_arg(reason.split())
+    reason = ' '.join(rest_words)
+    if kind == 'written' and written == 0:
+        await update.message.reply_text(f"❌ У {target_data['nick']} нет выговоров.")
+        return
+    if kind == 'verbal' and verbal == 0:
+        await update.message.reply_text(f"❌ У {target_data['nick']} нет предов.")
+        return
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    if written > 0:
+    if written > 0 and kind != 'verbal':
         written -= 1
         removed_type = "письменное"
         c.execute('''UPDATE warnings SET counter = "0/0" 
@@ -6668,7 +6792,7 @@ async def adept_apply_template(update: Update, context: ContextTypes.DEFAULT_TYP
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Профиль другого пользователя"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'who'):
+    if not has_permission(user_id, 'manage_ranks', 'get'):
         await update.message.reply_text("❌ С 5 ранга.")
         return
     
@@ -6676,7 +6800,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_id and context.args:
         target_id = extract_user_id(update, context, context.args[0])
     if not target_id:
-        await update.message.reply_text("❌ /who @user")
+        await update.message.reply_text("❌ /get @user")
         return
     
     if isinstance(target_id, str) and target_id.startswith('@'):
@@ -6713,7 +6837,7 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 ПРОФИЛЬ\n\n"
         f"🎮 Ник: {user_data['nick']}\n{cs_line(user_data['callsign'])}"
         f"{tk_line(user_data['token'])}⭐ Ранг: {permissions['name']}\n"
-        f"📁 Отдел: {user_data['departments_str']}\n⚠️ Предупреждения: {user_data['warns']} (всего {warn_count})\n"
+        f"📁 Отдел: {user_data['departments_str']}\n⚠️ Выговоры/преды: {warn_counts_text(user_data['warns'])} (активных {warn_count})\n"
         f"{extra_fields_text(target_id)}"
         f"🏅 Наград: {award_count}\n{special_text}{notes_line}🆔 ID: {user_data['user_id']}\n"
         f"📅 Зарегистрирован: {user_data['reg_date']}"
@@ -7217,7 +7341,7 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
       «бан» [@user] [длительность] [причина]                → /ban
       «кик» [@user] [причина]                                → /kick
       «варн» [@user] [причина]                               → /warn
-      «ты кто» [@user]                                       → /who
+      «ты кто» [@user]                                       → /get
     """
     if not update.message or not update.message.text:
         return
@@ -7230,7 +7354,7 @@ async def word_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
 
     if first == "ты" and len(parts) >= 2 and parts[1].lower() == "кто":
-        if not has_permission(user_id, 'manage_ranks', 'who'):
+        if not has_permission(user_id, 'manage_ranks', 'get'):
             return
         context.args = parts[2:]
         await awhoprofile(update, context)
@@ -9781,7 +9905,7 @@ async def awhois(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 ПОЛНАЯ ИНФОРМАЦИЯ\n\n"
         f"🎮 {user_data['nick']}\n{cs_line(user_data['callsign'], '📻 ')}{tk_line(user_data['token'], '🎫 ')}"
         f"⭐ {RANKS[user_data['rank']]['name']}\n📁 {user_data['departments_str']}\n"
-        f"⚠️ {user_data['warns']}\n"
+        f"⚠️ {warn_counts_text(user_data['warns'])}\n"
         f"🔐 Спецдопуск: {'Да' if has_special_access(target_id) else 'Нет'}\n"
         f"🚫 ЧС: {'Да' if gban['is_banned'] else 'Нет'}\n🆔 {user_data['user_id']}"
     )
@@ -10275,46 +10399,100 @@ def _poll_multi_winner(poll: dict) -> str:
     return leaders[0] if len(leaders) == 1 else "ничья: " + ", ".join(leaders)
 
 
+def _poll_passed(poll: dict) -> bool:
+    return poll['yes'] > poll['no']
+
+
+def _poll_ends_line(poll: dict) -> str:
+    if not poll.get('ends_at') or poll['status'] != 'active':
+        return ""
+    try:
+        dt = datetime.strptime(poll['ends_at'], "%Y-%m-%d %H:%M:%S")
+        return f"⏰ Завершится: {dt.strftime('%d.%m.%Y %H:%M')} МСК\n"
+    except ValueError:
+        return f"⏰ Завершится: {poll['ends_at']}\n"
+
+
 def _poll_topic_text(poll: dict) -> str:
     """
-    Текст сообщения-объявления в топике — то же сообщение редактируется на
-    каждый голос (счётчик) и при закрытии (вердикт), чтобы не плодить новые
-    сообщения. Больше никуда (в ЛС) голосование не рассылается — только сюда.
+    Текст сообщения-объявления в топике. Количество голосов здесь НЕ
+    показывается — только «идёт» и по завершении итог (прошёл/не прошёл или
+    выигравший вариант). Цифры — в /poll_info, только со спецдопуском.
     """
     is_active = poll['status'] == 'active'
-    status_line = "🟢 Идёт голосование" if is_active else "🔴 Голосование закрыто"
     if poll['type'] == 'multi':
-        result_line = "" if is_active else f"🏆 Итог: {_poll_multi_winner(poll)}\n━━━━━━━━━━━━━━━━━\n"
-        return (
-            f"🗳 ГОЛОСОВАНИЕ #{poll['id']}\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"❓ {poll['candidate']}\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"{_poll_multi_results(poll)}\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"{result_line}"
-            f"👮 Создал: {poll['creator_nick']}\n"
-            f"📅 {poll['created_at']}\n"
-            f"🔒 Голосование анонимное — {status_line.lower()}."
-        )
-    result_line = ""
-    if not is_active:
-        result = "✅ ПРИНЯТО" if poll['yes'] > poll['no'] else "❌ ОТКЛОНЕНО"
-        result_line = f"📊 Итог: {result}\n"
+        options = "\n".join(f"{i}. {opt}" for i, opt in enumerate(poll['options'], 1))
+        head = f"❓ {poll['candidate']}\n━━━━━━━━━━━━━━━━━\n{options}\n"
+        result = f"🏆 Итог: {_poll_multi_winner(poll)}" if not is_active else ""
+    else:
+        head = f"👤 Кандидат: {poll['candidate']}\n📝 {poll['description']}\n"
+        result = ("📊 Итог: " + ("✅ Прошёл" if _poll_passed(poll) else "❌ Не прошёл")) if not is_active else ""
+    status = "🟢 Голосование идёт" if is_active else "🔴 Голосование завершено"
     return (
         f"🗳 ГОЛОСОВАНИЕ #{poll['id']}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👤 Кандидат: {poll['candidate']}\n"
-        f"📝 {poll['description']}\n"
+        f"{head}"
         "━━━━━━━━━━━━━━━━━\n"
         f"👮 Создал: {poll['creator_nick']}\n"
         f"📅 {poll['created_at']}\n"
+        f"{_poll_ends_line(poll)}"
         "━━━━━━━━━━━━━━━━━\n"
-        f"{result_line}"
-        f"📊 Да: {poll['yes']} | Нет: {poll['no']} | Возд: {poll['abstain']}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"🔒 Голосование анонимное — {status_line.lower()}."
+        + (f"{result}\n" if result else "")
+        + f"{status}\n"
+        "🔒 Голосование анонимное."
     )
+
+
+def _can_see_poll_counts(user_id: int) -> bool:
+    """Количество голосов видят только главный админ и спецдопуск."""
+    return is_main_admin(user_id) or has_special_access(user_id)
+
+
+def _split_duration(args: list) -> tuple:
+    """Срок в начале аргументов: «2ч», «30m», «1d», «2 часа». Голое число без
+    единицы сроком НЕ считается (это может быть ник). → (timedelta|None, остаток)."""
+    if not args:
+        return None, args
+    first = args[0].strip()
+    if first.isdigit():
+        if len(args) >= 2:
+            td = parse_duration(f"{first} {args[1].strip()}")
+            if td:
+                return td, args[2:]
+        return None, args
+    td = parse_duration(first)
+    return (td, args[1:]) if td else (None, args)
+
+
+def set_poll_deadline(poll_id: int, td) -> None:
+    if not td:
+        return
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute('UPDATE polls SET ends_at = ? WHERE id = ?',
+              ((now_msk() + td).strftime("%Y-%m-%d %H:%M:%S"), poll_id))
+    conn.commit(); conn.close()
+
+
+async def finish_poll(context: ContextTypes.DEFAULT_TYPE, poll_id: int) -> dict:
+    """Закрыть голосование и переписать объявление в топике на итог."""
+    close_poll(poll_id)
+    await _poll_update_topic_tally(context, poll_id)
+    return get_poll_by_id(poll_id)
+
+
+async def poll_deadline_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в минуту (в каждой конфе): закрывает голосования с истёкшим сроком."""
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute("SELECT id FROM polls WHERE status = 'active' AND ends_at IS NOT NULL AND ends_at <> '' AND ends_at <= ?",
+              (now_msk_str(),))
+    ids = [r[0] for r in c.fetchall()]
+    conn.close()
+    for poll_id in ids:
+        try:
+            await finish_poll(context, poll_id)
+            log_action(None, 'poll_close', None, f"#{poll_id} — истёк срок")
+        except Exception as e:
+            logger.error(f"poll_deadline_job #{poll_id}: {e}")
 
 
 async def _poll_update_topic_tally(context: ContextTypes.DEFAULT_TYPE, poll_id: int):
@@ -10427,7 +10605,7 @@ def get_poll_by_id(poll_id: int) -> dict:
     conn = sqlite3.connect(DB_FILE); c = conn.cursor()
     c.execute('''SELECT id, candidate_nick, description, additions, creator_id, creator_nick, status,
                         yes_count, no_count, abstain_count, created_at, closed_at, topic_message_id,
-                        COALESCE(poll_type, 'candidate'), COALESCE(options, '')
+                        COALESCE(poll_type, 'candidate'), COALESCE(options, ''), ends_at
                  FROM polls WHERE id = ?''', (poll_id,))
     row = c.fetchone()
     counts = []
@@ -10448,7 +10626,7 @@ def get_poll_by_id(poll_id: int) -> dict:
                 "yes": row[7], "no": row[8], "abstain": row[9],
                 "created_at": row[10], "closed_at": row[11],
                 "topic_message_id": row[12],
-                "type": row[13], "options": options, "counts": counts}
+                "type": row[13], "options": options, "counts": counts, "ends_at": row[15]}
     return None
 
 def set_poll_topic_message(poll_id: int, message_id: int):
@@ -10481,18 +10659,20 @@ async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_permission(user_id, 'poll_create', 'poll_create'):
         await update.message.reply_text("❌ Нужен 6 ранг, спецдопуск или грант на poll_create."); return
     
-    if len(context.args) < 2:
-        await update.message.reply_text('❌ /poll_create Ник "Описание"'); return
+    duration, args = _split_duration(list(context.args or []))
+    if len(args) < 2:
+        await update.message.reply_text('❌ /poll_create [срок] Ник "Описание"\nСрок — например 2ч, 1d, 30m; без срока — до /poll_close'); return
     
-    text = ' '.join(context.args)
+    text = ' '.join(args)
     if '"' in text:
         parts = text.split('"')
         candidate_nick = parts[0].strip()
         description = parts[1].strip() if len(parts) >= 3 else ' '.join(context.args[1:])
     else:
-        candidate_nick = context.args[0]; description = ' '.join(context.args[1:])
+        candidate_nick = args[0]; description = ' '.join(args[1:])
     
     poll_id = create_poll(candidate_nick, description, user_id)
+    set_poll_deadline(poll_id, duration)
     creator_nick = get_admin_nick(user_id)
 
     # === В КОНФЕРЕНЦИЮ (топик) — одно сообщение с кнопками, которое дальше
@@ -10507,7 +10687,8 @@ async def apoll_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.send_message(chat_id=conf_chat(), text=conf_text, reply_markup=kb)
     set_poll_topic_message(poll_id, msg.message_id)
 
-    await update.message.reply_text(f"✅ Голосование #{poll_id} создано в топике.")
+    await update.message.reply_text(f"✅ Голосование #{poll_id} создано в топике."
+                                    + (f"\n⏰ Закроется через {format_duration(duration)}." if duration else ""))
 
 
 async def apoll_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10517,10 +10698,11 @@ async def apoll_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_permission(user_id, 'poll_create', 'poll_multi'):
         await update.message.reply_text("❌ Нужен 6 ранг, спецдопуск или грант на poll_multi."); return
 
-    usage = ("❌ /poll_multi Вопрос | Вариант 1 | Вариант 2 [| …]\n"
+    usage = ("❌ /poll_multi [срок] Вопрос | Вариант 1 | Вариант 2 [| …]\n"
              f"Вариантов — от 2 до {POLL_MULTI_MAX_OPTIONS}.\n"
              "Пример: /poll_multi Когда собрание? | Пятница | Суббота | Воскресенье")
-    parts = [p.strip() for p in ' '.join(context.args or []).split('|')]
+    duration, args = _split_duration(list(context.args or []))
+    parts = [p.strip() for p in ' '.join(args).split('|')]
     question, options = (parts[0], [o for o in parts[1:] if o]) if parts else ('', [])
     if not question or not (2 <= len(options) <= POLL_MULTI_MAX_OPTIONS):
         await update.message.reply_text(usage); return
@@ -10530,6 +10712,7 @@ async def apoll_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Слишком длинно: вопрос до 500 символов, вариант до 100."); return
 
     poll_id = create_multi_poll(question, options, user_id)
+    set_poll_deadline(poll_id, duration)
     poll = get_poll_by_id(poll_id)
     kb = _poll_vote_kb(poll_id)
     try:
@@ -10539,7 +10722,8 @@ async def apoll_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.send_message(chat_id=conf_chat(), text=_poll_topic_text(poll), reply_markup=kb)
     set_poll_topic_message(poll_id, msg.message_id)
     log_action(user_id, 'poll_create', None, f"#{poll_id} (варианты): {question[:100]}")
-    await update.message.reply_text(f"✅ Голосование #{poll_id} с вариантами создано в топике.")
+    await update.message.reply_text(f"✅ Голосование #{poll_id} с вариантами создано в топике."
+                                    + (f"\n⏰ Закроется через {format_duration(duration)}." if duration else ""))
 
 
 async def avote(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10574,11 +10758,7 @@ async def avote(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if success:
         poll = get_poll_by_id(poll_id)
-        if poll['type'] == 'multi':
-            tally = _poll_multi_results(poll)
-        else:
-            tally = f"📊 Да:{poll['yes']} Нет:{poll['no']} Возд:{poll['abstain']}"
-        await update.message.reply_text(f"✅ Голос принят: {_poll_vote_label(poll, vote_en)}\n{tally}")
+        await update.message.reply_text(f"✅ Голос принят: {_poll_vote_label(poll, vote_en)}")
         await _poll_update_topic_tally(context, poll_id)
         await _poll_log_vote(context, poll_id, user_id, vote_en, reason)
     else: await update.message.reply_text(f"❌ {message}")
@@ -10669,16 +10849,12 @@ async def apoll_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if poll['creator_id'] != user_id and not has_permission(user_id, 'poll_close', 'poll_close'):
         await update.message.reply_text("❌ Только создатель, спецдопуск или грант на poll_close."); return
     
-    closed = close_poll(poll_id)
-    if poll['type'] == 'multi':
-        result = f"🏆 {_poll_multi_winner(get_poll_by_id(poll_id))}"
+    # В топике — то же сообщение: кнопки убираются, показывается итог (без цифр)
+    closed = await finish_poll(context, poll_id)
+    if closed['type'] == 'multi':
+        result = f"🏆 {_poll_multi_winner(closed)}"
     else:
-        result = "✅ ПРИНЯТО" if closed['yes'] > closed['no'] else "❌ ОТКЛОНЕНО"
-
-    # Единственное действие в топике — редактируем то же сообщение с кнопками:
-    # убираем кнопки и показываем финальный вердикт. Отдельное сообщение и
-    # рассылка в ЛС больше не нужны — всё видно в этом одном сообщении.
-    await _poll_update_topic_tally(context, poll_id)
+        result = "✅ Прошёл" if _poll_passed(closed) else "❌ Не прошёл"
 
     await update.message.reply_text(f"✅ Голосование #{poll_id} закрыто.\n📊 {result}")
 
@@ -10691,6 +10867,11 @@ async def apoll_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     poll = get_poll_by_id(poll_id)
     if not poll: await update.message.reply_text("❌ Не найдено."); return
+
+    if not _can_see_poll_counts(update.effective_user.id):
+        # Без спецдопуска — только то же, что в топике: идёт / итог
+        await update.message.reply_text(_poll_topic_text(poll))
+        return
 
     if poll['type'] == 'multi':
         text = (
@@ -10752,8 +10933,12 @@ async def apolls(update: Update, context: ContextTypes.DEFAULT_TYPE):
     polls = get_active_polls()
     if polls:
         text = "📋 АКТИВНЫЕ ГОЛОСОВАНИЯ:\n\n"
+        show_counts = _can_see_poll_counts(update.effective_user.id)
         for p in polls:
             poll = get_poll_by_id(p[0])
+            if not show_counts:
+                text += f"#{p[0]} | {'❓' if poll and poll['type'] == 'multi' else '👤'} {(poll['candidate'] if poll else p[1])[:50]} | 🟢 идёт\n"
+                continue
             if poll and poll['type'] == 'multi':
                 text += f"#{p[0]} | ❓ {poll['candidate'][:50]} | 🔢 вариантов: {len(poll['options'])} | 👥{sum(poll['counts'])}\n"
                 continue
@@ -11059,6 +11244,9 @@ async def apm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_id = extract_user_id(update, context, args[0], ignore_reply=True)
     if isinstance(target_id, str) and target_id.startswith('@'):
         target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        # Не нашли в текущей конфе — ищем во всех остальных (ЛС между конфами)
+        target_id = await _resolve_global_target(update, context, args[0], all_conferences())
     if target_id in (None, -1):
         await update.message.reply_text("❌ Пользователь не найден.")
         return
@@ -15496,6 +15684,7 @@ async def _legacy_prefix_notice(update: Update, context: ContextTypes.DEFAULT_TY
     first_word = update.message.text.split()[0]
     old_name = first_word.lstrip('/').split('@')[0]
     new_name = old_name[1:] if old_name in _LEGACY_A_PREFIX_COMMANDS else old_name
+    new_name = {'who': 'get'}.get(new_name, new_name)   # /who переименована в /get
     await update.message.reply_text(
         f"ℹ️ Префикс «a» убрали из команд.\n"
         f"Чтобы использовать команду, напишите её без префикса: /{new_name}"
@@ -16016,7 +16205,7 @@ async def agbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👤 {with_callsign(ud['nick'], ud['callsign'])}\n"
                 f"⭐ {RANKS.get(ud['rank'], RANKS[0])['name']}\n"
                 f"📁 {ud['departments_str']}\n"
-                f"⚠️ Предупреждения: {ud['warns']}\n"
+                f"⚠️ Выговоры/преды: {warn_counts_text(ud['warns'])}\n"
                 f"{extra_fields_text(target_id)}"
                 f"💬 В беседе: {'да' if in_chat else 'нет'}"
                 + ("\n" + "\n".join(flags) if flags else "")
@@ -16169,6 +16358,200 @@ async def adeldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============ /id, /amode, ПОИНТЫ ============
+
+async def aid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/id [user] — Telegram ID: свой, по reply или по @username/нику."""
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = await _resolve_global_target(update, context, context.args[0], all_conferences())
+    target_id = target_id or update.effective_user.id
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id in (None, -1):
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+    td = get_user_data(target_id)
+    name = td['nick'] if td else ("вы" if target_id == update.effective_user.id else "—")
+    await update.message.reply_text(f"🆔 {_html_escape(name)}: <code>{target_id}</code>", parse_mode='HTML')
+
+
+# Права «по умолчанию» при открытии чата, если прежние не сохранились (рестарт бота)
+_AMODE_OPEN = dict(
+    can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True,
+    can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True,
+    can_send_other_messages=True, can_add_web_page_previews=True, can_invite_users=True,
+    can_change_info=False, can_pin_messages=False, can_manage_topics=False,
+)
+_AMODE_CLOSED = {k: False for k in _AMODE_OPEN}
+
+
+async def aamode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/amode [on|off] — закрыть чат для всех (писать могут только админы Telegram)
+    или открыть обратно. Без аргумента — переключить."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'ban', 'amode'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    chat_id = _action_chat_id(update)
+    try:
+        chat = await context.bot.get_chat(chat_id)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось получить чат: {e}")
+        return
+    perms = chat.permissions
+    is_open = bool(perms and perms.can_send_messages)
+    arg = (context.args[0].lower() if context.args else '')
+    close = {'on': True, 'вкл': True, 'off': False, 'выкл': False}.get(arg, is_open)
+
+    key = f"amode_perms_{chat_id}"
+    try:
+        if close:
+            if perms and is_open:
+                context.bot_data[key] = perms.to_dict()   # чтобы вернуть как было
+            await context.bot.set_chat_permissions(chat_id, ChatPermissions(**_AMODE_CLOSED))
+        else:
+            saved = context.bot_data.pop(key, None)
+            new_perms = ChatPermissions.de_json(saved, context.bot) if saved else ChatPermissions(**_AMODE_OPEN)
+            await context.bot.set_chat_permissions(chat_id, new_perms)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не получилось (нужно право «Блокировка пользователей»): {e}")
+        return
+
+    log_action(user_id, 'amode', None, f"chat={chat_id} {'закрыт' if close else 'открыт'}")
+    text = (f"{WARN_ANNOUNCE_PREFIX} » Чат закрыт: писать могут только администраторы."
+            if close else f"{WARN_ANNOUNCE_PREFIX} » Чат открыт.")
+    if chat_id == update.effective_chat.id:
+        await update.message.reply_text(text)
+    else:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            pass
+        await update.message.reply_text(f"✅ {conf_title()}: чат {'закрыт' if close else 'открыт'}.")
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def points_word(n: int) -> str:
+    return _plural(n, "поинт", "поинта", "поинтов")
+
+
+def get_points(user_id: int) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT COALESCE(SUM(amount), 0) FROM points_log WHERE user_id = ?', (user_id,))
+    total = c.fetchone()[0] or 0
+    conn.close()
+    return int(total)
+
+
+async def apoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/point <user> <±кол-во> [причина] — начислить (или списать минусом) поинты."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'points', 'point'):
+        await update.message.reply_text("❌ Команда доступна с 4 ранга.")
+        return
+    args = list(context.args or [])
+    target_id = extract_user_id(update, context)
+    if target_id:
+        rest = args
+    elif args:
+        target_id = extract_user_id(update, context, args[0])
+        rest = args[1:]
+    else:
+        rest = []
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    try:
+        amount = int(rest[0]) if rest else None
+    except ValueError:
+        amount = None
+    if not target_id or target_id == -1 or not amount:
+        await update.message.reply_text(
+            "❌ /point <user> <кол-во> [причина]\n"
+            "Пример: /point @user 5 помощь новичкам · /point @user -3 опоздание"
+        )
+        return
+    if abs(amount) > 100000:
+        await update.message.reply_text("❌ Слишком большое число.")
+        return
+    td = get_user_data(target_id)
+    if not td:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в этой конференции.")
+        return
+    reason = ' '.join(rest[1:]).strip()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO points_log (user_id, amount, reason, issued_by, date) VALUES (?, ?, ?, ?, ?)',
+              (target_id, amount, reason, user_id, now_msk_str()))
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'points', target_id, f"{amount:+d} {reason}"[:300])
+    total = get_points(target_id)
+    if amount > 0:
+        line = f"Пользователь {td['nick']} получил {amount} {points_word(amount)}."
+    else:
+        line = f"У пользователя {td['nick']} списано {-amount} {points_word(amount)}."
+    text = f"{WARN_ANNOUNCE_PREFIX} » {line}\nТекущее кол-во: {total}"
+    if reason:
+        text += f"\n\nПричина: {reason}"
+    await announce_punishment(update, context, target_id, text)
+
+
+async def apointlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pointlist [user] — баланс и история поинтов."""
+    target_id = await _warns_target(update, context)
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+        return
+    td = get_user_data(target_id)
+    if not td:
+        await update.message.reply_text("❌ Пользователь не зарегистрирован.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT amount, reason, issued_by, date FROM points_log WHERE user_id = ? ORDER BY id DESC LIMIT 100',
+              (target_id,))
+    rows = c.fetchall()
+    conn.close()
+    lines = [f"🪙 ПОИНТЫ — {td['nick']}", "━━━━━━━━━━━━━━━━━", f"💰 Баланс: {get_points(target_id)}"]
+    if rows:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        for amount, reason, issued_by, date in rows:
+            lines.append(f"{'➕' if amount > 0 else '➖'} {abs(amount)} · {date}\n"
+                         f"  📝 {reason or '—'} · 👮 {get_admin_nick(issued_by) if issued_by else '—'}")
+    else:
+        lines.append("История пуста.")
+    await _send_long(update, "\n".join(lines))
+
+
+async def apoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/points — у кого есть поинты, по убыванию."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''SELECT p.user_id, u.game_nick, SUM(p.amount) AS total
+                 FROM points_log p JOIN users u ON u.user_id = p.user_id
+                 GROUP BY p.user_id, u.game_nick
+                 HAVING SUM(p.amount) <> 0
+                 ORDER BY SUM(p.amount) DESC, u.game_nick''')
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("🪙 Поинтов пока ни у кого нет.")
+        return
+    lines = [f"🪙 ПОИНТЫ ({len(rows)})", "━━━━━━━━━━━━━━━━━"]
+    lines += [f"{i}. {nick} — {total}" for i, (_uid, nick, total) in enumerate(rows, 1)]
+    await _send_long(update, "\n".join(lines))
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -16231,9 +16614,10 @@ def main():
         'start': start, 'info': ainfo, 'help': ahelp, 'profile': aprofile,
         'stats': astats, 'awards': aawards, 'nick': anick, 'search': asearch,
         'kick': akick, 'ban': aban, 'unban': aunban, 'mute': amute, 'unmute': aunmute, 'warn': awarn,
-        'warns': awarns, 'warnlist': awarns, 'unwarn': aunwarn, 'unwarnall': aunwarnall,
+        'warns': awarns, 'warnlist': awarnlist, 'mywarns': amywarns, 'unwarn': aunwarn, 'unwarnall': aunwarnall,
         'setrank': asetrank, 'setdept': asetdept, 'settoken': asettoken,
-        'admins': aadmins, 'userlist': auserlist, 'who': awhoprofile,
+        'admins': aadmins, 'userlist': auserlist, 'get': awhoprofile, 'id': aid,
+        'amode': aamode, 'point': apoint, 'pointlist': apointlist, 'points': apoints,
         'reports': areports, 'callsign': acallsign,
         'block': ablock, 'unblock': aunblock,
         'special': aspecial, 'whois': awhois, 'broadcast': abroadcast,
@@ -16454,6 +16838,8 @@ def main():
 
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
     application.job_queue.run_repeating(per_conf_job(expire_warnings_job), interval=3600, first=30)
+    # Закрытие голосований с истёкшим сроком — раз в минуту.
+    application.job_queue.run_repeating(per_conf_job(poll_deadline_job), interval=60, first=20)
     # Авто-разбан временных банов: проверяем каждые 5 минут.
     application.job_queue.run_repeating(per_conf_job(auto_unban_job), interval=300, first=45)
     # Главный преступник дня — ежедневно в 21:00 МСК
