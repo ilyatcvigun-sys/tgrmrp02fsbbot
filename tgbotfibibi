@@ -6975,8 +6975,9 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if notes_line:
         text += " – " + e(notes_line.replace("📝 ", "", 1))
 
-    # Скрытые комментарии: только спецдопуску и только в ЛС (в группе увидел бы весь чат)
-    if _can_see_comments(user_id) and is_private_chat(update):
+    # Скрытые комментарии: только спецдопуску и только в ЛС или лог-группе
+    # (в обычной группе их увидел бы весь чат)
+    if _can_see_comments(user_id) and _is_secure_chat(update):
         comments = get_user_comments(target_id)
         if comments:
             text += "\n<b>Скрытые комментарии</b> 🔒\n"
@@ -16545,10 +16546,17 @@ def _comments_text(target_id: int, nick: str) -> str:
     return "\n".join(lines)
 
 
+def _is_secure_chat(update: Update) -> bool:
+    """Чат, где скрытое можно показывать открыто: ЛС с ботом или лог-группа
+    PM_LOG_CHAT_ID (в ней только владелец и доверенные)."""
+    chat = update.effective_chat
+    return chat is not None and (chat.type == 'private' or chat.id == PM_LOG_CHAT_ID)
+
+
 async def _private_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Ответ так, чтобы его не увидел общий чат: в группе — удаляем команду и
-    пишем вызвавшему в ЛС; в ЛС — обычный ответ."""
-    if is_private_chat(update):
+    """Ответ так, чтобы его не увидел общий чат: в ЛС и в лог-группе — обычный
+    ответ; в остальных группах — удаляем команду и пишем вызвавшему в ЛС."""
+    if _is_secure_chat(update):
         for i in range(0, len(text), 4000):
             await update.message.reply_text(text[i:i + 4000])
         return
