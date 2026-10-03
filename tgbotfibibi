@@ -617,6 +617,7 @@ NON_GRANTABLE_COMMANDS = {
     'gban', 'ungban', 'global_unban', 'gban_list', 'check_gban',
     'setallrank',
     'tgadmin', 'tgunadmin',
+    'addcomment', 'comments', 'delcomment',
 }
 
 # Полный список зарегистрированных имён команд — заполняется в main() сразу
@@ -1661,6 +1662,17 @@ def init_database():
             c.execute(col_sql)
         except sqlite3.OperationalError:
             pass
+    # Скрытые комментарии о пользователе (/addcomment) — видит ТОЛЬКО спецдопуск
+    # и главный админ. Отдельно от user_notes: те видны с 4 ранга и в Mini App.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            author_id INTEGER,
+            text TEXT NOT NULL,
+            created_at TEXT DEFAULT ''
+        )
+    """)
     # Поинты (/point): каждая выдача/списание — отдельная строка, баланс = сумма.
     c.execute('''
         CREATE TABLE IF NOT EXISTS points_log (
@@ -2820,7 +2832,7 @@ HELP_SECTIONS = [
         ("help",      "[текст]",               "эта справка (с текстом — поиск команды)", 0),
         ("cancel",     "",                      "прервать начатую форму", 0),
         ("callsign",  "<новый позывной>",      "сменить себе позывной", 0),
-        ("get",       "<user>",                "информация о пользователе", 5),
+        ("get",       "+ | - | <user>",        "статистика: + своя (всем), - по ответу, <user> — чужая (с 5 ранга)", 0),
         ("id",        "[user]",                "Telegram ID (свой или чужой)", 0),
         ("pointlist", "[user]",                "поинты и их история", 0),
         ("points",    "",                      "у кого есть поинты", 0),
@@ -2896,6 +2908,9 @@ HELP_SECTIONS = [
         ("note_edit",  "<id> <текст>",         "изменить свою пометку", 4),
         ("note_pin",   "<id>",                 "закрепить или открепить пометку", 4),
         ("note_del",   "<id>",                 "удалить свою пометку", 4),
+        ("addcomment", "<user> <текст>",       "скрытый комментарий (видит только спецдопуск)", "spec"),
+        ("comments",   "<user>",               "скрытые комментарии о пользователе", "spec"),
+        ("delcomment", "<id>",                 "удалить скрытый комментарий", "spec"),
     ]),
 
     ("staff", "👥", "Ранги, отделы, состав", [
@@ -6860,17 +6875,34 @@ def _service_times(user_id: int, reg_date: str) -> tuple:
 
 
 async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Профиль другого пользователя"""
+    """Карточка пользователя.
+    /get +      — своя статистика (доступно всем)
+    /get -      — того, на чьё сообщение отвечаешь
+    /get @user  — указанного (или ответом на сообщение без аргументов)
+    """
     user_id = update.effective_user.id
-    if not has_permission(user_id, 'manage_ranks', 'get'):
-        await update.message.reply_text("❌ С 5 ранга.")
+    mode = (context.args[0].strip() if context.args else '')
+    if mode != '+' and not has_permission(user_id, 'manage_ranks', 'get'):
+        await update.message.reply_text("❌ Чужую статистику — с 5 ранга. Свою: /get +")
         return
-    
-    target_id = extract_user_id(update, context)
-    if not target_id and context.args:
-        target_id = extract_user_id(update, context, context.args[0])
+
+    if mode == '+':
+        target_id = user_id
+    elif mode in ('-', '—', '–'):
+        if not _is_real_reply(update.message) or not update.message.reply_to_message.from_user:
+            await update.message.reply_text("❌ /get - пишется ответом на сообщение нужного человека.")
+            return
+        target_id = update.message.reply_to_message.from_user.id
+    else:
+        target_id = extract_user_id(update, context)
+        if not target_id and context.args:
+            target_id = extract_user_id(update, context, context.args[0])
     if not target_id:
-        await update.message.reply_text("❌ /get @user")
+        await update.message.reply_text(
+            "❌ /get + — своя статистика\n"
+            "   /get - — ответом на сообщение\n"
+            "   /get @user — другого пользователя"
+        )
         return
     
     if isinstance(target_id, str) and target_id.startswith('@'):
@@ -6942,6 +6974,16 @@ async def awhoprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += row("Спецдопуск", "да")
     if notes_line:
         text += " – " + e(notes_line.replace("📝 ", "", 1))
+
+    # Скрытые комментарии: только спецдопуску и только в ЛС (в группе увидел бы весь чат)
+    if _can_see_comments(user_id) and is_private_chat(update):
+        comments = get_user_comments(target_id)
+        if comments:
+            text += "\n<b>Скрытые комментарии</b> 🔒\n"
+            for cid, author_id, ctext, created_at in comments[:10]:
+                text += f" – #{cid} {e(ctext)} ({e(get_admin_nick(author_id)) if author_id else '—'}, {e(created_at[:10])})\n"
+            if len(comments) > 10:
+                text += f" – … ещё {len(comments) - 10}, все — /comments\n"
 
     text += "\n<b>Время нахождения в беседе</b>\n"
     text += row("С приглашения", _fmt_span(since_join))
@@ -16473,6 +16515,140 @@ async def adeldept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============ СКРЫТЫЕ КОММЕНТАРИИ (только спецдопуск) ============
+# /addcomment, /comments, /delcomment. Никому, кроме главного админа и
+# спецдопуска, не показываются — нигде: ни в /get в общем чате, ни в Mini App.
+# В группе команда удаляется, а ответ уходит в ЛС, чтобы текст не видел чат.
+
+def _can_see_comments(user_id: int) -> bool:
+    return is_main_admin(user_id) or has_special_access(user_id)
+
+
+def get_user_comments(user_id: int) -> list:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, author_id, text, created_at FROM user_comments WHERE user_id = ? ORDER BY id DESC',
+              (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def _comments_text(target_id: int, nick: str) -> str:
+    rows = get_user_comments(target_id)
+    lines = [f"🔒 СКРЫТЫЕ КОММЕНТАРИИ — {nick}", "━━━━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("Комментариев нет.")
+    for cid, author_id, text, created_at in rows:
+        lines.append(f"#{cid} · {created_at} · 👮 {get_admin_nick(author_id) if author_id else '—'}\n📝 {text}")
+    lines.append("━━━━━━━━━━━━━━━━━\n/addcomment <user> <текст> · /delcomment <id>")
+    return "\n".join(lines)
+
+
+async def _private_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Ответ так, чтобы его не увидел общий чат: в группе — удаляем команду и
+    пишем вызвавшему в ЛС; в ЛС — обычный ответ."""
+    if is_private_chat(update):
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(text[i:i + 4000])
+        return
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    try:
+        for i in range(0, len(text), 4000):
+            await context.bot.send_message(chat_id=update.effective_user.id, text=text[i:i + 4000])
+    except Exception:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                message_thread_id=update.message.message_thread_id if update.message.is_topic_message else None,
+                text="🔒 Ответ скрытый — откройте ЛС с ботом и повторите команду там.")
+        except Exception:
+            pass
+
+
+async def _comment_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(target_id, остальные аргументы) — цель из reply или первого аргумента."""
+    args = list(context.args or [])
+    target_id = extract_user_id(update, context)
+    if target_id:
+        return target_id, args
+    if not args:
+        return None, []
+    target_id = extract_user_id(update, context, args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    return target_id, args[1:]
+
+
+async def aaddcomment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addcomment <user> <текст> — скрытый комментарий о пользователе."""
+    user_id = update.effective_user.id
+    if not _can_see_comments(user_id):
+        await update.message.reply_text("❌ Только спецдопуск.")
+        return
+    target_id, rest = await _comment_target(update, context)
+    text = ' '.join(rest).strip()
+    if not target_id or target_id == -1 or not text:
+        await _private_reply(update, context, "❌ /addcomment <user> <текст> (или ответом на сообщение)")
+        return
+    td = get_user_data(target_id)
+    if not td:
+        await _private_reply(update, context, "❌ Пользователь не зарегистрирован в этой конференции.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO user_comments (user_id, author_id, text, created_at) VALUES (?, ?, ?, ?)',
+              (target_id, user_id, text[:2000], now_msk_str()))
+    conn.commit()
+    conn.close()
+    # В журнал — только факт, без текста: /audit видят не только со спецдопуском
+    log_action(user_id, 'comment_add', target_id, "скрытый комментарий")
+    await _private_reply(update, context,
+                         f"🔒 Комментарий о {td['nick']} сохранён.\n📝 {text}\n\nВсе комментарии — /comments {target_id}")
+
+
+async def acomments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/comments <user> — скрытые комментарии о пользователе."""
+    user_id = update.effective_user.id
+    if not _can_see_comments(user_id):
+        await update.message.reply_text("❌ Только спецдопуск.")
+        return
+    target_id, _rest = await _comment_target(update, context)
+    td = get_user_data(target_id) if target_id and target_id != -1 else None
+    if not td:
+        await _private_reply(update, context, "❌ /comments <user> — пользователь не найден.")
+        return
+    await _private_reply(update, context, _comments_text(target_id, td['nick']))
+
+
+async def adelcomment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delcomment <id> — удалить скрытый комментарий."""
+    user_id = update.effective_user.id
+    if not _can_see_comments(user_id):
+        await update.message.reply_text("❌ Только спецдопуск.")
+        return
+    cid = _first_int_in_args(context.args)
+    if cid is None:
+        await _private_reply(update, context, "❌ /delcomment <id> — номер из /comments")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM user_comments WHERE id = ?', (cid,))
+    row = c.fetchone()
+    if row:
+        c.execute('DELETE FROM user_comments WHERE id = ?', (cid,))
+        conn.commit()
+    conn.close()
+    if not row:
+        await _private_reply(update, context, f"❌ Комментарий #{cid} не найден.")
+        return
+    log_action(user_id, 'comment_del', row[0], f"#{cid}")
+    await _private_reply(update, context, f"✅ Комментарий #{cid} удалён.")
+
+
 # ============ /id, /amode, ПОИНТЫ ============
 
 async def aid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -16773,6 +16949,7 @@ def main():
         'marry': amarry, 'divorce': adivorce, 'wedding': awedding,
         'weddings_list': aweddings_list, 'wedding_setdate': awedding_setdate,
         'note': anote, 'notes': anotes, 'note_del': anote_del,
+        'addcomment': aaddcomment, 'comments': acomments, 'delcomment': adelcomment,
         'note_edit': anote_edit, 'note_pin': anote_pin,
         'changelog': achangelog, 'changelog_list': achangelog_list,
         'changelog_add': achangelog_add, 'changelog_draft': achangelog_draft,
