@@ -223,13 +223,14 @@ PostgreSQL строже SQLite. Уже исправлено, не сломай �
 
 ---
 
-## Схема БД (26 таблиц в каждой конфе + глобальные `public.g_*`)
+## Схема БД (28 таблиц в каждой конфе + глобальные `public.g_*`)
 
 `users` `warnings` `awards` `reports` `gban` `departments` `department_groups`
 `polls` `poll_votes` `command_grants` `change_requests` `audit_log`
 `article_history` `duels` `cube_games` `changelogs` `idea_polls` `ideas`
 `topic_violations` `punishments` `marriages` `user_notes`
-`rank_names` `user_departments` `reg_fields` `user_fields`
+`rank_names` `user_departments` `reg_fields` `user_fields` `points_log`
+`user_comments`
 
 Заметки по данным:
 
@@ -260,6 +261,13 @@ PostgreSQL строже SQLite. Уже исправлено, не сломай �
   сообщения в чате конфы, с момента внедрения). Время в беседе — из
   `service_periods`: точное `started_at`, для старых записей — дата `hired_at`
   (её формат `дд.мм.гггг` не менять — правится из Mini App).
+- `user_comments` — **скрытые комментарии** (`/addcomment`, `/comments`,
+  `/delcomment`): видит и пишет только главный админ и спецдопуск
+  (`_can_see_comments`), грантом не выдаются. Не путать с `user_notes`
+  (пометки с 4 ранга, видны в Mini App). Правила: ответы только через
+  `_private_reply()` (в группе команда удаляется, ответ уходит в ЛС); в `/get`
+  раздел показывается только спецдопуску и только в ЛС; в `audit_log` пишется
+  факт без текста. Не выводи их больше нигде.
 - `command_grants` — единственная таблица **без колонки `id`** (составной ключ).
   Слой совместимости это учитывает при эмуляции `lastrowid`.
 - **Голосования:** в топике конфы цифры НЕ показываются — только «идёт» и
@@ -411,7 +419,7 @@ Telegram, позывной → `'—'`), свои — в `user_fields` и выв
 с учётом прав.
 
 Проверка покрытия — сверь список из словарей `commands` и `no_prefix` в `main()`
-с реестром. На момент написания: 142 команды. `/who`
+с реестром. На момент написания: 145 команд. `/who`
 переименована в `/get` (гранты на `who` переносятся при старте), пропущенных нет.
 
 ---
