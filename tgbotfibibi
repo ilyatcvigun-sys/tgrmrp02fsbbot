@@ -1657,6 +1657,8 @@ def init_database():
         "ALTER TABLE users ADD COLUMN msg_count INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN last_msg_at TEXT DEFAULT ''",
         "ALTER TABLE service_periods ADD COLUMN started_at TEXT DEFAULT ''",
+        # /tagskip: кому не слать ЛС-уведомления от /tagall
+        "ALTER TABLE users ADD COLUMN tagall_skip INTEGER DEFAULT 0",
     ):
         try:
             c.execute(col_sql)
@@ -2836,6 +2838,7 @@ HELP_SECTIONS = [
         ("id",        "[user]",                "Telegram ID (свой или чужой)", 0),
         ("pointlist", "[user]",                "поинты и их история", 0),
         ("points",    "",                      "у кого есть поинты", 0),
+        ("top",       "",                      "топ по количеству сообщений", 0),
         ("whois",     "<id>",                  "полная информация по ID", "spec"),
     ]),
 
@@ -2921,6 +2924,7 @@ HELP_SECTIONS = [
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
         ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
         ("tagall",     "<текст>",              "тегнуть всех активных; гиперссылки сохраняются, ответом на файл — с вложением", 5),
+        ("tagskip",    "[user]",               "кому не слать уведомления от /tagall: без аргумента — список, с <user> — добавить/убрать", 5),
         ("department", "add|remove|rename|list|find", "управление отделами", 5),
         ("setalldept", "<номер>",              "перевести всех в отдел", 5),
         ("setallrank", "<0-7>",                "выставить всем ранг", "main"),
@@ -8810,11 +8814,15 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
-    members = [r[0] for r in c.fetchall()]
+    c.execute('SELECT user_id, COALESCE(tagall_skip, 0) FROM users '
+              'WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    rows = c.fetchall()
     conn.close()
+    # Список исключений (/tagskip): в чат обращение уходит, в ЛС этим людям — нет
+    members = [uid for uid, skip in rows if not skip]
+    skipped = len(rows) - len(members)
 
-    if not members:
+    if not rows:
         await update.message.reply_text("❌ Некого тегать — нет активных пользователей.")
         return
 
@@ -8863,12 +8871,69 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ ТЕГ ВСЕХ ОТПРАВЛЕН\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"👥 Активных пользователей: {len(members)}\n"
+        f"👥 Активных пользователей: {len(rows)}\n"
         f"📤 Сообщение → {summary_chat}\n"
         f"📎 Вложение: {'да' if attachment else 'нет'}\n"
         f"📨 В ЛС доставлено: {delivered}\n"
-        f"⛔ Не доставлено в ЛС: {failed}"
+        f"⛔ Не доставлено в ЛС: {failed}\n"
+        f"🔕 В исключениях (/tagskip): {skipped}"
     )
+
+
+async def atagskip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tagskip — список тех, кому /tagall не шлёт уведомление в ЛС.
+    /tagskip <user> (или ответом) — добавить в список / убрать из него."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'tagskip'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if not target_id:
+        if context.args:
+            conn.close()
+            await update.message.reply_text("❌ Пользователь не найден.")
+            return
+        c.execute('SELECT game_nick FROM users WHERE COALESCE(tagall_skip, 0) = 1 ORDER BY game_nick')
+        nicks = [r[0] for r in c.fetchall()]
+        conn.close()
+        text = f"🔕 ИСКЛЮЧЕНИЯ /tagall ({len(nicks)})\n━━━━━━━━━━━━━━━━━\n"
+        if nicks:
+            text += "\n".join(f"{i}. {nick}" for i, nick in enumerate(nicks, 1))
+        else:
+            text += "Список пуст."
+        text += "\n━━━━━━━━━━━━━━━━━\n➕➖ /tagskip <user> — добавить или убрать"
+        await _send_long(update, text)
+        return
+
+    c.execute('SELECT game_nick, COALESCE(tagall_skip, 0) FROM users WHERE user_id = ?', (target_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        await update.message.reply_text("❌ Пользователь не зарегистрирован в этой конференции.")
+        return
+    nick, skip = row
+    new_skip = 0 if skip else 1
+    c.execute('UPDATE users SET tagall_skip = ? WHERE user_id = ?', (new_skip, target_id))
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'tagskip', target_id, 'добавлен' if new_skip else 'убран')
+    if new_skip:
+        await update.message.reply_text(
+            f"🔕 {nick} добавлен в исключения /tagall — уведомления в ЛС приходить не будут.")
+    else:
+        await update.message.reply_text(
+            f"🔔 {nick} убран из исключений /tagall — уведомления в ЛС снова приходят.")
 
 # ============ ИНДИВИДУАЛЬНЫЕ ГРАНТЫ: КОМАНДЫ УПРАВЛЕНИЯ ============
 
@@ -16851,6 +16916,66 @@ async def apoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_long(update, "\n".join(lines))
 
 
+# ============ ТОП ПО СООБЩЕНИЯМ ============
+
+TOP_PAGE_SIZE = 15
+
+
+def _top_page(page: int):
+    """Текст и кнопки страницы /top. Счётчик — users.msg_count (см. track_username)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT game_nick, msg_count FROM users WHERE COALESCE(msg_count, 0) > 0 '
+              'ORDER BY msg_count DESC, game_nick')
+    rows = c.fetchall()
+    conn.close()
+    pages_count = max(1, (len(rows) + TOP_PAGE_SIZE - 1) // TOP_PAGE_SIZE)
+    page = max(0, min(page, pages_count - 1))
+    start = page * TOP_PAGE_SIZE
+    text = f"{WARN_ANNOUNCE_PREFIX} » ТОП пользователей. Страница: {page + 1}/{pages_count}\n\n"
+    if rows:
+        text += "\n".join(
+            f"<b>{i}.</b> {_html_escape(nick)}, <b>Кол-во сообщений: {count}</b>"
+            for i, (nick, count) in enumerate(rows[start:start + TOP_PAGE_SIZE], start + 1)
+        )
+    else:
+        text += "Сообщений пока никто не написал."
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Пред. Страница", callback_data=f"toppg:{(page - 1) % pages_count}"),
+        InlineKeyboardButton("Обновить", callback_data=f"toppg:{page}"),
+        InlineKeyboardButton("След. Страница", callback_data=f"toppg:{(page + 1) % pages_count}"),
+    ]])
+    return text, kb
+
+
+async def atop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/top — топ пользователей по количеству сообщений в конференции."""
+    if not get_user_data(update.effective_user.id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    text, kb = _top_page(0)
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+
+
+async def top_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки под /top. Топ перечитывается при каждом нажатии."""
+    query = update.callback_query
+    if not get_user_data(query.from_user.id):
+        await query.answer("❌ Вы не зарегистрированы.", show_alert=True)
+        return
+    try:
+        page = int((query.data or "").split(":", 1)[-1])
+    except ValueError:
+        await query.answer()
+        return
+    text, kb = _top_page(page)
+    await query.answer()
+    try:
+        await query.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+    except Exception:
+        pass  # «message is not modified» — топ не изменился
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -16916,7 +17041,7 @@ def main():
         'warns': awarns, 'warnlist': awarnlist, 'mywarns': amywarns, 'unwarn': aunwarn, 'unwarnall': aunwarnall,
         'setrank': asetrank, 'setdept': asetdept, 'settoken': asettoken,
         'admins': aadmins, 'userlist': auserlist, 'get': awhoprofile, 'id': aid,
-        'amode': aamode, 'point': apoint, 'pointlist': apointlist, 'points': apoints,
+        'amode': aamode, 'point': apoint, 'pointlist': apointlist, 'points': apoints, 'top': atop,
         'reports': areports, 'callsign': acallsign,
         'block': ablock, 'unblock': aunblock,
         'special': aspecial, 'whois': awhois, 'broadcast': abroadcast,
@@ -16942,7 +17067,7 @@ def main():
         'dept_group_add': adept_group_add, 'dept_group_del': adept_group_del,
         'dept_group_assign': adept_group_assign, 'dept_apply_template': adept_apply_template,
         'poll_create': apoll_create, 'poll_multi': apoll_multi, 'vote': avote, 'add': aadd, 'poll_info': apoll_info, 'poll_close': apoll_close, 'polls': apolls,
-        'tag': atag, 'tagdept': atagdept, 'tagall': atagall,
+        'tag': atag, 'tagdept': atagdept, 'tagall': atagall, 'tagskip': atagskip,
         'grant': agrant, 'revoke': arevoke, 'perms': aperms, 'grantlist': agrantlist, 'grantcmds': agrantcmds,
         'cmdrank': acmdrank,
         'requests': arequests, 'request_info': arequest_info,
@@ -17108,6 +17233,7 @@ def main():
     # Настройка видимости отделов в /find
     application.add_handler(CallbackQueryHandler(afindsetup_callback, pattern=r'^findsetup:'))
     application.add_handler(CallbackQueryHandler(find_page_callback, pattern=r'^findpg:'))
+    application.add_handler(CallbackQueryHandler(top_page_callback, pattern=r'^toppg:'))
     application.add_handler(CallbackQueryHandler(aconf_callback, pattern=r'^conf:sw:'))
     # Справка: переключение разделов кнопками
     application.add_handler(CallbackQueryHandler(ahelp_callback, pattern=r'^help:'))
