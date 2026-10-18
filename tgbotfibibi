@@ -1686,6 +1686,24 @@ def init_database():
             date TEXT DEFAULT ''
         )
     ''')
+    # Новый год (/ny): режимы систем, служебные значения, Санта, адвент, снежки,
+    # помесячный счётчик сообщений для итогов года.
+    c.execute('''CREATE TABLE IF NOT EXISTS ny_settings (
+        system TEXT PRIMARY KEY, mode TEXT DEFAULT 'auto', until TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ny_kv (key TEXT PRIMARY KEY, value TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS santa (
+        year INTEGER NOT NULL, user_id INTEGER NOT NULL, receiver_id INTEGER,
+        gift_received INTEGER DEFAULT 0, joined_at TEXT DEFAULT '',
+        PRIMARY KEY (year, user_id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS advent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        day TEXT NOT NULL, prize TEXT, points INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS snowballs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, thrower_id INTEGER NOT NULL,
+        target_id INTEGER NOT NULL, hit INTEGER DEFAULT 0, thrown_at TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS msg_monthly (
+        user_id INTEGER NOT NULL, month TEXT NOT NULL, cnt INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, month))''')
     # Поля регистрации конфы (/regfields). Встроенные — field_key 'nick' и
     # 'callsign' (пишутся в users), свои — field_key NULL, ответы в user_fields.
     c.execute('''
@@ -2869,6 +2887,18 @@ HELP_SECTIONS = [
         ("reloadarticles", "",                 "перечитать базу статей УК", "main"),
     ]),
 
+    ("newyear", "🎄", "Новый год", [
+        ("ny",         "[on|off|auto <система|all> [дд.мм]]", "статус новогодних систем; выключить до даты, включить, вернуть по сезону", 0),
+        ("santa",      "[join|leave|msg|reply|gift|me]", "Тайный Санта; руководству ещё list|draw|reveal|reset", 0),
+        ("advent",     "",                     "адвент-календарь: окошко раз в сутки, поинты и бонус за серию", 0),
+        ("snowball",   "<@user>",              "кинуть снежок (или «снежок @user»)", 0),
+        ("snowstats",  "[@user]",              "снайперы и сугробы сезона", 0),
+        ("year",       "[@user|all]",          "итоги года: личные или всей конфы", 0),
+        ("nypoll",     "[срок] [номинация]",   "голосование «Сотрудник года» по самым активным", 6),
+        ("nyset",      "[текст|-]",            "поздравление в 00:00 1 января", 7),
+        ("amnesty",    "[причина]",            "новогодняя амнистия: снять всем преды", 7),
+    ]),
+
     ("reports", "📨", "Жалобы и выговоры", [
         ("report",      "",                    "подать жалобу", 0),
         ("reports",     "",                    "список жалоб", 4),
@@ -3239,6 +3269,7 @@ AWARD_TYPES = {
     'грамота':    '📜 Грамота',
     'благодарность': '🤝 Благодарность',
     'знак':       '⭐ Знак отличия',
+    'новогодняя': '❄️ Новогодняя награда',   # только пока работает /ny awards
 }
 
 
@@ -3302,6 +3333,8 @@ async def aaward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0].lower() in AWARD_TYPES:
         award_type = args[0].lower()
         args = args[1:]
+    if award_type == 'новогодняя' and not await _ny_gate(update, 'awards'):
+        return
     
     award_name = ' '.join(args).strip()
     if not award_name:
@@ -11223,6 +11256,9 @@ async def track_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c = conn.cursor()
             c.execute('UPDATE users SET msg_count = COALESCE(msg_count, 0) + 1, last_msg_at = ? WHERE user_id = ?',
                       (now_msk_str(), user.id))
+            c.execute('SELECT 1 FROM users WHERE user_id = ?', (user.id,))
+            if c.fetchone():
+                count_monthly_message(c, user.id)  # для итогов года (/year)
             conn.commit()
             conn.close()
     except Exception as e:
@@ -11637,7 +11673,8 @@ async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_
             logger.warning(f"topic violation: add_warning failed: {e}")
     
     # 7. Составляем санкционную строку
-    kind_label = {"cubes": "«кубы»", "article": "«моя статья»"}.get(kind, kind)
+    kind_label = {"cubes": "«кубы»", "article": "«моя статья»", "snowball": "«снежок»",
+                  "advent": "«адвент»"}.get(kind, kind)
     sanction_lines = ["🗑 Сообщение удалено"]
     if mute_applied:
         sanction_lines.append(f"🤐 Мут на {mute_min} мин")
@@ -16976,6 +17013,974 @@ async def top_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # «message is not modified» — топ не изменился
 
 
+# ============ НОВЫЙ ГОД ============
+# Сезонные системы: Тайный Санта, адвент-календарь, снежки, обратный отсчёт с
+# поздравлением, итоги года, новогодние награды, амнистия. У каждой — свой сезон
+# (NY_SYSTEMS), вне сезона она молчит. /ny — выключить систему до нужного дня,
+# включить вручную вне сезона или вернуть «по сезону». Настройки — свои в каждой
+# конфе (таблица ny_settings), служебные значения — в ny_kv.
+
+# ключ: (название, начало сезона ММ-ДД, конец сезона ММ-ДД — включительно)
+NY_SYSTEMS = {
+    'santa':     ("🎅 Тайный Санта",        "11-25", "01-10"),
+    'advent':    ("🎄 Адвент-календарь",    "12-01", "12-31"),
+    'snow':      ("❄️ Снежки",              "12-01", "01-14"),
+    'countdown': ("⏳ Отсчёт и поздравление", "12-01", "01-01"),
+    'year':      ("📊 Итоги года",          "12-15", "01-31"),
+    'awards':    ("🏅 Новогодние награды и «Сотрудник года»", "12-01", "01-31"),
+    'amnesty':   ("🕊 Амнистия",            "12-25", "01-10"),
+}
+
+NY_DEFAULT_GREETING = (
+    "🎆 С НОВЫМ ГОДОМ!\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "Спасибо каждому за этот год — за службу, активность и терпение друг к другу.\n"
+    "Пусть следующий будет ещё лучше. С праздником! 🥂"
+)
+
+
+def _ny_today() -> str:
+    return now_msk().strftime("%Y-%m-%d")
+
+
+def _ny_year() -> int:
+    """Год, который встречаем: с июля по декабрь — следующий, в январе-июне — текущий."""
+    now = now_msk()
+    return now.year + 1 if now.month >= 7 else now.year
+
+
+def _ny_stats_year() -> int:
+    """Год, за который подводим итоги: в январе — прошедший."""
+    now = now_msk()
+    return now.year - 1 if now.month == 1 else now.year
+
+
+def _ny_in_season(system: str, today: str = None) -> bool:
+    _, start, end = NY_SYSTEMS[system]
+    md = (today or _ny_today())[5:]
+    if start <= end:
+        return start <= md <= end
+    return md >= start or md <= end
+
+
+def ny_kv_get(key: str, default=None):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT value FROM ny_kv WHERE key = ?', (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def ny_kv_set(key: str, value):
+    """Delete+insert — как с тумблерами /cmdrank, без опоры на ON CONFLICT."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM ny_kv WHERE key = ?', (key,))
+    if value is not None:
+        c.execute('INSERT INTO ny_kv (key, value) VALUES (?, ?)', (key, str(value)))
+    conn.commit()
+    conn.close()
+
+
+def _ny_setting(system: str):
+    """(mode, until): mode — 'auto' | 'on' | 'off', until — 'YYYY-MM-DD' или None."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT mode, until FROM ny_settings WHERE system = ?', (system,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return 'auto', None
+    mode, until = row[0] or 'auto', row[1] or None
+    # Срок выключения прошёл — система снова работает по сезону
+    if mode == 'off' and until and _ny_today() >= until:
+        return 'auto', None
+    return mode, until
+
+
+def _ny_set(system: str, mode: str, until: str = None):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM ny_settings WHERE system = ?', (system,))
+    if mode != 'auto':
+        c.execute('INSERT INTO ny_settings (system, mode, until) VALUES (?, ?, ?)', (system, mode, until))
+    conn.commit()
+    conn.close()
+
+
+def ny_active(system: str) -> bool:
+    mode, _ = _ny_setting(system)
+    if mode == 'off':
+        return False
+    if mode == 'on':
+        return True
+    return _ny_in_season(system)
+
+
+def _ny_ddmm(md: str) -> str:
+    return f"{md[3:]}.{md[:2]}"
+
+
+def _ny_until_view(until: str) -> str:
+    return datetime.strptime(until, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+
+def _ny_state_text(system: str) -> str:
+    _, start, end = NY_SYSTEMS[system]
+    mode, until = _ny_setting(system)
+    if mode == 'off':
+        return f"🔴 выключена до {_ny_until_view(until)}" if until else "🔴 выключена (до /ny on)"
+    if mode == 'on':
+        return "🟢 включена вручную"
+    if _ny_in_season(system):
+        return f"🟢 работает (сезон {_ny_ddmm(start)}–{_ny_ddmm(end)})"
+    return f"⚪ не сезон ({_ny_ddmm(start)}–{_ny_ddmm(end)})"
+
+
+async def _ny_gate(update: Update, system: str) -> bool:
+    """True — система работает; иначе отвечает почему нет."""
+    if ny_active(system):
+        return True
+    title = NY_SYSTEMS[system][0]
+    mode, until = _ny_setting(system)
+    if mode == 'off':
+        why = f"выключено до {_ny_until_view(until)}" if until else "выключено руководством"
+    else:
+        _, start, end = NY_SYSTEMS[system]
+        why = f"работает с {_ny_ddmm(start)} по {_ny_ddmm(end)}"
+    if update.message:
+        await update.message.reply_text(f"{title} сейчас недоступно — {why}.")
+    return False
+
+
+def _ny_admin(user_id: int) -> bool:
+    """Управление новогодними системами: главный админ, спецдопуск, 7 ранг, грант на ny."""
+    return has_permission(user_id, 'ny', 'ny')
+
+
+def _ny_parse_until(arg: str):
+    """'дд.мм' или 'дд.мм.гггг' → 'YYYY-MM-DD' (дд.мм уже прошло — значит следующий год)."""
+    m = re.fullmatch(r'(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?', arg.strip())
+    if not m:
+        return None
+    day, month = int(m.group(1)), int(m.group(2))
+    today = now_msk().date()
+    year = int(m.group(3)) if m.group(3) else today.year
+    try:
+        d = datetime(year, month, day).date()
+    except ValueError:
+        return None
+    if not m.group(3) and d <= today:
+        d = d.replace(year=today.year + 1)
+    if d <= today:
+        return None
+    return d.strftime("%Y-%m-%d")
+
+
+def _ny_status_text() -> str:
+    lines = ["🎄 НОВОГОДНИЕ СИСТЕМЫ", "━━━━━━━━━━━━━━━━━"]
+    for key, (title, _, _) in NY_SYSTEMS.items():
+        lines.append(f"{title} [{key}]\n  {_ny_state_text(key)}")
+    lines += [
+        "━━━━━━━━━━━━━━━━━",
+        "🔴 /ny off <система|all> [дд.мм] — выключить (до даты или бессрочно)",
+        "🟢 /ny on <система|all> — включить вручную, даже вне сезона",
+        "⚪ /ny auto <система|all> — вернуть работу по сезону",
+        "💬 /nyset <текст> — своё поздравление в 00:00 (без текста — показать)",
+    ]
+    return "\n".join(lines)
+
+
+async def any_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ny — статус новогодних систем и управление ими."""
+    user_id = update.effective_user.id
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text(_ny_status_text())
+        return
+    if not _ny_admin(user_id):
+        await update.message.reply_text("❌ Управлять системами могут главный админ, спецдопуск и 7 ранг.")
+        return
+    action = args[0].lower()
+    if action not in ('on', 'off', 'auto') or len(args) < 2:
+        await update.message.reply_text(
+            "❌ /ny off <система|all> [дд.мм] · /ny on <система|all> · /ny auto <система|all>\n"
+            f"Системы: {', '.join(NY_SYSTEMS)}")
+        return
+    target = args[1].lower()
+    if target != 'all' and target not in NY_SYSTEMS:
+        await update.message.reply_text(f"❌ Нет такой системы. Есть: {', '.join(NY_SYSTEMS)}, all")
+        return
+    until = None
+    if action == 'off' and len(args) > 2:
+        until = _ny_parse_until(args[2])
+        if not until:
+            await update.message.reply_text("❌ Дата — дд.мм или дд.мм.гггг, и она должна быть в будущем.")
+            return
+    systems = list(NY_SYSTEMS) if target == 'all' else [target]
+    for s in systems:
+        _ny_set(s, action, until)
+    log_action(user_id, 'ny', None, f"{action} {target}" + (f" до {until}" if until else ""))
+    if action == 'off':
+        head = f"🔴 Выключено до {_ny_until_view(until)} — в этот день включится само." if until \
+            else "🔴 Выключено до команды /ny on или /ny auto."
+    elif action == 'on':
+        head = "🟢 Включено вручную — работает и вне сезона."
+    else:
+        head = "⚪ Работает по сезону."
+    await update.message.reply_text(
+        head + "\n━━━━━━━━━━━━━━━━━\n" + "\n".join(f"{NY_SYSTEMS[s][0]}: {_ny_state_text(s)}" for s in systems))
+
+
+async def anyset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/nyset [текст] — поздравление, которое уйдёт в конфу ровно в 00:00 МСК 1 января."""
+    user_id = update.effective_user.id
+    if not _ny_admin(user_id):
+        await update.message.reply_text("❌ Доступно главному админу, спецдопуску и 7 рангу.")
+        return
+    text = (update.message.text or "").split(None, 1)
+    if len(text) < 2:
+        current = ny_kv_get('greeting_text')
+        await update.message.reply_text(
+            ("💬 Своё поздравление:\n\n" + current) if current
+            else ("💬 Своё не задано, уйдёт стандартное:\n\n" + NY_DEFAULT_GREETING)
+            + "\n━━━━━━━━━━━━━━━━━\n/nyset <текст> — задать · /nyset - — вернуть стандартное")
+        return
+    body = text[1].strip()
+    if body == '-':
+        ny_kv_set('greeting_text', None)
+        await update.message.reply_text("✅ Вернул стандартное поздравление.")
+        return
+    ny_kv_set('greeting_text', body[:3500])
+    log_action(user_id, 'nyset', None, body[:200])
+    await update.message.reply_text("✅ Поздравление сохранено. Уйдёт в конфу в 00:00 МСК 1 января.")
+
+
+# ---------- Счётчик сообщений по месяцам (для итогов года) ----------
+
+def count_monthly_message(c, user_id: int):
+    """+1 в msg_monthly за текущий месяц. Вызывается из track_username на его курсоре."""
+    month = now_msk().strftime("%Y-%m")
+    c.execute('SELECT 1 FROM msg_monthly WHERE user_id = ? AND month = ?', (user_id, month))
+    if c.fetchone():
+        c.execute('UPDATE msg_monthly SET cnt = cnt + 1 WHERE user_id = ? AND month = ?', (user_id, month))
+    else:
+        try:
+            c.execute('INSERT INTO msg_monthly (user_id, month, cnt) VALUES (?, ?, 1)', (user_id, month))
+        except sqlite3.IntegrityError:
+            c.execute('UPDATE msg_monthly SET cnt = cnt + 1 WHERE user_id = ? AND month = ?', (user_id, month))
+
+
+# ---------- Тайный Санта ----------
+
+def _santa_rows(year: int) -> list:
+    """[(user_id, receiver_id, gift_received)] участников года."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id, receiver_id, COALESCE(gift_received, 0) FROM santa WHERE year = ? ORDER BY joined_at',
+              (year,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def _nick(user_id) -> str:
+    ud = get_user_data(user_id) if user_id else None
+    return ud['nick'] if ud else f"ID {user_id}"
+
+
+SANTA_HELP = (
+    "🎅 ТАЙНЫЙ САНТА\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "➕ /santa join — участвовать · ➖ /santa leave — выйти (до жеребьёвки)\n"
+    "✉️ /santa msg <текст> — анонимно написать своему получателю\n"
+    "↩️ /santa reply <текст> — анонимно ответить своему Санте\n"
+    "🎁 /santa gift — отметить, что подарок получен\n"
+    "👀 /santa me — кому дарю я (ответ в ЛС)"
+)
+SANTA_ADMIN_HELP = (
+    "\n━━━━━━━━━━━━━━━━━\n"
+    "📋 /santa list — участники · 🎲 /santa draw — жеребьёвка\n"
+    "🎉 /santa reveal — раскрыть всех Сант в конфе · ♻️ /santa reset — начать заново"
+)
+
+
+async def asanta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/santa join|leave|msg|reply|gift|me|list|draw|reveal|reset — Тайный Санта."""
+    if not await _ny_gate(update, 'santa'):
+        return
+    user_id = update.effective_user.id
+    if not get_user_data(user_id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    year = _ny_year()
+    args = list(context.args or [])
+    sub = args[0].lower() if args else ''
+    text_arg = ' '.join(args[1:]).strip()
+    rows = _santa_rows(year)
+    me = next((r for r in rows if r[0] == user_id), None)
+    drawn = ny_kv_get(f'santa_drawn_{year}') == '1'
+    admin = _ny_admin(user_id)
+
+    if not sub:
+        status = (f"👥 Участников: {len(rows)}\n"
+                  f"🎲 Жеребьёвка: {'проведена' if drawn else 'ещё не было'}\n"
+                  f"🙋 Вы: {'участвуете' if me else 'не участвуете'}\n━━━━━━━━━━━━━━━━━\n")
+        await update.message.reply_text(status + SANTA_HELP + (SANTA_ADMIN_HELP if admin else ""))
+        return
+
+    if sub == 'join':
+        if me:
+            await update.message.reply_text("🎅 Вы уже участвуете.")
+            return
+        if drawn:
+            await update.message.reply_text("❌ Жеребьёвка уже прошла — записаться нельзя.")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO santa (year, user_id, joined_at) VALUES (?, ?, ?)', (year, user_id, now_msk_str()))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"🎅 Вы в игре! Участников: {len(rows) + 1}. "
+                                        "Кому дарить — бот напишет в ЛС после жеребьёвки.")
+        return
+
+    if sub == 'leave':
+        if not me:
+            await update.message.reply_text("❌ Вы не участвуете.")
+            return
+        if drawn:
+            await update.message.reply_text("❌ После жеребьёвки выйти нельзя — обратитесь к руководству.")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('DELETE FROM santa WHERE year = ? AND user_id = ?', (year, user_id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("➖ Вы вышли из Тайного Санты.")
+        return
+
+    if sub in ('me', 'msg', 'reply', 'gift'):
+        if not me or not drawn:
+            await _private_reply(update, context, "❌ Вы не участвуете или жеребьёвки ещё не было.")
+            return
+        receiver = me[1]
+        my_santa = next((r[0] for r in rows if r[1] == user_id), None)
+        if sub == 'me':
+            await _private_reply(update, context, f"🎅 Вы — Тайный Санта для: {_nick(receiver)}")
+            return
+        if sub == 'gift':
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('UPDATE santa SET gift_received = 1 WHERE year = ? AND user_id = ?', (year, my_santa))
+            conn.commit()
+            conn.close()
+            await _private_reply(update, context, "🎁 Отметили: подарок получен. Санта узнает!")
+            if my_santa:
+                await notify_user(context, my_santa, f"🎁 {_nick(user_id)} получил(а) ваш подарок. Хо-хо-хо!")
+            return
+        if not text_arg:
+            await _private_reply(update, context, f"❌ /santa {sub} <текст>")
+            return
+        if sub == 'msg':
+            to, head = receiver, "🎅 ВАШ ТАЙНЫЙ САНТА ПИШЕТ"
+            hint = "↩️ Ответить анонимно: /santa reply <текст>"
+        else:
+            to, head = my_santa, f"↩️ ОТВЕТ ОТ {_nick(user_id).upper()} (вашего получателя)"
+            hint = "✉️ Написать ещё: /santa msg <текст>"
+        try:
+            await context.bot.send_message(chat_id=to, text=f"{head}\n━━━━━━━━━━━━━━━━━\n{text_arg}\n━━━━━━━━━━━━━━━━━\n{hint}")
+            await _private_reply(update, context, "✅ Отправлено анонимно.")
+        except Exception:
+            await _private_reply(update, context, "❌ Не доставлено — человек не открыл ЛС с ботом.")
+        return
+
+    if not admin:
+        await update.message.reply_text(SANTA_HELP)
+        return
+
+    if sub == 'list':
+        lines = [f"📋 УЧАСТНИКИ САНТЫ {year} ({len(rows)})", "━━━━━━━━━━━━━━━━━"]
+        lines += [f"{i}. {_nick(uid)}" + (" 🎁" if gift else "") for i, (uid, _r, gift) in enumerate(rows, 1)]
+        await _private_reply(update, context, "\n".join(lines))
+        return
+
+    if sub == 'draw':
+        if drawn:
+            await update.message.reply_text("❌ Жеребьёвка уже была. Начать заново — /santa reset.")
+            return
+        if len(rows) < 3:
+            await update.message.reply_text("❌ Нужно хотя бы 3 участника.")
+            return
+        # Один общий круг: никто не дарит себе и нет взаимных пар
+        ids = [r[0] for r in rows]
+        random.shuffle(ids)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        for i, uid in enumerate(ids):
+            c.execute('UPDATE santa SET receiver_id = ? WHERE year = ? AND user_id = ?',
+                      (ids[(i + 1) % len(ids)], year, uid))
+        conn.commit()
+        conn.close()
+        ny_kv_set(f'santa_drawn_{year}', '1')
+        log_action(user_id, 'santa_draw', None, f"{len(ids)} участников")
+        failed = []
+        for i, uid in enumerate(ids):
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"🎅 ЖЕРЕБЬЁВКА ПРОШЛА\n━━━━━━━━━━━━━━━━━\n🎁 Вы дарите: {_nick(ids[(i + 1) % len(ids)])}\n"
+                         "🤫 Никому не говорите!\n━━━━━━━━━━━━━━━━━\n✉️ /santa msg <текст> — написать анонимно")
+            except Exception:
+                failed.append(_nick(uid))
+            await asyncio.sleep(0.05)
+        await update.message.reply_text(
+            f"🎲 Жеребьёвка проведена: {len(ids)} участников."
+            + (f"\n⚠️ Не дошло в ЛС (пусть напишут /santa me): {', '.join(failed)}" if failed else ""))
+        return
+
+    if sub == 'reveal':
+        if not drawn:
+            await update.message.reply_text("❌ Жеребьёвки ещё не было.")
+            return
+        lines = [f"🎉 ТАЙНЫЕ САНТЫ {year} РАСКРЫТЫ!", "━━━━━━━━━━━━━━━━━"]
+        lines += [f"🎅 {_nick(uid)} → {_nick(rec)}" + (" 🎁" if gift else "") for uid, rec, gift in rows if rec]
+        lines.append("━━━━━━━━━━━━━━━━━\n🎁 — подарок получен")
+        try:
+            await context.bot.send_message(chat_id=conf_chat(), text="\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Не удалось отправить в конфу: {e}")
+            return
+        if update.effective_chat.id != conf_chat():
+            await update.message.reply_text("✅ Отправлено в конфу.")
+        return
+
+    if sub == 'reset':
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('DELETE FROM santa WHERE year = ?', (year,))
+        conn.commit()
+        conn.close()
+        ny_kv_set(f'santa_drawn_{year}', None)
+        log_action(user_id, 'santa_reset', None, str(year))
+        await update.message.reply_text("♻️ Санта сброшен: участники и жеребьёвка удалены.")
+        return
+
+    await update.message.reply_text(SANTA_HELP + SANTA_ADMIN_HELP)
+
+
+# ---------- Адвент-календарь ----------
+
+ADVENT_STREAK_BONUS_EVERY = 7
+ADVENT_STREAK_BONUS = 20
+ADVENT_EMPTY = [
+    "🧦 В окошке — тёплые носки. Поинтов нет, зато уютно.",
+    "🍊 Мандаринка! Вкусно, но не конвертируется в поинты.",
+    "⛄ Снеговик подмигнул и ушёл. Повезёт завтра.",
+    "🎶 Окошко спело «Jingle Bells». На этом всё.",
+]
+
+
+def _advent_streak(days: set, today) -> int:
+    streak, d = 0, today
+    while d.strftime("%Y-%m-%d") in days:
+        streak += 1
+        d -= timedelta(days=1)
+    return streak
+
+
+async def aadvent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/advent — открыть окошко адвент-календаря (раз в сутки)."""
+    if not await _ny_gate(update, 'advent'):
+        return
+    if not _is_in_games_topic(update):
+        await _handle_topic_violation(update, context, kind='advent')
+        return
+    user_id = update.effective_user.id
+    ud = get_user_data(user_id)
+    if not ud:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    today = now_msk().date()
+    today_s = today.strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT day FROM advent_log WHERE user_id = ? AND day >= ?',
+              (user_id, (today - timedelta(days=60)).strftime("%Y-%m-%d")))
+    days = {r[0] for r in c.fetchall()}
+    if today_s in days:
+        conn.close()
+        await update.message.reply_text(
+            f"🎄 {ud['nick']}, сегодняшнее окошко уже открыто. Следующее — завтра!\n"
+            f"🔥 Серия: {_advent_streak(days, today)} дн.")
+        return
+
+    roll = random.random()
+    if roll < 0.15:
+        points, prize = 0, random.choice(ADVENT_EMPTY)
+    elif roll < 0.60:
+        points = random.randint(1, 5)
+        prize = f"🍬 Конфета: +{points} {points_word(points)}"
+    elif roll < 0.92:
+        points = random.randint(6, 15)
+        prize = f"🎁 Подарок: +{points} {points_word(points)}"
+    else:
+        points = random.randint(30, 50)
+        prize = f"💎 ДЖЕКПОТ: +{points} {points_word(points)}!"
+    days.add(today_s)
+    streak = _advent_streak(days, today)
+    bonus = ADVENT_STREAK_BONUS if streak % ADVENT_STREAK_BONUS_EVERY == 0 else 0
+    total = points + bonus
+    c.execute('INSERT INTO advent_log (user_id, day, prize, points) VALUES (?, ?, ?, ?)',
+              (user_id, today_s, prize, total))
+    if total:
+        c.execute('INSERT INTO points_log (user_id, amount, reason, issued_by, date) VALUES (?, ?, ?, ?, ?)',
+                  (user_id, total, f"🎄 Адвент-календарь, {today.strftime('%d.%m')}", None, now_msk_str()))
+    conn.commit()
+    conn.close()
+    text = (f"🎄 АДВЕНТ — {today.strftime('%d.%m')}\n━━━━━━━━━━━━━━━━━\n"
+            f"👤 {ud['nick']}\n{prize}\n🔥 Серия: {streak} дн.")
+    if bonus:
+        text += f"\n🏆 Бонус за {streak} дней подряд: +{bonus} {points_word(bonus)}"
+    else:
+        left = ADVENT_STREAK_BONUS_EVERY - streak % ADVENT_STREAK_BONUS_EVERY
+        text += f"\n⏭ До бонуса серии: {left} дн."
+    if total:
+        text += f"\n🪙 Баланс: {get_points(user_id)}"
+    await update.message.reply_text(text)
+
+
+# ---------- Снежки ----------
+
+SNOW_COOLDOWN_SEC = 20
+SNOW_HIT_CHANCE = 0.65
+_snow_last: dict = {}
+SNOW_HITS = [
+    "🎯 прямо в лицо!", "🎯 точно за шиворот!", "🎯 в шапку — она улетела!",
+    "🎯 в спину, пока не видел(а)!", "🎯 в плечо, с хрустом!",
+]
+SNOW_MISSES = [
+    "💨 мимо — снежок улетел в сугроб.", "💨 промах! Цель увернулась.",
+    "💨 снежок развалился в руках.", "💨 попал в фонарный столб.",
+]
+
+
+async def asnowball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/snowball <user> (или «снежок @user», или ответом) — кинуть снежок."""
+    if not await _ny_gate(update, 'snow'):
+        return
+    if not _is_in_games_topic(update):
+        await _handle_topic_violation(update, context, kind='snowball')
+        return
+    user_id = update.effective_user.id
+    ud = get_user_data(user_id)
+    if not ud:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+        return
+    if not target_id:
+        await update.message.reply_text("❄️ Кого обстрелять? «снежок @user» или ответом на сообщение.")
+        return
+    if target_id == user_id:
+        await update.message.reply_text("❄️ Себе за шиворот? Смело, но нет.")
+        return
+    td = get_user_data(target_id)
+    if not td:
+        await update.message.reply_text("❌ Цель не зарегистрирована.")
+        return
+    key = (current_conf()['schema_name'], user_id)
+    now_ts = now_msk().timestamp()
+    wait = SNOW_COOLDOWN_SEC - (now_ts - _snow_last.get(key, 0))
+    if wait > 0:
+        await update.message.reply_text(f"🧤 Лепим новый снежок… ещё {int(wait) + 1} сек.")
+        return
+    _snow_last[key] = now_ts
+    hit = random.random() < SNOW_HIT_CHANCE
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO snowballs (thrower_id, target_id, hit, thrown_at) VALUES (?, ?, ?, ?)',
+              (user_id, target_id, 1 if hit else 0, now_msk_str()))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"❄️ {ud['nick']} кидает снежок в {td['nick']} — "
+        + random.choice(SNOW_HITS if hit else SNOW_MISSES))
+
+
+async def asnowstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/snowstats — топ снайперов и «сугробов» за сезон, /snowstats <user> — личная."""
+    year = _ny_stats_year()
+    since = f"{year}-11-01 00:00:00"
+    until = f"{year + 1}-03-01 00:00:00"
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if context.args or _is_real_reply(update.message):
+        target_id = await _warns_target(update, context)
+        if target_id == -1:
+            conn.close()
+            await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+            return
+        c.execute('SELECT COUNT(*), COALESCE(SUM(hit), 0) FROM snowballs '
+                  'WHERE thrower_id = ? AND thrown_at >= ? AND thrown_at < ?', (target_id, since, until))
+        thrown, hits = c.fetchone()
+        c.execute('SELECT COUNT(*) FROM snowballs WHERE target_id = ? AND hit = 1 '
+                  'AND thrown_at >= ? AND thrown_at < ?', (target_id, since, until))
+        got = c.fetchone()[0]
+        conn.close()
+        acc = f"{round(100 * hits / thrown)}%" if thrown else "—"
+        await update.message.reply_text(
+            f"❄️ СНЕЖКИ — {_nick(target_id)}\n━━━━━━━━━━━━━━━━━\n"
+            f"🧤 Брошено: {thrown}\n🎯 Попаданий: {hits} ({acc})\n⛄ Прилетело: {got}")
+        return
+    c.execute('SELECT thrower_id, SUM(hit) FROM snowballs WHERE thrown_at >= ? AND thrown_at < ? '
+              'GROUP BY thrower_id HAVING SUM(hit) > 0 ORDER BY SUM(hit) DESC LIMIT 5', (since, until))
+    snipers = c.fetchall()
+    c.execute('SELECT target_id, COUNT(*) FROM snowballs WHERE hit = 1 AND thrown_at >= ? AND thrown_at < ? '
+              'GROUP BY target_id ORDER BY COUNT(*) DESC LIMIT 5', (since, until))
+    drifts = c.fetchall()
+    conn.close()
+    lines = ["❄️ СНЕЖНАЯ БИТВА", "━━━━━━━━━━━━━━━━━", "🎯 Снайперы:"]
+    lines += [f"{i}. {_nick(uid)} — {n}" for i, (uid, n) in enumerate(snipers, 1)] or ["пока никого"]
+    lines += ["━━━━━━━━━━━━━━━━━", "⛄ Сугробы (больше всего прилетело):"]
+    lines += [f"{i}. {_nick(uid)} — {n}" for i, (uid, n) in enumerate(drifts, 1)] or ["пока никого"]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def snow_trigger_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«снежок @user» / «снежок» ответом — текстовый триггер /snowball. Отдельная группа."""
+    if not update.message or not update.message.text:
+        return
+    parts = update.message.text.strip().split()
+    if not parts or parts[0].lower() not in ("снежок", "снежком"):
+        return
+    if not ny_active('snow'):
+        return  # вне сезона «снежок» — обычное слово, молчим
+    context.args = parts[1:]
+    await asnowball(update, context)
+
+
+# ---------- Обратный отсчёт и поздравление ----------
+
+def _countdown_text() -> str:
+    now = now_msk()
+    ny = now.replace(year=_ny_year(), month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    left = ny - now
+    if left.total_seconds() <= 0:
+        return "🎆 С Новым годом!"
+    days = left.days
+    if days >= 1:
+        return (f"🎄 ДО НОВОГО {ny.year} ГОДА\n━━━━━━━━━━━━━━━━━\n"
+                f"⏳ {days} {_plural(days, 'день', 'дня', 'дней')}")
+    hours = left.seconds // 3600
+    if hours >= 1:
+        return (f"🎄 ДО НОВОГО {ny.year} ГОДА\n━━━━━━━━━━━━━━━━━\n"
+                f"⏳ {hours} {_plural(hours, 'час', 'часа', 'часов')} — готовим шампанское!")
+    return f"🎄 ДО НОВОГО {ny.year} ГОДА\n━━━━━━━━━━━━━━━━━\n⏳ меньше часа! 🥂"
+
+
+async def ny_countdown_job(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в час: одно закреплённое сообщение с отсчётом, текст правится на месте."""
+    now = now_msk()
+    if now.month != 12 or not ny_active('countdown'):
+        return
+    year = _ny_year()
+    text = _countdown_text()
+    if ny_kv_get(f'countdown_text_{year}') == text:
+        return
+    msg_id = ny_kv_get(f'countdown_msg_{year}')
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(chat_id=conf_chat(), message_id=int(msg_id), text=text)
+            ny_kv_set(f'countdown_text_{year}', text)
+            return
+        except Exception as e:
+            if 'not modified' in str(e).lower():
+                ny_kv_set(f'countdown_text_{year}', text)
+                return
+            logger.info(f"ny_countdown: старое сообщение не правится ({e}), шлю новое")
+    msg = await context.bot.send_message(chat_id=conf_chat(), text=text)
+    ny_kv_set(f'countdown_msg_{year}', msg.message_id)
+    ny_kv_set(f'countdown_text_{year}', text)
+    try:
+        await context.bot.pin_chat_message(chat_id=conf_chat(), message_id=msg.message_id,
+                                           disable_notification=True)
+    except Exception as e:
+        logger.debug(f"ny_countdown: не закрепил: {e}")
+
+
+async def ny_greeting_job(context: ContextTypes.DEFAULT_TYPE):
+    """00:00 МСК 1 января — поздравление в конфу (один раз за год)."""
+    now = now_msk()
+    if not (now.month == 1 and now.day == 1) or not ny_active('countdown'):
+        return
+    key = f'greeting_sent_{now.year}'
+    if ny_kv_get(key):
+        return
+    ny_kv_set(key, '1')
+    await context.bot.send_message(chat_id=conf_chat(), text=ny_kv_get('greeting_text') or NY_DEFAULT_GREETING)
+    msg_id = ny_kv_get(f'countdown_msg_{now.year}')
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(chat_id=conf_chat(), message_id=int(msg_id),
+                                                text="🎆 С Новым годом!")
+            await context.bot.unpin_chat_message(chat_id=conf_chat(), message_id=int(msg_id))
+        except Exception:
+            pass
+
+
+# ---------- Итоги года ----------
+
+def _year_bounds(year: int):
+    return f"{year}-01-01 00:00:00", f"{year + 1}-01-01 00:00:00"
+
+
+def _year_messages(c, year: int) -> list:
+    """[(user_id, сообщений за год)] по убыванию — из msg_monthly."""
+    c.execute('SELECT user_id, SUM(cnt) FROM msg_monthly WHERE month >= ? AND month <= ? '
+              'GROUP BY user_id ORDER BY SUM(cnt) DESC', (f"{year}-01", f"{year}-12"))
+    return c.fetchall()
+
+
+def _year_card(user_id: int, year: int) -> str:
+    since, until = _year_bounds(year)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    msgs = _year_messages(c, year)
+    my_msgs = next((n for uid, n in msgs if uid == user_id), 0)
+    place = next((i for i, (uid, _n) in enumerate(msgs, 1) if uid == user_id), None)
+    c.execute('SELECT MIN(month) FROM msg_monthly')
+    first_month = c.fetchone()[0]
+
+    def one(sql, params):
+        c.execute(sql, params)
+        return int(c.fetchone()[0] or 0)   # SUM в PG отдаёт Decimal
+
+    awards = one('SELECT COUNT(*) FROM awards WHERE user_id = ? AND date >= ? AND date < ?', (user_id, since, until))
+    points = one('SELECT SUM(amount) FROM points_log WHERE user_id = ? AND date >= ? AND date < ?',
+                 (user_id, since, until))
+    duel_w = one("SELECT COUNT(*) FROM duels WHERE winner_id = ? AND finished_at >= ? AND finished_at < ?",
+                 (user_id, since, until))
+    duel_l = one("SELECT COUNT(*) FROM duels WHERE loser_id = ? AND finished_at >= ? AND finished_at < ?",
+                 (user_id, since, until))
+    cube_w = one("SELECT COUNT(*) FROM cube_games WHERE winner_id = ? AND finished_at >= ? AND finished_at < ?",
+                 (user_id, since, until))
+    cube_l = one("SELECT COUNT(*) FROM cube_games WHERE loser_id = ? AND finished_at >= ? AND finished_at < ?",
+                 (user_id, since, until))
+    articles = one('SELECT COUNT(*) FROM article_history WHERE user_id = ? AND given_at >= ? AND given_at < ?',
+                   (user_id, since, until))
+    snow_hits = one('SELECT SUM(hit) FROM snowballs WHERE thrower_id = ? AND thrown_at >= ? AND thrown_at < ?',
+                    (user_id, since, until))
+    advent = one('SELECT COUNT(*) FROM advent_log WHERE user_id = ? AND day >= ? AND day < ?',
+                 (user_id, since[:10], until[:10]))
+    verbal = one("SELECT COUNT(*) FROM warnings WHERE user_id = ? AND warn_type = 'Устное' AND date >= ? AND date < ?",
+                 (user_id, since, until))
+    written = one("SELECT COUNT(*) FROM warnings WHERE user_id = ? AND warn_type = 'Письменное' "
+                  "AND date >= ? AND date < ?", (user_id, since, until))
+    c.execute("SELECT user1_id, user2_id, married_at FROM marriages WHERE status = 'active' "
+              "AND (user1_id = ? OR user2_id = ?) ORDER BY id DESC LIMIT 1", (user_id, user_id))
+    marriage = c.fetchone()
+    conn.close()
+
+    lines = [f"🎆 ИТОГИ {year} — {_nick(user_id)}", "━━━━━━━━━━━━━━━━━",
+             f"💬 Сообщений: {my_msgs}" + (f" · {place} место" if place else "")]
+    if first_month and first_month > f"{year}-01":
+        lines.append(f"   (счёт ведётся с {first_month[5:]}.{first_month[:4]})")
+    lines += [
+        f"🏅 Наград: {awards}",
+        f"🪙 Поинтов: {points:+d}" if points else "🪙 Поинтов: 0",
+        f"⚔️ Дуэли: {duel_w} побед / {duel_l} поражений",
+        f"🎲 Кубы: {cube_w} побед / {cube_l} поражений",
+        f"⚖️ Статей УК: {articles}",
+    ]
+    if snow_hits or advent:
+        lines.append(f"❄️ Попаданий снежком: {snow_hits} · 🎄 окошек адвента: {advent}")
+    if marriage:
+        partner = marriage[1] if marriage[0] == user_id else marriage[0]
+        lines.append(f"💍 В паре с {_nick(partner)} с {marriage[2][8:10]}.{marriage[2][5:7]}.{marriage[2][:4]}")
+    lines += ["━━━━━━━━━━━━━━━━━",
+              f"⚠️ За год: {written} {_plural(written, 'выговор', 'выговора', 'выговоров')}, "
+              f"{verbal} {_plural(verbal, 'пред', 'преда', 'предов')}"]
+    if not written and not verbal:
+        lines.append("😇 Ни одного взыскания — образцовая служба!")
+    return "\n".join(lines)
+
+
+def _year_summary(year: int) -> str:
+    since, until = _year_bounds(year)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    msgs = _year_messages(c, year)
+    c.execute('SELECT winner_id, COUNT(*) FROM duels WHERE winner_id IS NOT NULL AND finished_at >= ? AND finished_at < ? '
+              'GROUP BY winner_id ORDER BY COUNT(*) DESC LIMIT 3', (since, until))
+    duelists = c.fetchall()
+    c.execute('SELECT COUNT(*) FROM marriages WHERE married_at >= ? AND married_at < ?', (since, until))
+    weddings = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM awards WHERE date >= ? AND date < ?', (since, until))
+    awards = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM users WHERE created_at >= ? AND created_at < ?', (since, until))
+    newbies = c.fetchone()[0]
+    c.execute('SELECT thrower_id, SUM(hit) FROM snowballs WHERE thrown_at >= ? AND thrown_at < ? '
+              'GROUP BY thrower_id HAVING SUM(hit) > 0 ORDER BY SUM(hit) DESC LIMIT 1', (since, until))
+    sniper = c.fetchone()
+    conn.close()
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"🎆 ИТОГИ {year} ГОДА — {conf_title()}", "━━━━━━━━━━━━━━━━━",
+             f"💬 Сообщений за год: {sum(n for _u, n in msgs)}"]
+    if msgs:
+        lines.append("🗣 Самые активные:")
+        lines += [f"{medals[i]} {_nick(uid)} — {n}" for i, (uid, n) in enumerate(msgs[:3])]
+    if duelists:
+        lines.append("⚔️ Лучшие дуэлянты:")
+        lines += [f"{medals[i]} {_nick(uid)} — {n} {_plural(n, 'победа', 'победы', 'побед')}"
+                  for i, (uid, n) in enumerate(duelists)]
+    lines += ["━━━━━━━━━━━━━━━━━",
+              f"🆕 Новых в составе: {newbies}",
+              f"💍 Свадеб: {weddings}",
+              f"🏅 Выдано наград: {awards}"]
+    if sniper:
+        hits = int(sniper[1])
+        lines.append(f"❄️ Снайпер сезона: {_nick(sniper[0])} ({hits} {_plural(hits, 'попадание', 'попадания', 'попаданий')})")
+    lines += ["━━━━━━━━━━━━━━━━━", "📊 Личные итоги — /year"]
+    return "\n".join(lines)
+
+
+async def ayear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/year — личные итоги года, /year <user> — чужие, /year all — итоги конфы."""
+    if not await _ny_gate(update, 'year'):
+        return
+    if not get_user_data(update.effective_user.id):
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    year = _ny_stats_year()
+    if context.args and context.args[0].lower() in ('all', 'все', 'конфа'):
+        await update.message.reply_text(_year_summary(year))
+        return
+    target_id = await _warns_target(update, context)
+    if target_id == -1:
+        await update.message.reply_text("❌ Несколько совпадений. Уточните @username или ID.")
+        return
+    if not get_user_data(target_id):
+        await update.message.reply_text("❌ Пользователь не зарегистрирован.")
+        return
+    await update.message.reply_text(_year_card(target_id, year))
+
+
+async def ny_year_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    """31 декабря в 20:00 МСК — итоги года в конфу."""
+    now = now_msk()
+    if not (now.month == 12 and now.day == 31) or not ny_active('year'):
+        return
+    key = f'summary_sent_{now.year}'
+    if ny_kv_get(key):
+        return
+    ny_kv_set(key, '1')
+    await context.bot.send_message(chat_id=conf_chat(), text=_year_summary(now.year))
+
+
+# ---------- «Сотрудник года» ----------
+
+async def anypoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/nypoll [срок] <номинация> — голосование, варианты — 10 самых активных за год."""
+    if not await _ny_gate(update, 'awards'):
+        return
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'poll_create', 'nypoll'):
+        await update.message.reply_text("❌ Нужен 6 ранг, спецдопуск или грант на nypoll.")
+        return
+    duration, args = _split_duration(list(context.args or []))
+    nomination = ' '.join(args).strip() or "Сотрудник года"
+    year = _ny_stats_year()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    candidates = [uid for uid, _n in _year_messages(c, year)]
+    if len(candidates) < 2:
+        # Помесячного счёта ещё мало — берём общий счётчик сообщений
+        c.execute('SELECT user_id FROM users WHERE COALESCE(msg_count, 0) > 0 ORDER BY msg_count DESC')
+        candidates = [r[0] for r in c.fetchall()]
+    conn.close()
+    options = []
+    for uid in candidates:
+        nick = _nick(uid)
+        if nick.lower() not in (o.lower() for o in options):
+            options.append(nick[:100])
+        if len(options) >= POLL_MULTI_MAX_OPTIONS:
+            break
+    if len(options) < 2:
+        await update.message.reply_text("❌ Мало кандидатов — нет статистики сообщений.")
+        return
+    question = f"🏆 {nomination} {year}"
+    poll_id = create_multi_poll(question, options, user_id)
+    set_poll_deadline(poll_id, duration)
+    poll = get_poll_by_id(poll_id)
+    kb = _poll_vote_kb(poll_id)
+    try:
+        msg = await context.bot.send_message(chat_id=conf_chat(), text=_poll_topic_text(poll),
+                                             message_thread_id=conf_topic('poll'), reply_markup=kb)
+    except Exception:
+        msg = await context.bot.send_message(chat_id=conf_chat(), text=_poll_topic_text(poll), reply_markup=kb)
+    set_poll_topic_message(poll_id, msg.message_id)
+    log_action(user_id, 'poll_create', None, f"#{poll_id} (ny): {question[:100]}")
+    await update.message.reply_text(
+        f"✅ Голосование #{poll_id} «{question}» создано, кандидатов: {len(options)}."
+        + (f"\n⏰ Закроется через {format_duration(duration)}." if duration else ""))
+
+
+# ---------- Амнистия ----------
+
+async def aamnesty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/amnesty [причина] — снять всем преды (выговоры остаются)."""
+    if not await _ny_gate(update, 'amnesty'):
+        return
+    user_id = update.effective_user.id
+    if not _ny_admin(user_id):
+        await update.message.reply_text("❌ Доступно главному админу, спецдопуску и 7 рангу.")
+        return
+    reason = ' '.join(context.args or []).strip() or "Новогодняя амнистия"
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id, game_nick, warns FROM users WHERE warns IS NOT NULL AND warns <> '0/0'")
+    affected = []
+    for uid, nick, warns in c.fetchall():
+        parts = (warns or '0/0').split('/')
+        verbal = int(parts[0]) if len(parts) == 2 and parts[0].isdigit() else 0
+        written = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 0
+        if verbal <= 0:
+            continue
+        new_warns = f"0/{written}"
+        c.execute('UPDATE users SET warns = ? WHERE user_id = ?', (new_warns, uid))
+        # Как /unwarnall: снятые записи помечаются counter = '0/0'
+        c.execute("UPDATE warnings SET counter = '0/0' WHERE user_id = ? AND warn_type = 'Устное' "
+                  "AND counter <> '0/0' AND counter <> 'EXPIRED'", (uid,))
+        affected.append((uid, nick, new_warns))
+    conn.commit()
+    conn.close()
+    log_action(user_id, 'amnesty', None, f"{len(affected)} чел.: {reason}"[:300])
+    if not affected:
+        await update.message.reply_text("🕊 Предов ни у кого нет — амнистировать некого.")
+        return
+    text = (f"🕊 {WARN_ANNOUNCE_PREFIX} » Амнистия: преды сняты у {len(affected)} "
+            f"{_plural(len(affected), 'человека', 'человек', 'человек')}. Выговоры остаются.\n\n"
+            f"Причина: {reason}")
+    await update.message.reply_text(text)
+    if update.effective_chat.id != conf_chat():
+        try:
+            await context.bot.send_message(chat_id=conf_chat(), text=text)
+        except Exception as e:
+            logger.warning(f"amnesty: в конфу не отправилось: {e}")
+    for uid, nick, new_warns in affected:
+        await notify_user(context, uid, exbot_text(f"С пользователя {nick} сняты предупреждения по амнистии.",
+                                                   new_warns, reason))
+        await asyncio.sleep(0.05)
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -17089,6 +18094,9 @@ def main():
         'changelog_publish': achangelog_publish, 'changelog_delete': achangelog_delete,
         'ideas_start': aideas_start, 'ideas': aideas, 'idea_info': aidea_info,
         'idea_submit': aidea_submit, 'idea_to_changelog': aidea_to_changelog,
+        'ny': any_settings, 'nyset': anyset, 'santa': asanta, 'advent': aadvent,
+        'snowball': asnowball, 'snowstats': asnowstats, 'year': ayear,
+        'nypoll': anypoll, 'amnesty': aamnesty,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -17260,6 +18268,8 @@ def main():
     # «повысить»/«понизить»/«поменять отдел»/«мут»/«бан»/«кик»/«варн»/«ты кто» —
     # текстовые триггеры модерации. Отдельная группа по той же причине.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, word_trigger_router), group=7)
+    # «снежок @user» — текстовый триггер /snowball (только пока работает /ny snow)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, snow_trigger_router), group=8)
     application.add_handler(CallbackQueryHandler(word_trigger_callback, pattern=r'^wtrig:'))
 
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
@@ -17279,6 +18289,11 @@ def main():
         time=time(hour=22, minute=0, tzinfo=MSK),
         days=(6,),
     )
+    # Новый год: закреп с отсчётом (раз в час, в декабре), поздравление в 00:00
+    # 1 января, итоги года 31 декабря в 20:00. Каждая задача сама проверяет /ny.
+    application.job_queue.run_repeating(per_conf_job(ny_countdown_job), interval=3600, first=60)
+    application.job_queue.run_daily(per_conf_job(ny_greeting_job), time=time(hour=0, minute=0, second=5, tzinfo=MSK))
+    application.job_queue.run_daily(per_conf_job(ny_year_summary_job), time=time(hour=20, minute=0, tzinfo=MSK))
     # Уведомление о старте бота — через 5 секунд после запуска.
     application.job_queue.run_once(startup_notify_job, when=5)
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
