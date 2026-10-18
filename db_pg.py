@@ -126,6 +126,14 @@ def init_pool(dsn: str = None, min_size: int = 1, max_size: int = 10):
             "Не задана строка подключения. Укажите её в переменной DATABASE_URL "
             "в начале bot.py или в переменных окружения панели хостинга."
         )
+    # Пробное подключение напрямую: пул при неудаче пишет только «pool
+    # initialization incomplete after 30 sec» и прячет настоящую причину
+    # (неверный пароль, «too many clients», база выключена, хост не отвечает).
+    # Отсюда исключение долетит до main() и попадёт в лог как есть.
+    try:
+        psycopg.connect(dsn, connect_timeout=15).close()
+    except Exception as e:
+        raise RuntimeError(f"{type(e).__name__}: {e}".strip()) from e
     _pool = ConnectionPool(
         dsn,
         min_size=min_size,
