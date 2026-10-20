@@ -2985,8 +2985,7 @@ HELP_SECTIONS = [
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
         ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
         ("tagall",     "<текст>",              "тегнуть всех активных; в ЛС — помеченные копии, переслать нельзя; ответом на файл — с вложением", 5),
-        ("leakmark",   "<текст>",              "объявление в ЛС, у каждого своя помеченная копия (найти слившего — /leakfind)", 5),
-        ("leakfind",   "<текст со скрина>",    "чья копия /leakmark или /tagall на слитом скриншоте", "spec"),
+        ("leakfind",   "<текст со скрина>",    "чья копия /tagall на слитом скриншоте", "spec"),
         ("tagskip",    "[user]",               "кому не слать уведомления от /tagall: без аргумента — список, с <user> — добавить/убрать", 5),
         ("department", "add|remove|rename|list|find", "управление отделами", 5),
         ("setalldept", "<номер>",              "перевести всех в отдел", 5),
@@ -8916,7 +8915,7 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # В ЛС у каждого своя помеченная копия (см. «МЕТКИ ОТ СЛИВА») — по скрину
     # /leakfind покажет, чья она. Переслать и сохранить нельзя.
     def render(m, bits):
-        text = f"{m['head']} Обращение ко всем\n{m['div1']}\n{m['from']} От: {_html_escape(issuer_name)}"
+        text = f"{m['head']} {m['title']}\n{m['div1']}\n{m['from']} От: {_html_escape(issuer_name)}"
         if body_html:
             text += f"\n💬 {_leak_tweak_html(body_html, bits)}"
         return text + f"\n{m['div2']}"
@@ -18766,21 +18765,26 @@ async def aantimat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/antimat list — свои слова · /antimat test <текст> — проверить")
 
 
-# ============ МЕТКИ ОТ СЛИВА (/leakmark, /leakfind, ЛС /tagall) ============
-# Каждый получатель рассылки получает свою, чуть отличающуюся копию: эмодзи в
-# заголовке, длина разделителей, значок у «От:» (уникальны по номеру в рассылке),
-# плюс мелочи в самом тексте — любое «ё»/«е», «…/...», тире, «18:00/18.00», точка в конце.
+# ============ МЕТКИ ОТ СЛИВА (ЛС /tagall, /leakfind) ============
+# Каждый получатель рассылки получает свою, чуть отличающуюся копию: эмодзи и
+# регистр заголовка, длина разделителей, значок у «От:» (уникальны по номеру в
+# рассылке), плюс мелочи в самом тексте — заглавная/строчная в начале предложений,
+# знак в конце («.», «!» или ничего), любое «ё»/«е», «…/...», тире, «18:00/18.00».
 # Все копии хранятся в leak_copies. По тексту со слитого скриншота /leakfind
 # находит, чья это копия. Невидимые символы не используем — на скрине их нет.
 # Рассылки уходят с protect_content: переслать и сохранить их нельзя.
 
 LEAK_HEAD_EMOJI = ["📣", "📢", "🔔", "📯"]
 LEAK_FROM_EMOJI = ["👮", "👤", "🛡"]
+LEAK_TITLES = ["Обращение ко всем", "ОБРАЩЕНИЕ КО ВСЕМ", "Обращение ко ВСЕМ"]
 LEAK_DIV_MIN, LEAK_DIV_SPAN = 14, 6          # разделитель ━ длиной 14..19
 LEAK_SEARCH_MAILINGS = 50
 
-_LEAK_SLOT_RE = re.compile(r'\.\.\.|…| [-—] |\b\d{1,2}:\d{2}\b|\b\w*[ёЁ]\w*\b|\b(?:еще|ее|нее)\b',
-                           re.IGNORECASE)
+_LEAK_SLOTS = (r'\.\.\.|…| [-—] |\b\d{1,2}:\d{2}\b|\b\w*[ёЁ]\w*\b|\b(?:еще|ее|нее)\b'
+               r'|(?<=[.!?…] )[А-ЯЁа-яё](?=[а-яё])')
+_LEAK_SLOT_RE = re.compile(_LEAK_SLOTS, re.IGNORECASE)
+# То же + первая буква куска, если кусок начинает предложение (после тега или в начале текста)
+_LEAK_SLOT_START_RE = re.compile(r'^[А-ЯЁа-яё](?=[а-яё])|' + _LEAK_SLOTS, re.IGNORECASE)
 _LEAK_ALT = {
     '...': ('...', '…'), '…': ('...', '…'),
     ' - ': (' - ', ' — '), ' — ': (' - ', ' — '),
@@ -18791,14 +18795,16 @@ _LEAK_ALT = {
 }
 
 
-def _leak_tweak_text(text: str, bits: int, start: int = 0):
+def _leak_tweak_text(text: str, bits: int, start: int = 0, sentence_start: bool = False):
     """Подменяет мелочи в обычном тексте по битам; возвращает (текст, след. бит)."""
     k = [start]
 
     def sub(m):
         w = m.group(0)
         alt = _LEAK_ALT.get(w.lower())
-        if alt and w[:1].isupper():
+        if len(w) == 1:
+            alt = (w.upper(), w.lower())     # начало предложения: заглавная или строчная
+        elif alt and w[:1].isupper():
             alt = tuple(a.capitalize() for a in alt)
         elif not alt and re.fullmatch(r'\d{1,2}:\d{2}', w):
             alt = (w, w.replace(':', '.'))
@@ -18807,21 +18813,26 @@ def _leak_tweak_text(text: str, bits: int, start: int = 0):
         choice = alt[(bits >> (k[0] % 60)) & 1]
         k[0] += 1
         return choice
-    return _LEAK_SLOT_RE.sub(sub, text), k[0]
+    regex = _LEAK_SLOT_START_RE if sentence_start else _LEAK_SLOT_RE
+    return regex.sub(sub, text), k[0]
+# биты 60–61 заняты знаком в конце, слоты текста берут биты 0–59
 
 
 def _leak_tweak_html(body_html: str, bits: int) -> str:
     """То же для HTML: меняем только текст между тегами, точку в конце — по биту."""
     parts = re.split(r'(<[^>]+>)', body_html)
     k = 0
+    seen = ''     # уже пройденный текст — чтобы понять, начинается ли кусок с нового предложения
     for i, part in enumerate(parts):
         if part and not part.startswith('<'):
-            parts[i], k = _leak_tweak_text(part, bits, k)
+            starts = not seen.strip() or bool(re.search(r'[.!?…]\s+$', seen))
+            parts[i], k = _leak_tweak_text(part, bits, k, starts)
+            seen += part
     out = ''.join(parts)
-    end_bit = (bits >> 61) & 1
-    m = re.search(r'([А-Яа-яЁёA-Za-z0-9])(\.?)((?:</[^>]+>)*)\s*$', out)
+    end_mark = ('', '.', '!', '.')[(bits >> 60) & 3]
+    m = re.search(r'([А-Яа-яЁёA-Za-z0-9])([.!]?)((?:</[^>]+>)*)\s*$', out)
     if m:
-        out = out[:m.start()] + m.group(1) + ('.' if end_bit else '') + m.group(3)
+        out = out[:m.start()] + m.group(1) + end_mark + m.group(3)
     return out
 
 
@@ -18831,8 +18842,9 @@ def _leak_marks(index: int) -> dict:
     head = LEAK_HEAD_EMOJI[r % len(LEAK_HEAD_EMOJI)]; r //= len(LEAK_HEAD_EMOJI)
     d1 = LEAK_DIV_MIN + r % LEAK_DIV_SPAN; r //= LEAK_DIV_SPAN
     d2 = LEAK_DIV_MIN + r % LEAK_DIV_SPAN; r //= LEAK_DIV_SPAN
-    frm = LEAK_FROM_EMOJI[r % len(LEAK_FROM_EMOJI)]
-    return {'head': head, 'div1': '━' * d1, 'div2': '━' * d2, 'from': frm}
+    frm = LEAK_FROM_EMOJI[r % len(LEAK_FROM_EMOJI)]; r //= len(LEAK_FROM_EMOJI)
+    title = LEAK_TITLES[r % len(LEAK_TITLES)]
+    return {'head': head, 'div1': '━' * d1, 'div2': '━' * d2, 'from': frm, 'title': title}
 
 
 def _leak_plain(html_text: str) -> str:
@@ -18875,41 +18887,6 @@ async def leak_send(context, kind: str, author_id: int, members: list, render, a
     return delivered, failed
 
 
-async def aleakmark(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/leakmark <текст> — объявление в ЛС всем, у каждого своя помеченная копия."""
-    user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'leakmark'):
-        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
-        return
-    body_html = _tagall_body_html(update.message)
-    attachment = _tagall_attachment(update.message)
-    if not body_html:
-        await update.message.reply_text(
-            "❌ /leakmark <текст> — разослать в ЛС помеченные копии.\n"
-            "📎 Ответом на файл — с вложением. Найти слившего — /leakfind <текст со скрина>.")
-        return
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
-    members = [r[0] for r in c.fetchall()]
-    conn.close()
-    issuer = _html_escape(get_admin_nick(user_id))
-
-    def render(m, bits):
-        return (f"{m['head']} ОБЪЯВЛЕНИЕ\n{m['div1']}\n{_leak_tweak_html(body_html, bits)}\n"
-                f"{m['div2']}\n{m['from']} {issuer}")
-
-    await update.message.reply_text(f"📤 Рассылаю помеченные копии: {len(members)} чел...")
-    delivered, failed = await leak_send(context, 'leakmark', user_id, members, render, attachment,
-                                        _leak_plain(body_html))
-    log_action(user_id, 'leakmark', None, _leak_plain(body_html)[:200])
-    await update.message.reply_text(
-        "✅ ПОМЕЧЕННАЯ РАССЫЛКА\n━━━━━━━━━━━━━━━━━\n"
-        f"📨 Доставлено: {delivered}\n⛔ Не доставлено: {failed}\n"
-        "🔒 Переслать и сохранить нельзя\n━━━━━━━━━━━━━━━━━\n"
-        "🔎 Всплыл скрин — /leakfind <текст со скрина>")
-
-
 def _leak_tokens(text: str) -> set:
     # «━17» / «━ 17» в запросе — разделитель из 17 символов (чтобы не рисовать его)
     text = re.sub(r'━\s*(\d{1,2})\b', lambda m: '━' * int(m.group(1)), text or '')
@@ -18917,7 +18894,7 @@ def _leak_tokens(text: str) -> set:
 
 
 async def aleakfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/leakfind <текст со скрина> — чья это копия помеченной рассылки."""
+    """/leakfind <текст со скрина> — чья это копия ЛС /tagall."""
     user_id = update.effective_user.id
     if not (is_main_admin(user_id) or has_special_access(user_id)):
         await update.message.reply_text("❌ Доступно спецдопуску и главному админу.")
@@ -18960,14 +18937,14 @@ async def aleakfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     log_action(user_id, 'leakfind', None, query_text[:200])
     if not results:
-        await _private_reply(update, context, "🔎 Совпадений нет — текст не из помеченных рассылок "
+        await _private_reply(update, context, "🔎 Совпадений нет — текст не из рассылок /tagall "
                                               "или переписан слишком неточно.")
         return
     results.sort(key=lambda r: (r[0], r[1]), reverse=True)
     lines = ["🔎 ЧЬЯ КОПИЯ", "━━━━━━━━━━━━━━━━━"]
     for score, _extra, hits, total, uid, mid, kind, created, preview in results[:5]:
         lines.append(f"👤 {_nick(uid)} (ID {uid})\n"
-                     f"   📨 #{mid} {'/tagall' if kind == 'tagall' else '/leakmark'} · {created[:16]}\n"
+                     f"   📨 /tagall #{mid} · {created[:16]}\n"
                      f"   🎯 меток совпало: {hits} из {total}" + (f", чужих: {hits - score}" if hits != score else ""))
     if len(results) > 1 and results[0][:2] == results[1][:2]:
         lines.append("━━━━━━━━━━━━━━━━━\n⚠️ Первые места равны — перепишите больше текста "
@@ -19092,7 +19069,7 @@ def main():
         'snowball': asnowball, 'snowstats': asnowstats, 'year': ayear,
         'nypoll': anypoll, 'amnesty': aamnesty,
         'lock': alock, 'lockok': alockok, 'appeal': aappeal, 'antimat': aantimat,
-        'leakmark': aleakmark, 'leakfind': aleakfind,
+        'leakfind': aleakfind,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
