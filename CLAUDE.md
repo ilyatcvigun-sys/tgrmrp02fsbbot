@@ -399,7 +399,13 @@ Telegram, позывной → `'—'`), свои — в `user_fields` и выв
 дважды). В `get_user_data` есть `departments` и `departments_str` — для показа.
 `/find` листается по 10 человек (`findpg:<стр>`).
 
-**Связки (`/global create|add|remove|info`, главный админ):** конфы с одним
+**Связки (`/global create|add|remove|info`, главный админ):** `/global add` без
+id в любой беседе — кнопки со всеми конфами (`glink:<конфа>:<цель>`,
+`_link_confs`): цель в связке → беседа входит в неё, нет → новая связка из двух.
+Если чат ещё не конфа, `/global add|create` сам подключает его
+(`_create_conference` — общее ядро с `/confnew`); остальные `/global` в
+неподключённом чате ничего не делают — иначе `conf_router` отдал бы им
+основную конфу и они меняли бы связку ФСБ (ловили). Конфы с одним
 `link_group` делят ЧС (`add_gban`/`remove_gban` пишут во все, при `add` ЧС
 объединяется) и глобальные команды `/gwarn /gunwarn /gmute /gunmute /gkick
 /gunban /gblock /gunblock` (`make_global_command`: локальный хэндлер в каждой
