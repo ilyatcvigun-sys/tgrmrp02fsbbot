@@ -6,7 +6,7 @@ import contextvars
 from contextlib import contextmanager
 from collections.abc import Mapping
 from datetime import datetime, timedelta, time, timezone
-from telegram import Update, Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo
+from telegram import Update, Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo, ForceReply
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop, TypeHandler, ExtBot
 # ВАЖНО: бот работает на PostgreSQL. Модуль db_pg — слой совместимости,
 # который повторяет API sqlite3 (connect / Row / OperationalError /
@@ -1704,6 +1704,25 @@ def init_database():
     c.execute('''CREATE TABLE IF NOT EXISTS msg_monthly (
         user_id INTEGER NOT NULL, month TEXT NOT NULL, cnt INTEGER DEFAULT 0,
         PRIMARY KEY (user_id, month))''')
+    # /lock (закрытие конфы до подтверждения) и /antimat: настройки, кому вернули
+    # доступ, обращения из ЛС, свои слова антимата.
+    c.execute('''CREATE TABLE IF NOT EXISTS mod_kv (key TEXT PRIMARY KEY, value TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS lock_ok (
+        user_id INTEGER PRIMARY KEY, approved_by INTEGER, approved_at TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS lock_appeals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT,
+        status TEXT DEFAULT 'pending', created_at TEXT DEFAULT '',
+        decided_by INTEGER, decided_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS antimat_words (word TEXT PRIMARY KEY)''')
+    # Кого замутил /lock — чтобы при /lock off снять мут только с них
+    c.execute('''CREATE TABLE IF NOT EXISTS lock_muted (user_id INTEGER PRIMARY KEY)''')
+    # Метки от слива: рассылки и персональная копия каждого получателя
+    c.execute('''CREATE TABLE IF NOT EXISTS leak_mailings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, author_id INTEGER,
+        created_at TEXT DEFAULT '', preview TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS leak_copies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, mailing_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL, text TEXT)''')
     # Поля регистрации конфы (/regfields). Встроенные — field_key 'nick' и
     # 'callsign' (пишутся в users), свои — field_key NULL, ответы в user_fields.
     c.execute('''
@@ -2747,6 +2766,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню (ЛС)"""
     if not is_private_chat(update):
         return
+    # Ссылка из объявления о закрытии конфы: /start appeal_<id конфы>
+    if context.args and context.args[0].startswith('appeal'):
+        conf_arg = context.args[0][len('appeal_'):]
+        await aappeal(update, context, int(conf_arg) if conf_arg.lstrip('-').isdigit() else None)
+        return
     
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
@@ -2766,6 +2790,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Кнопка настройки доступов — только главному админу.
         if is_main_admin(user_id):
             keyboard.append([KeyboardButton("🎫 Доступы")])
+        # Пока конфа закрыта (/lock) и у человека нет доступа — кнопка обращения
+        if lock_active() and user_id not in _lock_state()['ok'] and not has_permission(user_id, 'ban', 'lock'):
+            keyboard.append([KeyboardButton(LOCK_APPEAL_BUTTON)])
 
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         permissions = get_user_permissions(user_id)
@@ -2917,6 +2944,10 @@ HELP_SECTIONS = [
         ("warnlist",   "[user]",               "история выговоров и предов (свою — всем)", 0),
         ("mute",       "<user> [срок] [причина]", "мут; срок 30m · 2ч · 7 дней · число = минуты", 5),
         ("amode",      "[on|off]",             "закрыть/открыть чат для всех (пишут только админы)", 5),
+        ("lock",       "[on [текст]|off]",     "закрыть конфу до подтверждения: доступ — через обращение в ЛС бота", 5),
+        ("lockok",     "<user>",               "вернуть доступ в закрытую конфу вручную", "spec"),
+        ("appeal",     "",                     "обращение о возврате доступа в закрытую конфу (ЛС)", 0),
+        ("antimat",    "[on|off|add|del|list|test]", "мат и оскорбления удаляются и публикуются ботом без автора", 5),
         ("point",      "<user> <±кол-во> [причина]", "начислить или списать поинты", 4),
         ("unmute",     "<user>",               "снять мут", 5),
         ("kick",       "<user> [причина]",     "кик из конференции", 5),
@@ -2953,7 +2984,9 @@ HELP_SECTIONS = [
         ("deldept",    "<user> <номер>",       "убрать из отдела", 5),
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
         ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
-        ("tagall",     "<текст>",              "тегнуть всех активных; гиперссылки сохраняются, ответом на файл — с вложением", 5),
+        ("tagall",     "<текст>",              "тегнуть всех активных; в ЛС — помеченные копии, переслать нельзя; ответом на файл — с вложением", 5),
+        ("leakmark",   "<текст>",              "объявление в ЛС, у каждого своя помеченная копия (найти слившего — /leakfind)", 5),
+        ("leakfind",   "<текст со скрина>",    "чья копия /leakmark или /tagall на слитом скриншоте", "spec"),
         ("tagskip",    "[user]",               "кому не слать уведомления от /tagall: без аргумента — список, с <user> — добавить/убрать", 5),
         ("department", "add|remove|rename|list|find", "управление отделами", 5),
         ("setalldept", "<номер>",              "перевести всех в отдел", 5),
@@ -8872,7 +8905,7 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         going_to_conf = True
 
     try:
-        await _send_text_with_attachment(context.bot, out_chat, chat_text, attachment)
+        await _send_text_with_attachment(context.bot, out_chat, chat_text, attachment, protect_content=True)
     except Exception as e:
         logger.error(f"atagall send error: {e}")
         await update.message.reply_text(f"❌ Не удалось отправить в чат: {e}")
@@ -8880,25 +8913,16 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📤 Рассылка в ЛС на {len(members)} чел...")
 
-    dm_text = (
-        "📣 Обращение ко всем\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"👮 От: {_html_escape(issuer_name)}"
-    )
-    if body_html:
-        dm_text += f"\n💬 {body_html}"
-    delivered, failed = 0, 0
-    for tid in members:
-        if is_user_blocked(tid):
-            continue
-        try:
-            await _send_text_with_attachment(context.bot, tid, dm_text, attachment)
-            delivered += 1
-        except Exception as e:
-            logger.debug(f"tagall DM to {tid} failed: {e}")
-            failed += 1
-        # Лёгкий троттлинг чтобы не упереться в флуд-лимит Telegram
-        await asyncio.sleep(0.05)
+    # В ЛС у каждого своя помеченная копия (см. «МЕТКИ ОТ СЛИВА») — по скрину
+    # /leakfind покажет, чья она. Переслать и сохранить нельзя.
+    def render(m, bits):
+        text = f"{m['head']} Обращение ко всем\n{m['div1']}\n{m['from']} От: {_html_escape(issuer_name)}"
+        if body_html:
+            text += f"\n💬 {_leak_tweak_html(body_html, bits)}"
+        return text + f"\n{m['div2']}"
+
+    delivered, failed = await leak_send(context, 'tagall', user_id, members, render, attachment,
+                                        _leak_plain(body_html) if body_html else '[вложение]')
 
     summary_chat = "конференция" if going_to_conf else "текущий чат"
     await update.message.reply_text(
@@ -11267,6 +11291,7 @@ async def track_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _PM_KNOWN_BUTTONS = {
     "👤 Информация", "🔍 Проверить ЧС", "ℹ️ Помощь", "📋 Список участников",
     "📝 Подать жалобу", "📝 Регистрация", "🚓 Выдать выговор", "🎫 Доступы",
+    "📨 Обращение о доступе",
 }
 
 # Ключи context.user_data, означающие что юзер сейчас в активной форме/диалоге.
@@ -17981,6 +18006,975 @@ async def aamnesty(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)
 
 
+# ============ ЗАКРЫТИЕ КОНФЫ ДО ПОДТВЕРЖДЕНИЯ (/lock) ============
+# /lock on — конфа закрывается как при /amode, но мутом КАЖДОГО участника в
+# Telegram, а не общими правами чата: исключения в Telegram могут только сильнее
+# ограничивать, и при закрытом для всех чате вернуть право писать одному человеку
+# нельзя. Мутятся все зарегистрированные; кто не в базе — при первом сообщении
+# (lock_gate удаляет его и мутит). Вернуть доступ — обращение в ЛС бота (/appeal)
+# с доказательствами; оно уходит в лог-группу PM_LOG_CHAT_ID, решают спецдопуск и
+# главный админ, «Вернуть доступ» снимает мут. «Уточнить» — вопрос заявителю от
+# имени бота, его ответ возвращается в лог-группу.
+# Без подтверждения пишут: 5+ ранг, спецдопуск, главный админ, админы Telegram.
+
+LOCK_APPEAL_BUTTON = "📨 Обращение о доступе"
+LOCK_REMIND_COOLDOWN_SEC = 600
+LOCK_ADMINS_TTL_SEC = 600
+
+_lock_cache: dict = {}          # схема → {'on': bool, 'ok': set, 'admins': set, 'admins_at': float}
+_lock_reminded: dict = {}       # (схема, user_id) → когда последний раз напоминали
+_appeal_drafts: dict = {}       # user_id → {'conf_id', 'msgs': [message_id], 'texts': [str]}
+_clarify_prompts: dict = {}     # (chat_id, message_id) приглашения «ответьте» → (conf_id, appeal_id)
+_appeal_answers: dict = {}      # user_id → {'conf_id', 'appeal_id', 'buttons_sent'} — ждём ответ на уточнение
+
+
+def mod_kv_get(key: str, default=None):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT value FROM mod_kv WHERE key = ?', (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def mod_kv_set(key: str, value):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM mod_kv WHERE key = ?', (key,))
+    if value is not None:
+        c.execute('INSERT INTO mod_kv (key, value) VALUES (?, ?)', (key, str(value)))
+    conn.commit()
+    conn.close()
+
+
+def _lock_state() -> dict:
+    schema = current_conf()['schema_name']
+    st = _lock_cache.get(schema)
+    if st is None:
+        on = mod_kv_get('lock_on') == '1'
+        ok = set()
+        if on:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('SELECT user_id FROM lock_ok')
+            ok = {r[0] for r in c.fetchall()}
+            conn.close()
+        st = {'on': on, 'ok': ok, 'admins': set(), 'admins_at': 0.0}
+        _lock_cache[schema] = st
+    return st
+
+
+def _lock_invalidate():
+    _lock_cache.pop(current_conf()['schema_name'], None)
+
+
+def lock_active() -> bool:
+    return _lock_state()['on']
+
+
+def _lock_judge(user_id: int) -> bool:
+    """Кто решает по обращениям: главный админ и спецдопуск."""
+    return is_main_admin(user_id) or has_special_access(user_id)
+
+
+def _lock_approve(user_id: int, by: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM lock_ok WHERE user_id = ?', (user_id,))
+    c.execute('INSERT INTO lock_ok (user_id, approved_by, approved_at) VALUES (?, ?, ?)',
+              (user_id, by, now_msk_str()))
+    conn.commit()
+    conn.close()
+    _lock_state()['ok'].add(user_id)
+
+
+async def _lock_mute(context, user_id: int) -> bool:
+    """Замутить в чате конфы и запомнить. Уже замученных (обычным /mute) и
+    админов не трогаем — чтобы /lock off не снял чужой мут."""
+    try:
+        member = await context.bot.get_chat_member(conf_chat(), user_id)
+    except Exception:
+        return False
+    if member.status in ('administrator', 'creator', 'left', 'kicked'):
+        return False
+    if member.status == 'restricted' and not getattr(member, 'can_send_messages', True):
+        return False
+    try:
+        await context.bot.restrict_chat_member(conf_chat(), user_id, ChatPermissions(**_AMODE_CLOSED))
+    except Exception as e:
+        logger.debug(f"lock: не замутил {user_id}: {e}")
+        return False
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM lock_muted WHERE user_id = ?', (user_id,))
+    c.execute('INSERT INTO lock_muted (user_id) VALUES (?)', (user_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+async def _lock_unmute(context, user_id: int) -> bool:
+    """Снять мут /lock (только если его ставил /lock)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM lock_muted WHERE user_id = ?', (user_id,))
+    muted = c.fetchone() is not None
+    c.execute('DELETE FROM lock_muted WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+    if not muted:
+        return False
+    try:
+        await context.bot.restrict_chat_member(conf_chat(), user_id, ChatPermissions(**_AMODE_OPEN))
+        return True
+    except Exception as e:
+        logger.debug(f"lock: не снял мут {user_id}: {e}")
+        return False
+
+
+async def _lock_mute_all(context, report_chat_id: int):
+    """Фоном после /lock on: замутить всех зарегистрированных без доступа."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE ban_status = 'Нет'")
+    ids = [r[0] for r in c.fetchall()]
+    conn.close()
+    muted = 0
+    for uid in ids:
+        if await _lock_allowed(context, uid):
+            continue
+        if await _lock_mute(context, uid):
+            muted += 1
+        await asyncio.sleep(0.05)
+    try:
+        await context.bot.send_message(report_chat_id, f"🔒 {conf_title()}: замучено {muted} из {len(ids)} в базе. "
+                                                       "Остальные — админы, 5+ ранг, уже в муте или не в чате.")
+    except Exception:
+        pass
+
+
+async def _lock_unmute_all(context, report_chat_id: int):
+    """Фоном после /lock off: снять мут со всех, кого мутил /lock."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM lock_muted')
+    ids = [r[0] for r in c.fetchall()]
+    conn.close()
+    done = 0
+    for uid in ids:
+        if await _lock_unmute(context, uid):
+            done += 1
+        await asyncio.sleep(0.05)
+    try:
+        await context.bot.send_message(report_chat_id, f"🔓 {conf_title()}: мут снят с {done} из {len(ids)}.")
+    except Exception:
+        pass
+
+
+async def _lock_allowed(context, user_id: int) -> bool:
+    st = _lock_state()
+    if user_id in st['ok']:
+        return True
+    if is_main_admin(user_id) or has_permission(user_id, 'ban', 'lock'):
+        return True
+    now_ts = now_msk().timestamp()
+    if now_ts - st['admins_at'] > LOCK_ADMINS_TTL_SEC:
+        try:
+            admins = await context.bot.get_chat_administrators(conf_chat())
+            st['admins'] = {a.user.id for a in admins}
+        except Exception as e:
+            logger.debug(f"lock: админы чата не получены: {e}")
+        st['admins_at'] = now_ts
+    return user_id in st['admins']
+
+
+def _appeal_link(context) -> str:
+    return f"https://t.me/{context.bot.username}?start=appeal_{current_conf()['id']}"
+
+
+def _appeal_kb(context) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📨 Обращение", url=_appeal_link(context))]])
+
+
+async def _delete_later(context: ContextTypes.DEFAULT_TYPE):
+    chat_id, message_id = context.job.data
+    try:
+        await context.bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+async def lock_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Группа −50: пока конфа закрыта — удаляет сообщения тех, у кого нет доступа."""
+    msg = update.message
+    if not msg or not update.effective_chat or update.effective_chat.id != conf_chat():
+        return
+    if msg.sender_chat or not msg.from_user or msg.from_user.is_bot:
+        return  # анонимный админ, канал, боты
+    if not lock_active():
+        return
+    user_id = msg.from_user.id
+    if await _lock_allowed(context, user_id):
+        return
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.debug(f"lock: не удалил сообщение: {e}")
+    await _lock_mute(context, user_id)   # не был в базе или мут не встал при /lock on
+    key = (current_conf()['schema_name'], user_id)
+    now_ts = now_msk().timestamp()
+    if now_ts - _lock_reminded.get(key, 0) > LOCK_REMIND_COOLDOWN_SEC:
+        _lock_reminded[key] = now_ts
+        ud = get_user_data(user_id)
+        name = ud['nick'] if ud else (msg.from_user.full_name or "Пользователь")
+        try:
+            r = await context.bot.send_message(
+                chat_id=conf_chat(),
+                message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+                text=f"🔒 {name}, конференция закрыта. Доступ возвращается через обращение в ЛС бота.",
+                reply_markup=_appeal_kb(context))
+            context.job_queue.run_once(_delete_later, 30, data=(conf_chat(), r.message_id))
+        except Exception:
+            pass
+    raise ApplicationHandlerStop
+
+
+def _lock_announce_text(note: str = None) -> str:
+    text = (f"🔒 {WARN_ANNOUNCE_PREFIX} » Конференция закрыта.\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Писать могут только те, чей доступ подтверждён руководством.\n\n"
+            "📨 Чтобы вернуть доступ — напишите боту в личные сообщения: кнопка "
+            "«Обращение» ниже. Приложите доказательства, что вы не сливаете "
+            "конференцию (скрины, объяснение).\n"
+            "━━━━━━━━━━━━━━━━━")
+    if note:
+        text += f"\n📝 {note}"
+    return text
+
+
+async def alock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lock [on [текст]|off] — закрыть конфу до подтверждения доступа или открыть."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'ban', 'lock'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    args = list(context.args or [])
+    action = args[0].lower() if args else ''
+    st = _lock_state()
+    if action not in ('on', 'off', 'вкл', 'выкл'):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM lock_appeals WHERE status = 'pending'")
+        pending = c.fetchone()[0]
+        conn.close()
+        await update.message.reply_text(
+            "🔒 ЗАКРЫТИЕ КОНФЕРЕНЦИИ\n━━━━━━━━━━━━━━━━━\n"
+            f"🏛 {conf_title()}\n"
+            f"📍 Сейчас: {'🔴 закрыта' if st['on'] else '🟢 открыта'}\n"
+            + (f"✅ Доступ подтверждён: {len(st['ok'])}\n⏳ Обращений на рассмотрении: {pending}\n" if st['on'] else "")
+            + "━━━━━━━━━━━━━━━━━\n"
+            "🔴 /lock on [текст] — закрыть: мут всем без доступа (подтверждения сбрасываются)\n"
+            "🟢 /lock off — открыть\n"
+            "✅ /lockok <user> — вернуть доступ вручную (спецдопуск)")
+        return
+
+    if action in ('on', 'вкл'):
+        note = ' '.join(args[1:]).strip() or None
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('DELETE FROM lock_ok')
+        c.execute("UPDATE lock_appeals SET status = 'expired' WHERE status = 'pending'")
+        conn.commit()
+        conn.close()
+        mod_kv_set('lock_on', '1')
+        mod_kv_set('lock_since', now_msk_str())
+        _lock_invalidate()
+        log_action(user_id, 'lock', None, f"закрыта{': ' + note if note else ''}"[:300])
+        try:
+            m = await context.bot.send_message(chat_id=conf_chat(), text=_lock_announce_text(note),
+                                               reply_markup=_appeal_kb(context))
+            mod_kv_set('lock_msg_id', m.message_id)
+            try:
+                await context.bot.pin_chat_message(conf_chat(), m.message_id, disable_notification=False)
+            except Exception as e:
+                logger.debug(f"lock: не закрепил: {e}")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Закрыто, но объявление в конфу не ушло: {e}")
+            return
+        await update.message.reply_text("⏳ Мучу участников без доступа, отчёт придёт сюда…")
+        context.application.create_task(_lock_mute_all(context, update.effective_chat.id))
+        return
+
+    mod_kv_set('lock_on', None)
+    _lock_invalidate()
+    log_action(user_id, 'lock', None, "открыта")
+    msg_id = mod_kv_get('lock_msg_id')
+    if msg_id:
+        try:
+            await context.bot.unpin_chat_message(conf_chat(), int(msg_id))
+        except Exception:
+            pass
+        mod_kv_set('lock_msg_id', None)
+    text = f"🔓 {WARN_ANNOUNCE_PREFIX} » Конференция снова открыта для всех."
+    try:
+        await context.bot.send_message(chat_id=conf_chat(), text=text)
+    except Exception:
+        pass
+    await update.message.reply_text("⏳ Снимаю мут с участников, отчёт придёт сюда…")
+    context.application.create_task(_lock_unmute_all(context, update.effective_chat.id))
+
+
+async def alockok(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lockok <user> — вернуть доступ без обращения."""
+    user_id = update.effective_user.id
+    if not _lock_judge(user_id):
+        await update.message.reply_text("❌ Доступно спецдопуску и главному админу.")
+        return
+    target_id = extract_user_id(update, context)
+    if not target_id and context.args:
+        target_id = extract_user_id(update, context, context.args[0])
+    if isinstance(target_id, str) and target_id.startswith('@'):
+        target_id = await get_target_id(update, context, target_id)
+    if not target_id or target_id == -1:
+        await update.message.reply_text("❌ /lockok @user (или ответом на сообщение)")
+        return
+    _lock_approve(target_id, user_id)
+    await _lock_unmute(context, target_id)
+    _appeal_answers.pop(target_id, None)
+    log_action(user_id, 'lockok', target_id, "доступ вручную")
+    await update.message.reply_text(f"✅ {_nick(target_id)}: доступ в конференцию возвращён.")
+    await notify_user(context, target_id, f"✅ Доступ в конференцию «{conf_title()}» возвращён.")
+
+
+# ---------- Обращение в ЛС ----------
+
+def _appeal_compose_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📤 Отправить", callback_data="lockapc:send"),
+        InlineKeyboardButton("✖️ Отмена", callback_data="lockapc:cancel"),
+    ]])
+
+
+async def aappeal(update: Update, context: ContextTypes.DEFAULT_TYPE, conf_id=None):
+    """/appeal — обращение о возврате доступа в закрытую конфу (только ЛС)."""
+    if not is_private_chat(update):
+        await update.message.reply_text("📨 Обращение подаётся в личных сообщениях бота.",
+                                        reply_markup=_appeal_kb(context) if lock_active() else None)
+        return
+    user_id = update.effective_user.id
+    conf = get_conf(conf_id) if conf_id is not None else current_conf()
+    if not conf:
+        conf = current_conf()
+    with using_conf(conf):
+        if not lock_active():
+            await update.message.reply_text(f"🟢 Конференция «{conf_title()}» сейчас не закрыта — обращение не нужно.")
+            return
+        if await _lock_allowed(context, user_id):
+            await update.message.reply_text(f"✅ У вас уже есть доступ в «{conf_title()}».")
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id FROM lock_appeals WHERE user_id = ? AND status = 'pending'", (user_id,))
+        pending = c.fetchone()
+        conn.close()
+        if pending:
+            await update.message.reply_text(f"⏳ Ваше обращение #{pending[0]} уже на рассмотрении. Дождитесь решения.")
+            return
+        title = conf_title()
+    _appeal_drafts[user_id] = {'conf_id': conf['id'], 'msgs': [], 'texts': []}
+    await update.message.reply_text(
+        f"📨 ОБРАЩЕНИЕ О ДОСТУПЕ — {title}\n━━━━━━━━━━━━━━━━━\n"
+        "Отправьте сюда одним или несколькими сообщениями:\n"
+        "• объяснение, почему вам можно вернуть доступ;\n"
+        "• доказательства, что вы не сливаете конференцию (скрины, файлы).\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Когда всё приложили — нажмите «📤 Отправить».",
+        reply_markup=_appeal_compose_kb())
+
+
+async def appeal_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Группа −5: пока пишется обращение, сообщения в ЛС складываются в черновик."""
+    msg = update.message
+    if not msg or not update.effective_user or update.effective_chat.type != 'private':
+        return
+    user_id = update.effective_user.id
+    draft = _appeal_drafts.get(user_id)
+    answer = _appeal_answers.get(user_id)
+    if (draft is None and answer is None) or is_user_blocked(user_id):
+        return
+    text = msg.text or ''
+    if text.startswith('/'):
+        return  # команды работают как обычно (/cancel, /appeal…)
+    if text == LOCK_APPEAL_BUTTON:
+        return
+    if draft is None:
+        await _forward_appeal_answer(update, context, answer)
+        raise ApplicationHandlerStop
+    draft['msgs'].append(msg.message_id)
+    if msg.text or msg.caption:
+        draft['texts'].append(msg.text or msg.caption)
+    n = len(draft['msgs'])
+    if n == 1 or n % 5 == 0:
+        await msg.reply_text(f"📎 Приложено: {n}. Можно добавить ещё или отправить.",
+                             reply_markup=_appeal_compose_kb())
+    raise ApplicationHandlerStop
+
+
+async def appeal_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «📨 Обращение о доступе» в меню /start (группа −6)."""
+    await aappeal(update, context)
+    raise ApplicationHandlerStop
+
+
+async def appeal_compose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """lockapc:send|cancel — отправить или отменить черновик обращения."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    action = (query.data or '').split(':', 1)[-1]
+    draft = _appeal_drafts.get(user_id)
+    if draft is None:
+        await query.answer("Черновика нет — начните заново: /appeal", show_alert=True)
+        return
+    if action == 'cancel':
+        _appeal_drafts.pop(user_id, None)
+        await query.answer()
+        await query.edit_message_text("✖️ Обращение отменено.")
+        return
+    if not draft['msgs']:
+        await query.answer("Сначала приложите объяснение или доказательства.", show_alert=True)
+        return
+    conf = get_conf(draft['conf_id']) or main_conf()
+    _appeal_drafts.pop(user_id, None)
+    await query.answer()
+    with using_conf(conf):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO lock_appeals (user_id, text, status, created_at) VALUES (?, ?, 'pending', ?)",
+                  (user_id, "\n\n".join(draft['texts'])[:4000], now_msk_str()))
+        appeal_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        ud = get_user_data(user_id)
+        u = query.from_user
+        who = ud['nick'] if ud else (u.full_name or "—")
+        card = (f"📨 ОБРАЩЕНИЕ О ДОСТУПЕ #{appeal_id}\n━━━━━━━━━━━━━━━━━\n"
+                f"🏛 {conf_title()}\n"
+                f"👤 {who}" + ("" if ud else " (не зарегистрирован)") + "\n"
+                f"🆔 {user_id}" + (f" · @{u.username}" if u.username else "") + "\n"
+                f"📎 Материалов: {len(draft['msgs'])}\n━━━━━━━━━━━━━━━━━\n⬇️ Материалы ниже")
+        decide_kb = _appeal_decide_kb(conf['id'], appeal_id)
+        try:
+            await context.bot.send_message(chat_id=PM_LOG_CHAT_ID, text=card)
+            for mid in draft['msgs']:
+                try:
+                    await context.bot.copy_message(chat_id=PM_LOG_CHAT_ID, from_chat_id=user_id, message_id=mid)
+                except Exception as e:
+                    logger.debug(f"appeal: не скопировал {mid}: {e}")
+                await asyncio.sleep(0.05)
+            await context.bot.send_message(
+                chat_id=PM_LOG_CHAT_ID,
+                text=f"⚖️ Решение по обращению #{appeal_id} ({who})\nРешают: спецдопуск и главный админ.",
+                reply_markup=decide_kb)
+        except Exception as e:
+            logger.error(f"appeal: в лог-группу не ушло: {e}")
+            await query.edit_message_text("❌ Не удалось отправить обращение. Попробуйте позже: /appeal")
+            return
+    await query.edit_message_text(f"📤 Обращение #{appeal_id} отправлено руководству. О решении бот напишет сюда.")
+
+
+def _appeal_decide_kb(conf_id, appeal_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Вернуть доступ", callback_data=f"lockap:ok:{conf_id}:{appeal_id}"),
+         InlineKeyboardButton("❌ Отклонить", callback_data=f"lockap:no:{conf_id}:{appeal_id}")],
+        [InlineKeyboardButton("❓ Уточнить", callback_data=f"lockap:ask:{conf_id}:{appeal_id}")],
+    ])
+
+
+async def _forward_appeal_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, answer: dict):
+    """Ответ заявителя на уточнение — копией в лог-группу."""
+    msg = update.message
+    user_id = update.effective_user.id
+    conf = get_conf(answer['conf_id']) or main_conf()
+    with using_conf(conf):
+        who = _nick(user_id) if get_user_data(user_id) else (update.effective_user.full_name or str(user_id))
+    try:
+        await context.bot.send_message(PM_LOG_CHAT_ID, f"💬 Ответ на уточнение по обращению #{answer['appeal_id']} — {who}")
+        await context.bot.copy_message(PM_LOG_CHAT_ID, from_chat_id=user_id, message_id=msg.message_id)
+        if not answer.get('buttons_sent'):
+            await context.bot.send_message(
+                PM_LOG_CHAT_ID, f"⚖️ Решение по обращению #{answer['appeal_id']} ({who})",
+                reply_markup=_appeal_decide_kb(answer['conf_id'], answer['appeal_id']))
+            answer['buttons_sent'] = True
+            await msg.reply_text("📤 Ответ передан руководству. Можно дописать ещё — тоже передам.")
+    except Exception as e:
+        logger.error(f"appeal: ответ на уточнение не ушёл: {e}")
+        await msg.reply_text("❌ Не удалось передать ответ, попробуйте ещё раз позже.")
+
+
+async def clarify_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Группа 12, лог-группа: ответ руководства на «✍️ ответьте…» уходит заявителю от бота."""
+    msg = update.message
+    if not msg or not msg.reply_to_message or not msg.from_user:
+        return
+    key = (msg.chat_id, msg.reply_to_message.message_id)
+    ref = _clarify_prompts.get(key)
+    if not ref:
+        return
+    conf_id, appeal_id = ref
+    conf = get_conf(conf_id)
+    if not conf:
+        return
+    with using_conf(conf):
+        if not _lock_judge(msg.from_user.id):
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT user_id, status FROM lock_appeals WHERE id = ?', (appeal_id,))
+        row = c.fetchone()
+        conn.close()
+        title = conf_title()
+    if not row or row[1] != 'pending':
+        await msg.reply_text("❌ Обращение уже закрыто.")
+        _clarify_prompts.pop(key, None)
+        return
+    target = row[0]
+    try:
+        await context.bot.send_message(target, f"❓ УТОЧНЕНИЕ ПО ОБРАЩЕНИЮ #{appeal_id}\n🏛 {title}\n━━━━━━━━━━━━━━━━━")
+        await context.bot.copy_message(target, from_chat_id=msg.chat_id, message_id=msg.message_id)
+        await context.bot.send_message(target, "━━━━━━━━━━━━━━━━━\n↩️ Ответьте сюда сообщением — ответ уйдёт руководству.")
+    except Exception as e:
+        await msg.reply_text(f"❌ Не доставлено заявителю: {e}")
+        return
+    _clarify_prompts.pop(key, None)
+    _appeal_answers[target] = {'conf_id': conf_id, 'appeal_id': appeal_id, 'buttons_sent': False}
+    with using_conf(conf):
+        log_action(msg.from_user.id, 'lock_appeal', target, f"#{appeal_id} уточнение")
+    await msg.reply_text("📨 Уточнение отправлено от имени бота. Ответ заявителя придёт сюда.")
+
+
+async def appeal_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """lockap:ok|no|ask:<conf_id>:<appeal_id> — решение в лог-группе."""
+    query = update.callback_query
+    parts = (query.data or '').split(':')
+    if len(parts) != 4:
+        await query.answer()
+        return
+    _, action, conf_id, appeal_id = parts
+    conf = get_conf(int(conf_id))
+    if not conf:
+        await query.answer("Конференция не найдена.", show_alert=True)
+        return
+    judge = query.from_user.id
+    with using_conf(conf):
+        if not _lock_judge(judge):
+            await query.answer("Решают только спецдопуск и главный админ.", show_alert=True)
+            return
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT user_id, status FROM lock_appeals WHERE id = ?', (int(appeal_id),))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            await query.answer("Обращение не найдено.", show_alert=True)
+            return
+        target, status = row
+        if status != 'pending':
+            conn.close()
+            await query.answer(f"Уже решено ({status}).", show_alert=True)
+            return
+        if action == 'ask':
+            conn.close()
+            judge_name = get_admin_nick(judge)
+            await query.answer()
+            msg = query.message
+            prompt = await context.bot.send_message(
+                chat_id=msg.chat_id,
+                message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+                text=(f'✍️ <a href="tg://user?id={judge}">{_html_escape(judge_name)}</a>, ответьте на это '
+                      f'сообщение — текст (или фото/файл) уйдёт заявителю по обращению #{appeal_id} от имени бота.'),
+                parse_mode='HTML',
+                reply_markup=ForceReply(selective=True, input_field_placeholder="Вопрос заявителю"))
+            _clarify_prompts[(prompt.chat_id, prompt.message_id)] = (int(conf_id), int(appeal_id))
+            return
+        new_status = 'ok' if action == 'ok' else 'no'
+        c.execute('UPDATE lock_appeals SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?',
+                  (new_status, judge, now_msk_str(), int(appeal_id)))
+        conn.commit()
+        conn.close()
+        if new_status == 'ok':
+            _lock_approve(target, judge)
+            await _lock_unmute(context, target)
+        _appeal_answers.pop(target, None)
+        log_action(judge, 'lock_appeal', target, f"#{appeal_id} {'одобрено' if new_status == 'ok' else 'отклонено'}")
+        title = conf_title()
+        judge_name = get_admin_nick(judge)
+    await query.answer()
+    verdict = f"✅ Доступ вернул: {judge_name}" if new_status == 'ok' else f"❌ Отклонил: {judge_name}"
+    try:
+        await query.edit_message_text(f"{query.message.text}\n━━━━━━━━━━━━━━━━━\n{verdict} · {now_msk_str('%d.%m %H:%M')}")
+    except Exception:
+        pass
+    if new_status == 'ok':
+        await notify_user(context, target, f"✅ Обращение #{appeal_id} одобрено — доступ в «{title}» возвращён.")
+    else:
+        await notify_user(context, target, f"❌ Обращение #{appeal_id} в «{title}» отклонено.\n"
+                                           "Можно подать новое с дополнительными доказательствами: /appeal")
+
+
+# ============ АНТИМАТ (/antimat) ============
+# Режим конфы: сообщение с матом или оскорблением бот удаляет и тут же публикует
+# тот же текст от своего имени, без автора. Автор пишется только в audit_log.
+
+_MAT_PATTERNS = [
+    r'\b(?:на|по|от|за|вы|у|ни|до|раз|при|пере|об|о)?ху[йяеёию]',
+    r'пизд',
+    r'\b(?:за|у|в|въ|вы|до|на|об|от|под|раз|съ|пере|при|про|по|до)?[её]б(?:а[тлнш]|ал|ан|ат|ут|ись|ище|уч|у\b|ло|ля|лан|нут|ну|ош|ырь|ен|ён|ыв|ит|и\b)',
+    r'\bбл[яэ](?:д|т|\b)',
+    r'\bсук(?:а|и|е|у|ой|ин)',
+    r'\bмуд[аио](?:к|л|з)',
+    r'\bпид(?:о|а)?р',
+    r'\bпедик',
+    r'\bг[ао]нд[ао]н',
+    r'\bшлюх',
+    r'залуп',
+    r'\bдолб[ао][её]б',
+    r'\b(?:дебил|идиот|кретин|дегенерат|ублюд|мраз[ьи]|твар[ьи]|чмо|чмош|даун|лошар|тупорыл|скотин)',
+    r'\bурод(?:\b|а\b|ы\b|ов\b|ин|ец)',
+    r'\bдурак\b',
+    r'\bлох(?:\b|а|и|у|ом)',
+]
+_MAT_RE = re.compile('|'.join(_MAT_PATTERNS))
+# латиница, похожая на кириллицу: «xyй», «cyka»
+_LOOKALIKE = str.maketrans({'a': 'а', 'e': 'е', 'o': 'о', 'p': 'р', 'c': 'с', 'x': 'х', 'y': 'у',
+                            'k': 'к', 'm': 'м', 'b': 'б', 't': 'т', 'h': 'н', '3': 'з', '0': 'о',
+                            'ё': 'е'})
+_antimat_cache: dict = {}       # схема → (включён, regex своих слов | None)
+
+
+def _antimat_state():
+    schema = current_conf()['schema_name']
+    st = _antimat_cache.get(schema)
+    if st is None:
+        on = mod_kv_get('antimat_on') == '1'
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT word FROM antimat_words')
+        words = [r[0] for r in c.fetchall()]
+        conn.close()
+        extra = re.compile('|'.join(r'\b' + re.escape(w) for w in words)) if words else None
+        st = (on, extra)
+        _antimat_cache[schema] = st
+    return st
+
+
+def has_mat(text: str, extra=None) -> bool:
+    t = (text or '').lower().translate(_LOOKALIKE)
+    t = re.sub(r'(.)\1{2,}', r'\1', t)        # «бляяяя» → «бля»
+    if _MAT_RE.search(t):
+        return True
+    return bool(extra and extra.search(t))
+
+
+async def antimat_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Группа −4: в режиме антимата — удалить и переписать от имени бота."""
+    msg = update.message
+    if not msg or not msg.text or msg.text.startswith('/'):
+        return
+    if not update.effective_chat or update.effective_chat.id != conf_chat():
+        return
+    on, extra = _antimat_state()
+    if not on or not has_mat(msg.text, extra):
+        return
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.debug(f"antimat: не удалил: {e}")
+        return
+    kwargs = {}
+    if msg.is_topic_message:
+        kwargs['message_thread_id'] = msg.message_thread_id
+    if _is_real_reply(msg):
+        kwargs['reply_to_message_id'] = msg.reply_to_message.message_id
+    try:
+        await context.bot.send_message(chat_id=msg.chat_id, text=f"🕶 Аноним:\n{msg.text}", **kwargs)
+    except Exception:
+        kwargs.pop('reply_to_message_id', None)
+        try:
+            await context.bot.send_message(chat_id=msg.chat_id, text=f"🕶 Аноним:\n{msg.text}", **kwargs)
+        except Exception as e:
+            logger.debug(f"antimat: не переписал: {e}")
+    if msg.from_user:
+        log_action(msg.from_user.id, 'antimat', None, msg.text[:300])
+    raise ApplicationHandlerStop
+
+
+async def aantimat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/antimat [on|off|add|del|list|test] — режим анонимизации мата и оскорблений."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'ban', 'antimat'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    args = list(context.args or [])
+    action = args[0].lower() if args else ''
+    rest = ' '.join(args[1:]).strip().lower()
+    on, _extra = _antimat_state()
+    if action in ('on', 'вкл', 'off', 'выкл'):
+        enable = action in ('on', 'вкл')
+        mod_kv_set('antimat_on', '1' if enable else None)
+        _antimat_cache.pop(current_conf()['schema_name'], None)
+        log_action(user_id, 'antimat_mode', None, 'вкл' if enable else 'выкл')
+        text = (f"🕶 {WARN_ANNOUNCE_PREFIX} » Включён антимат: сообщения с матом и оскорблениями "
+                "будут удаляться и публиковаться от имени бота без автора."
+                if enable else f"{WARN_ANNOUNCE_PREFIX} » Антимат выключен.")
+        await update.message.reply_text(text)
+        if update.effective_chat.id != conf_chat():
+            try:
+                await context.bot.send_message(chat_id=conf_chat(), text=text)
+            except Exception:
+                pass
+        return
+    if action in ('add', 'del') and rest:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('DELETE FROM antimat_words WHERE word = ?', (rest,))
+        if action == 'add':
+            c.execute('INSERT INTO antimat_words (word) VALUES (?)', (rest,))
+        conn.commit()
+        conn.close()
+        _antimat_cache.pop(current_conf()['schema_name'], None)
+        await update.message.reply_text(f"✅ «{rest}» {'добавлено в список' if action == 'add' else 'убрано из списка'}.")
+        return
+    if action == 'list':
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT word FROM antimat_words ORDER BY word')
+        words = [r[0] for r in c.fetchall()]
+        conn.close()
+        await _private_reply(update, context, "🕶 СВОИ СЛОВА АНТИМАТА\n━━━━━━━━━━━━━━━━━\n"
+                             + (", ".join(words) if words else "Пусто — работает только встроенный список."))
+        return
+    if action == 'test' and rest:
+        hit = has_mat(rest, _antimat_state()[1])
+        await _private_reply(update, context, "🕶 Сработает" if hit else "✅ Не сработает")
+        return
+    await update.message.reply_text(
+        "🕶 АНТИМАТ\n━━━━━━━━━━━━━━━━━\n"
+        f"📍 Сейчас: {'🟢 включён' if on else '⚪ выключен'}\n━━━━━━━━━━━━━━━━━\n"
+        "/antimat on|off — включить или выключить\n"
+        "/antimat add <слово> — ловить ещё и это слово (начало слова)\n"
+        "/antimat del <слово> — убрать своё слово\n"
+        "/antimat list — свои слова · /antimat test <текст> — проверить")
+
+
+# ============ МЕТКИ ОТ СЛИВА (/leakmark, /leakfind, ЛС /tagall) ============
+# Каждый получатель рассылки получает свою, чуть отличающуюся копию: эмодзи в
+# заголовке, длина разделителей, значок у «От:» (уникальны по номеру в рассылке),
+# плюс мелочи в самом тексте — любое «ё»/«е», «…/...», тире, «18:00/18.00», точка в конце.
+# Все копии хранятся в leak_copies. По тексту со слитого скриншота /leakfind
+# находит, чья это копия. Невидимые символы не используем — на скрине их нет.
+# Рассылки уходят с protect_content: переслать и сохранить их нельзя.
+
+LEAK_HEAD_EMOJI = ["📣", "📢", "🔔", "📯"]
+LEAK_FROM_EMOJI = ["👮", "👤", "🛡"]
+LEAK_DIV_MIN, LEAK_DIV_SPAN = 14, 6          # разделитель ━ длиной 14..19
+LEAK_SEARCH_MAILINGS = 50
+
+_LEAK_SLOT_RE = re.compile(r'\.\.\.|…| [-—] |\b\d{1,2}:\d{2}\b|\b\w*[ёЁ]\w*\b|\b(?:еще|ее|нее)\b',
+                           re.IGNORECASE)
+_LEAK_ALT = {
+    '...': ('...', '…'), '…': ('...', '…'),
+    ' - ': (' - ', ' — '), ' — ': (' - ', ' — '),
+    'ещё': ('ещё', 'еще'), 'еще': ('ещё', 'еще'),
+    'её': ('её', 'ее'), 'ее': ('её', 'ее'),
+    'неё': ('неё', 'нее'), 'нее': ('неё', 'нее'),
+    'всё': ('всё', 'все'),
+}
+
+
+def _leak_tweak_text(text: str, bits: int, start: int = 0):
+    """Подменяет мелочи в обычном тексте по битам; возвращает (текст, след. бит)."""
+    k = [start]
+
+    def sub(m):
+        w = m.group(0)
+        alt = _LEAK_ALT.get(w.lower())
+        if alt and w[:1].isupper():
+            alt = tuple(a.capitalize() for a in alt)
+        elif not alt and re.fullmatch(r'\d{1,2}:\d{2}', w):
+            alt = (w, w.replace(':', '.'))
+        elif not alt:
+            alt = (w, w.replace('ё', 'е').replace('Ё', 'Е'))
+        choice = alt[(bits >> (k[0] % 60)) & 1]
+        k[0] += 1
+        return choice
+    return _LEAK_SLOT_RE.sub(sub, text), k[0]
+
+
+def _leak_tweak_html(body_html: str, bits: int) -> str:
+    """То же для HTML: меняем только текст между тегами, точку в конце — по биту."""
+    parts = re.split(r'(<[^>]+>)', body_html)
+    k = 0
+    for i, part in enumerate(parts):
+        if part and not part.startswith('<'):
+            parts[i], k = _leak_tweak_text(part, bits, k)
+    out = ''.join(parts)
+    end_bit = (bits >> 61) & 1
+    m = re.search(r'([А-Яа-яЁёA-Za-z0-9])(\.?)((?:</[^>]+>)*)\s*$', out)
+    if m:
+        out = out[:m.start()] + m.group(1) + ('.' if end_bit else '') + m.group(3)
+    return out
+
+
+def _leak_marks(index: int) -> dict:
+    """Шаблонные метки по номеру получателя (смешанная система счисления)."""
+    r = index
+    head = LEAK_HEAD_EMOJI[r % len(LEAK_HEAD_EMOJI)]; r //= len(LEAK_HEAD_EMOJI)
+    d1 = LEAK_DIV_MIN + r % LEAK_DIV_SPAN; r //= LEAK_DIV_SPAN
+    d2 = LEAK_DIV_MIN + r % LEAK_DIV_SPAN; r //= LEAK_DIV_SPAN
+    frm = LEAK_FROM_EMOJI[r % len(LEAK_FROM_EMOJI)]
+    return {'head': head, 'div1': '━' * d1, 'div2': '━' * d2, 'from': frm}
+
+
+def _leak_plain(html_text: str) -> str:
+    import html as _html
+    return _html.unescape(re.sub(r'<[^>]+>', '', html_text))
+
+
+async def leak_send(context, kind: str, author_id: int, members: list, render, attachment=None,
+                    preview: str = '') -> tuple:
+    """Разослать персональные копии. render(marks, bits) → HTML-текст для одного
+    получателя. Копии сохраняются в leak_copies. Возвращает (доставлено, не доставлено)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO leak_mailings (kind, author_id, created_at, preview) VALUES (?, ?, ?, ?)',
+              (kind, author_id, now_msk_str(), preview[:200]))
+    mailing_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    order = list(members)
+    random.shuffle(order)       # номер в рассылке не должен совпадать с порядком в базе
+    delivered, failed, copies = 0, 0, []
+    for index, tid in enumerate(order):
+        if is_user_blocked(tid):
+            continue
+        text = render(_leak_marks(index), random.getrandbits(62))
+        try:
+            await _send_text_with_attachment(context.bot, tid, text, attachment, protect_content=True)
+            delivered += 1
+            copies.append((mailing_id, tid, _leak_plain(text)))
+        except Exception as e:
+            logger.debug(f"leak_send {kind} → {tid}: {e}")
+            failed += 1
+        await asyncio.sleep(0.05)
+    if copies:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.executemany('INSERT INTO leak_copies (mailing_id, user_id, text) VALUES (?, ?, ?)', copies)
+        conn.commit()
+        conn.close()
+    return delivered, failed
+
+
+async def aleakmark(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/leakmark <текст> — объявление в ЛС всем, у каждого своя помеченная копия."""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, 'warn', 'leakmark'):
+        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
+        return
+    body_html = _tagall_body_html(update.message)
+    attachment = _tagall_attachment(update.message)
+    if not body_html:
+        await update.message.reply_text(
+            "❌ /leakmark <текст> — разослать в ЛС помеченные копии.\n"
+            "📎 Ответом на файл — с вложением. Найти слившего — /leakfind <текст со скрина>.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
+    members = [r[0] for r in c.fetchall()]
+    conn.close()
+    issuer = _html_escape(get_admin_nick(user_id))
+
+    def render(m, bits):
+        return (f"{m['head']} ОБЪЯВЛЕНИЕ\n{m['div1']}\n{_leak_tweak_html(body_html, bits)}\n"
+                f"{m['div2']}\n{m['from']} {issuer}")
+
+    await update.message.reply_text(f"📤 Рассылаю помеченные копии: {len(members)} чел...")
+    delivered, failed = await leak_send(context, 'leakmark', user_id, members, render, attachment,
+                                        _leak_plain(body_html))
+    log_action(user_id, 'leakmark', None, _leak_plain(body_html)[:200])
+    await update.message.reply_text(
+        "✅ ПОМЕЧЕННАЯ РАССЫЛКА\n━━━━━━━━━━━━━━━━━\n"
+        f"📨 Доставлено: {delivered}\n⛔ Не доставлено: {failed}\n"
+        "🔒 Переслать и сохранить нельзя\n━━━━━━━━━━━━━━━━━\n"
+        "🔎 Всплыл скрин — /leakfind <текст со скрина>")
+
+
+def _leak_tokens(text: str) -> set:
+    # «━17» / «━ 17» в запросе — разделитель из 17 символов (чтобы не рисовать его)
+    text = re.sub(r'━\s*(\d{1,2})\b', lambda m: '━' * int(m.group(1)), text or '')
+    return set(re.findall(r'━+|\S+', text))
+
+
+async def aleakfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/leakfind <текст со скрина> — чья это копия помеченной рассылки."""
+    user_id = update.effective_user.id
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
+        await update.message.reply_text("❌ Доступно спецдопуску и главному админу.")
+        return
+    raw = (update.message.text or '').split(None, 1)
+    query_text = raw[1] if len(raw) > 1 else ''
+    if not query_text and _is_real_reply(update.message):
+        src = update.message.reply_to_message
+        query_text = src.text or src.caption or ''
+    if not query_text.strip():
+        await _private_reply(update, context,
+            "🔎 /leakfind <текст со скрина>\n━━━━━━━━━━━━━━━━━\n"
+            "Перепишите текст со скриншота как есть: эмодзи, тире, многоточия, ё/е, "
+            "точку в конце. Длину разделителя можно числом: ━17.\n"
+            "Чем больше текста — тем точнее.")
+        return
+    q = _leak_tokens(query_text)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, kind, created_at, preview FROM leak_mailings ORDER BY id DESC LIMIT ?',
+              (LEAK_SEARCH_MAILINGS,))
+    mailings = c.fetchall()
+    results = []
+    for mid, kind, created, preview in mailings:
+        c.execute('SELECT user_id, text FROM leak_copies WHERE mailing_id = ?', (mid,))
+        copies = [(uid, _leak_tokens(t)) for uid, t in c.fetchall()]
+        if len(copies) < 2:
+            continue
+        common = set.intersection(*(t for _u, t in copies))
+        union = set.union(*(t for _u, t in copies))
+        if not (q & union):
+            continue
+        for uid, toks in copies:
+            marks = toks - common
+            hits = len(marks & q)
+            misses = len((union - toks) & q)   # в запросе есть метки ЧУЖИХ копий
+            extra = len(marks - q)             # меток этой копии нет в запросе — только для ничьих
+            if hits:
+                results.append((hits - misses, -extra, hits, len(marks), uid, mid, kind, created, preview))
+    conn.close()
+    log_action(user_id, 'leakfind', None, query_text[:200])
+    if not results:
+        await _private_reply(update, context, "🔎 Совпадений нет — текст не из помеченных рассылок "
+                                              "или переписан слишком неточно.")
+        return
+    results.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    lines = ["🔎 ЧЬЯ КОПИЯ", "━━━━━━━━━━━━━━━━━"]
+    for score, _extra, hits, total, uid, mid, kind, created, preview in results[:5]:
+        lines.append(f"👤 {_nick(uid)} (ID {uid})\n"
+                     f"   📨 #{mid} {'/tagall' if kind == 'tagall' else '/leakmark'} · {created[:16]}\n"
+                     f"   🎯 меток совпало: {hits} из {total}" + (f", чужих: {hits - score}" if hits != score else ""))
+    if len(results) > 1 and results[0][:2] == results[1][:2]:
+        lines.append("━━━━━━━━━━━━━━━━━\n⚠️ Первые места равны — перепишите больше текста "
+                     "(разделители, эмодзи, тире, ё/е).")
+    await _private_reply(update, context, "\n".join(lines))
+
+
 # ============ ЗАПУСК ============
 
 def main():
@@ -18097,6 +19091,8 @@ def main():
         'ny': any_settings, 'nyset': anyset, 'santa': asanta, 'advent': aadvent,
         'snowball': asnowball, 'snowstats': asnowstats, 'year': ayear,
         'nypoll': anypoll, 'amnesty': aamnesty,
+        'lock': alock, 'lockok': alockok, 'appeal': aappeal, 'antimat': aantimat,
+        'leakmark': aleakmark, 'leakfind': aleakfind,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -18205,6 +19201,15 @@ def main():
     # group=-2 → раньше track_username и всего остального.
     # Зеркало личной переписки в приватную группу-лог. group=-3 → раньше block_gate,
     # чтобы фиксировать даже сообщения заблокированных. Не прерывает пайплайн.
+    # /lock: удалять сообщения тех, у кого нет доступа (до всех остальных, кроме conf_router)
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, lock_gate), group=-50)
+    # Кнопка «📨 Обращение о доступе» и сбор материалов обращения в ЛС
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Regex(r'^📨 Обращение о доступе$'),
+                                           appeal_button), group=-6)
+    application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.StatusUpdate.ALL, appeal_collector),
+                            group=-5)
+    # /antimat: мат и оскорбления — удалить и переписать от имени бота
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, antimat_filter), group=-4)
     application.add_handler(MessageHandler(filters.ALL & filters.ChatType.PRIVATE, pm_mirror), group=-3)
     # Ответы от имени бота: reply на зеркальное сообщение в лог-группе → доставка юзеру.
     application.add_handler(
@@ -18242,6 +19247,11 @@ def main():
     application.add_handler(CallbackQueryHandler(afindsetup_callback, pattern=r'^findsetup:'))
     application.add_handler(CallbackQueryHandler(find_page_callback, pattern=r'^findpg:'))
     application.add_handler(CallbackQueryHandler(top_page_callback, pattern=r'^toppg:'))
+    application.add_handler(CallbackQueryHandler(appeal_compose_callback, pattern=r'^lockapc:'))
+    application.add_handler(CallbackQueryHandler(appeal_decision_callback, pattern=r'^lockap:'))
+    # Ответ руководства на «✍️ ответьте…» в лог-группе → заявителю от имени бота
+    application.add_handler(MessageHandler(filters.Chat(PM_LOG_CHAT_ID) & filters.REPLY, clarify_reply_handler),
+                            group=12)
     application.add_handler(CallbackQueryHandler(aconf_callback, pattern=r'^conf:sw:'))
     # Справка: переключение разделов кнопками
     application.add_handler(CallbackQueryHandler(ahelp_callback, pattern=r'^help:'))
