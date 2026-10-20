@@ -2985,8 +2985,7 @@ HELP_SECTIONS = [
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
         ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
         ("tagall",     "<текст>",              "тегнуть всех активных; в ЛС — помеченные копии, переслать нельзя; ответом на файл — с вложением", 5),
-        ("leakmark",   "<текст>",              "объявление в ЛС, у каждого своя помеченная копия (найти слившего — /leakfind)", 5),
-        ("leakfind",   "<текст со скрина>",    "чья копия /leakmark или /tagall на слитом скриншоте", "spec"),
+        ("leakfind",   "<текст со скрина>",    "чья копия /tagall на слитом скриншоте", "spec"),
         ("tagskip",    "[user]",               "кому не слать уведомления от /tagall: без аргумента — список, с <user> — добавить/убрать", 5),
         ("department", "add|remove|rename|list|find", "управление отделами", 5),
         ("setalldept", "<номер>",              "перевести всех в отдел", 5),
@@ -3016,7 +3015,7 @@ HELP_SECTIONS = [
         ("conflist",   "",                     "все конференции бота", "main"),
         ("rankname",   "[0-7 название]",       "названия рангов этой конференции", 0),
         ("regfields",  "[add|on|off|req|rename|move|del|token]", "вопросы регистрации и жетоны этой конференции", "spec"),
-        ("global",     "create|add|remove|info", "глобальные связки бесед", 0),
+        ("global",     "add|create|remove|info", "связки бесед: /global add — присоединить эту беседу к другой кнопками", 0),
         ("gbinfo",     "<user>",               "информация о человеке во всех беседах", 5),
         ("gwarn",      "<user> <причина>",     "варн во всех беседах связки", 5),
         ("gunwarn",    "<user>",               "снять варн во всех беседах связки", 5),
@@ -8916,7 +8915,7 @@ async def atagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # В ЛС у каждого своя помеченная копия (см. «МЕТКИ ОТ СЛИВА») — по скрину
     # /leakfind покажет, чья она. Переслать и сохранить нельзя.
     def render(m, bits):
-        text = f"{m['head']} Обращение ко всем\n{m['div1']}\n{m['from']} От: {_html_escape(issuer_name)}"
+        text = f"{m['head']} {m['title']}\n{m['div1']}\n{m['from']} От: {_html_escape(issuer_name)}"
         if body_html:
             text += f"\n💬 {_leak_tweak_html(body_html, bits)}"
         return text + f"\n{m['div2']}"
@@ -16107,26 +16106,8 @@ async def aconfnew(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Этот чат уже подключён как конференция.")
         return
     title = ' '.join(context.args or []).strip() or (chat.title or f"Конфа {chat.id}")
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # schema_name заполняем временным уникальным значением, потом — conf_<id>
-    c.execute('''INSERT INTO public.g_conferences (chat_id, title, schema_name, reg_open, created_at)
-                 VALUES (?, ?, ?, 1, ?)''', (chat.id, title, f"pending_{abs(chat.id)}", now_msk_str()))
-    c.execute('SELECT id FROM public.g_conferences WHERE chat_id = ?', (chat.id,))
-    conf_id = c.fetchone()[0]
-    schema = f"conf_{conf_id}"
-    c.execute('UPDATE public.g_conferences SET schema_name = ? WHERE id = ?', (schema, conf_id))
-    conn.commit()
-    conn.close()
-
     try:
-        sqlite3.create_schema(schema)
-        reload_conferences()
-        with using_conf(get_conf(conf_id)):
-            init_database()
-            reload_blocked_users()
-        sqlite3.invalidate_table_cache()
+        conf_id = _create_conference(chat.id, title)
     except Exception as e:
         logger.error(f"confnew: {e}")
         await update.message.reply_text(f"❌ Не удалось создать базу конференции: {e}")
@@ -16145,8 +16126,31 @@ async def aconfnew(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/rankname <0-7> <название> — названия рангов\n"
         "/regfields — вопросы регистрации\n"
         "/confset — топики, название, регистрация\n"
-        "/global — связать с другими конференциями"
+        "/global add — присоединить к другой беседе"
     )
+
+
+def _create_conference(chat_id: int, title: str) -> int:
+    """Завести конфу для чата: запись в реестре, своя схема и таблицы. Возвращает id."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # schema_name заполняем временным уникальным значением, потом — conf_<id>
+    c.execute('''INSERT INTO public.g_conferences (chat_id, title, schema_name, reg_open, created_at)
+                 VALUES (?, ?, ?, 1, ?)''', (chat_id, title, f"pending_{abs(chat_id)}", now_msk_str()))
+    c.execute('SELECT id FROM public.g_conferences WHERE chat_id = ?', (chat_id,))
+    conf_id = c.fetchone()[0]
+    schema = f"conf_{conf_id}"
+    c.execute('UPDATE public.g_conferences SET schema_name = ? WHERE id = ?', (schema, conf_id))
+    conn.commit()
+    conn.close()
+
+    sqlite3.create_schema(schema)
+    reload_conferences()
+    with using_conf(get_conf(conf_id)):
+        init_database()
+        reload_blocked_users()
+    sqlite3.invalidate_table_cache()
+    return conf_id
 
 
 _TOPIC_KEYS = {'verdict': 'verdict_topic', 'games': 'games_topic', 'poll': 'poll_topic'}
@@ -16273,6 +16277,30 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = list(context.args or [])
     action = args[0].lower() if args else ''
     conf = current_conf()
+    # Незнакомый чат conf_router считает основной конфой — без этой проверки
+    # /global в ещё не подключённой беседе показывал и менял связку ФСБ.
+    chat = update.effective_chat
+    if action and chat.type != 'private' and not conf_for_chat(chat.id):
+        if action not in ('add', 'create'):
+            await update.message.reply_text(
+                "ℹ️ Этот чат ещё не подключён к боту. /global add — подключить и присоединить к беседе.")
+            return
+        if not is_main_admin(user_id):
+            await update.message.reply_text("❌ Подключать беседы может только главный админ.")
+            return
+        title = chat.title or f"Конфа {chat.id}"
+        try:
+            new_id = _create_conference(chat.id, title)
+        except Exception as e:
+            logger.error(f"global: автоподключение: {e}")
+            await update.message.reply_text(f"❌ Не удалось подключить беседу: {e}")
+            return
+        log_action(user_id, 'conf_new', None, f"#{new_id} {title} chat={chat.id} (через /global)")
+        conf = get_conf(new_id)
+        activate_conf(conf)
+        await update.message.reply_text(
+            f"🏛 Беседа подключена к боту: «{title}» (#{new_id}). База своя, регистрация открыта.")
+    where = "" if update.effective_chat.type != 'private' else f"\n🏛 Действует на активную конфу: «{conf_title(conf)}» (/conf — сменить)"
 
     if action == 'info' or not action:
         if not action:
@@ -16280,7 +16308,8 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔗 ГЛОБАЛЬНЫЕ СВЯЗКИ\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 "/global create [название] — создать глобальную связку\n"
-                "/global add <id> — добавить беседу в глобальную связку\n"
+                "/global add — присоединить эту беседу к другой (кнопками; новую беседу бот подключит сам)\n"
+                "/global add <id> — добавить беседу в связку по её id\n"
                 "/global remove — удалить беседу из глобальной связки\n"
                 "/global info — информация о глобальной связке\n"
                 "━━━━━━━━━━━━━━━━━\n"
@@ -16289,7 +16318,7 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if not conf.get('link_group'):
-            await update.message.reply_text(f"ℹ️ «{conf_title(conf)}» не состоит в глобальной связке.")
+            await update.message.reply_text(f"ℹ️ «{conf_title(conf)}» не состоит в глобальной связке.{where}")
             return
         gid = conf['link_group']
         members = linked_confs(conf)
@@ -16301,7 +16330,7 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━",
         ]
         lines += [f"{'▶️' if m['id'] == conf['id'] else '•'} {conf_title(m)} (#{m['id']})" for m in members]
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines) + where)
         return
 
     if not is_main_admin(user_id):
@@ -16314,7 +16343,7 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == 'create':
         if conf.get('link_group'):
             await update.message.reply_text(
-                f"❌ «{conf_title(conf)}» уже в связке id {conf['link_group']}. Сначала /global remove."
+                f"❌ «{conf_title(conf)}» уже в связке id {conf['link_group']}. Сначала /global remove.{where}"
             )
             return
         title = ' '.join(args[1:]).strip()
@@ -16335,13 +16364,29 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 id связки: {gid}\n"
             f"🏛 Добавлена: {conf_title(conf)}\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"В другой беседе: /global add {gid}"
+            f"В другой беседе: /global add {gid}{where}"
         )
         return
 
     if action == 'add':
-        if len(args) < 2 or not args[1].isdigit():
-            await update.message.reply_text("❌ /global add <id связки>")
+        if len(args) < 2:
+            others = [m for m in all_conferences() if m['id'] != conf['id']]
+            if not others:
+                await update.message.reply_text("ℹ️ Других бесед у бота пока нет — присоединять не к чему.")
+                return
+            kb = [[InlineKeyboardButton(
+                f"{conf_title(m)}" + (f" · связка {m['link_group']}" if m.get('link_group') else ""),
+                callback_data=f"glink:{conf['id']}:{m['id']}")] for m in others]
+            kb.append([InlineKeyboardButton("✖️ Отмена", callback_data=f"glink:{conf['id']}:0")])
+            await update.message.reply_text(
+                f"🔗 К какой беседе присоединить «{conf_title(conf)}»?\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "Если выбранная беседа уже в связке — эта войдёт в ту же связку.\n"
+                "Если нет — будет создана новая связка из двух бесед." + where,
+                reply_markup=InlineKeyboardMarkup(kb))
+            return
+        if not args[1].isdigit():
+            await update.message.reply_text("❌ /global add — выбрать беседу кнопками, или /global add <id связки>")
             return
         gid = int(args[1])
         conn = sqlite3.connect(DB_FILE)
@@ -16364,24 +16409,79 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━\n"
             f"📛 {_link_group_title(gid)} (id {gid})\n"
             f"🏛 В связке: {', '.join(members)}\n"
-            "🚫 ЧС бесед связки объединён"
+            "🚫 ЧС бесед связки объединён" + where
         )
         return
 
     if action == 'remove':
         if not conf.get('link_group'):
-            await update.message.reply_text("ℹ️ Эта беседа не в связке.")
+            await update.message.reply_text(f"ℹ️ «{conf_title(conf)}» не в связке.{where}")
             return
         gid = conf['link_group']
         _set_conf_link(conf['id'], None)
         log_action(user_id, 'global_remove', None, f"group={gid} conf=#{conf['id']}")
         await update.message.reply_text(
             f"✅ «{conf_title(conf)}» удалена из связки «{_link_group_title(gid)}».\n"
-            "ЧС беседы сохранён как есть, новые баны связки сюда больше не приходят."
+            "ЧС беседы сохранён как есть, новые баны связки сюда больше не приходят." + where
         )
         return
 
     await update.message.reply_text("❌ /global create | add | remove | info")
+
+
+def _link_confs(conf: dict, target: dict) -> int:
+    """Присоединить conf к беседе target: в её связку, а если связки нет — новая из двух."""
+    gid = target.get('link_group')
+    if not gid:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('INSERT INTO public.g_link_groups (title, created_by, created_at) VALUES (?, ?, ?)',
+                  (conf_title(target), None, now_msk_str()))
+        c.execute('SELECT MAX(id) FROM public.g_link_groups')
+        gid = c.fetchone()[0]
+        conn.commit()
+        conn.close()
+        _set_conf_link(target['id'], gid)
+    _set_conf_link(conf['id'], gid)
+    sync_gban_group(gid)
+    return gid
+
+
+async def global_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """glink:<id беседы>:<id беседы-цели|0> — кнопки /global add."""
+    query = update.callback_query
+    if not is_main_admin(query.from_user.id):
+        await query.answer("Только главный админ.", show_alert=True)
+        return
+    try:
+        _, conf_id, target_id = query.data.split(':')
+        conf_id, target_id = int(conf_id), int(target_id)
+    except ValueError:
+        await query.answer()
+        return
+    await query.answer()
+    if not target_id:
+        await query.edit_message_text("✖️ Отменено.")
+        return
+    conf, target = get_conf(conf_id), get_conf(target_id)
+    if not conf or not target or conf_id == target_id:
+        await query.edit_message_text("❌ Беседа не найдена.")
+        return
+    if conf.get('link_group') and conf['link_group'] == target.get('link_group'):
+        await query.edit_message_text(f"ℹ️ «{conf_title(conf)}» и «{conf_title(target)}» уже в одной связке.")
+        return
+    old = conf.get('link_group')
+    gid = _link_confs(conf, target)
+    log_action(query.from_user.id, 'global_add', None, f"group={gid} conf=#{conf_id} к #{target_id}")
+    members = [conf_title(m) for m in all_conferences() if m.get('link_group') == gid]
+    await query.edit_message_text(
+        "🔗 БЕСЕДА ПРИСОЕДИНЕНА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"🏛 «{conf_title(conf)}» → «{conf_title(target)}»\n"
+        f"📛 {_link_group_title(gid)} (id {gid})\n"
+        f"👥 В связке: {', '.join(members)}\n"
+        "🚫 ЧС бесед связки объединён, работают /gwarn /gmute /gkick …"
+        + (f"\n↪️ Из прежней связки id {old} беседа вышла." if old else ""))
 
 
 # ─── Глобальные команды ───
@@ -18766,21 +18866,26 @@ async def aantimat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/antimat list — свои слова · /antimat test <текст> — проверить")
 
 
-# ============ МЕТКИ ОТ СЛИВА (/leakmark, /leakfind, ЛС /tagall) ============
-# Каждый получатель рассылки получает свою, чуть отличающуюся копию: эмодзи в
-# заголовке, длина разделителей, значок у «От:» (уникальны по номеру в рассылке),
-# плюс мелочи в самом тексте — любое «ё»/«е», «…/...», тире, «18:00/18.00», точка в конце.
+# ============ МЕТКИ ОТ СЛИВА (ЛС /tagall, /leakfind) ============
+# Каждый получатель рассылки получает свою, чуть отличающуюся копию: эмодзи и
+# регистр заголовка, длина разделителей, значок у «От:» (уникальны по номеру в
+# рассылке), плюс мелочи в самом тексте — заглавная/строчная в начале предложений,
+# знак в конце («.», «!» или ничего), любое «ё»/«е», «…/...», тире, «18:00/18.00».
 # Все копии хранятся в leak_copies. По тексту со слитого скриншота /leakfind
 # находит, чья это копия. Невидимые символы не используем — на скрине их нет.
 # Рассылки уходят с protect_content: переслать и сохранить их нельзя.
 
 LEAK_HEAD_EMOJI = ["📣", "📢", "🔔", "📯"]
 LEAK_FROM_EMOJI = ["👮", "👤", "🛡"]
+LEAK_TITLES = ["Обращение ко всем", "ОБРАЩЕНИЕ КО ВСЕМ", "Обращение ко ВСЕМ"]
 LEAK_DIV_MIN, LEAK_DIV_SPAN = 14, 6          # разделитель ━ длиной 14..19
 LEAK_SEARCH_MAILINGS = 50
 
-_LEAK_SLOT_RE = re.compile(r'\.\.\.|…| [-—] |\b\d{1,2}:\d{2}\b|\b\w*[ёЁ]\w*\b|\b(?:еще|ее|нее)\b',
-                           re.IGNORECASE)
+_LEAK_SLOTS = (r'\.\.\.|…| [-—] |\b\d{1,2}:\d{2}\b|\b\w*[ёЁ]\w*\b|\b(?:еще|ее|нее)\b'
+               r'|(?<=[.!?…] )[А-ЯЁа-яё](?=[а-яё])')
+_LEAK_SLOT_RE = re.compile(_LEAK_SLOTS, re.IGNORECASE)
+# То же + первая буква куска, если кусок начинает предложение (после тега или в начале текста)
+_LEAK_SLOT_START_RE = re.compile(r'^[А-ЯЁа-яё](?=[а-яё])|' + _LEAK_SLOTS, re.IGNORECASE)
 _LEAK_ALT = {
     '...': ('...', '…'), '…': ('...', '…'),
     ' - ': (' - ', ' — '), ' — ': (' - ', ' — '),
@@ -18791,14 +18896,16 @@ _LEAK_ALT = {
 }
 
 
-def _leak_tweak_text(text: str, bits: int, start: int = 0):
+def _leak_tweak_text(text: str, bits: int, start: int = 0, sentence_start: bool = False):
     """Подменяет мелочи в обычном тексте по битам; возвращает (текст, след. бит)."""
     k = [start]
 
     def sub(m):
         w = m.group(0)
         alt = _LEAK_ALT.get(w.lower())
-        if alt and w[:1].isupper():
+        if len(w) == 1:
+            alt = (w.upper(), w.lower())     # начало предложения: заглавная или строчная
+        elif alt and w[:1].isupper():
             alt = tuple(a.capitalize() for a in alt)
         elif not alt and re.fullmatch(r'\d{1,2}:\d{2}', w):
             alt = (w, w.replace(':', '.'))
@@ -18807,21 +18914,26 @@ def _leak_tweak_text(text: str, bits: int, start: int = 0):
         choice = alt[(bits >> (k[0] % 60)) & 1]
         k[0] += 1
         return choice
-    return _LEAK_SLOT_RE.sub(sub, text), k[0]
+    regex = _LEAK_SLOT_START_RE if sentence_start else _LEAK_SLOT_RE
+    return regex.sub(sub, text), k[0]
+# биты 60–61 заняты знаком в конце, слоты текста берут биты 0–59
 
 
 def _leak_tweak_html(body_html: str, bits: int) -> str:
     """То же для HTML: меняем только текст между тегами, точку в конце — по биту."""
     parts = re.split(r'(<[^>]+>)', body_html)
     k = 0
+    seen = ''     # уже пройденный текст — чтобы понять, начинается ли кусок с нового предложения
     for i, part in enumerate(parts):
         if part and not part.startswith('<'):
-            parts[i], k = _leak_tweak_text(part, bits, k)
+            starts = not seen.strip() or bool(re.search(r'[.!?…]\s+$', seen))
+            parts[i], k = _leak_tweak_text(part, bits, k, starts)
+            seen += part
     out = ''.join(parts)
-    end_bit = (bits >> 61) & 1
-    m = re.search(r'([А-Яа-яЁёA-Za-z0-9])(\.?)((?:</[^>]+>)*)\s*$', out)
+    end_mark = ('', '.', '!', '.')[(bits >> 60) & 3]
+    m = re.search(r'([А-Яа-яЁёA-Za-z0-9])([.!]?)((?:</[^>]+>)*)\s*$', out)
     if m:
-        out = out[:m.start()] + m.group(1) + ('.' if end_bit else '') + m.group(3)
+        out = out[:m.start()] + m.group(1) + end_mark + m.group(3)
     return out
 
 
@@ -18831,8 +18943,9 @@ def _leak_marks(index: int) -> dict:
     head = LEAK_HEAD_EMOJI[r % len(LEAK_HEAD_EMOJI)]; r //= len(LEAK_HEAD_EMOJI)
     d1 = LEAK_DIV_MIN + r % LEAK_DIV_SPAN; r //= LEAK_DIV_SPAN
     d2 = LEAK_DIV_MIN + r % LEAK_DIV_SPAN; r //= LEAK_DIV_SPAN
-    frm = LEAK_FROM_EMOJI[r % len(LEAK_FROM_EMOJI)]
-    return {'head': head, 'div1': '━' * d1, 'div2': '━' * d2, 'from': frm}
+    frm = LEAK_FROM_EMOJI[r % len(LEAK_FROM_EMOJI)]; r //= len(LEAK_FROM_EMOJI)
+    title = LEAK_TITLES[r % len(LEAK_TITLES)]
+    return {'head': head, 'div1': '━' * d1, 'div2': '━' * d2, 'from': frm, 'title': title}
 
 
 def _leak_plain(html_text: str) -> str:
@@ -18875,41 +18988,6 @@ async def leak_send(context, kind: str, author_id: int, members: list, render, a
     return delivered, failed
 
 
-async def aleakmark(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/leakmark <текст> — объявление в ЛС всем, у каждого своя помеченная копия."""
-    user_id = update.effective_user.id
-    if not has_permission(user_id, 'warn', 'leakmark'):
-        await update.message.reply_text("❌ Команда доступна с 5 ранга.")
-        return
-    body_html = _tagall_body_html(update.message)
-    attachment = _tagall_attachment(update.message)
-    if not body_html:
-        await update.message.reply_text(
-            "❌ /leakmark <текст> — разослать в ЛС помеченные копии.\n"
-            "📎 Ответом на файл — с вложением. Найти слившего — /leakfind <текст со скрина>.")
-        return
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT user_id FROM users WHERE ban_status = "Нет" AND bot_blocked = "Нет"')
-    members = [r[0] for r in c.fetchall()]
-    conn.close()
-    issuer = _html_escape(get_admin_nick(user_id))
-
-    def render(m, bits):
-        return (f"{m['head']} ОБЪЯВЛЕНИЕ\n{m['div1']}\n{_leak_tweak_html(body_html, bits)}\n"
-                f"{m['div2']}\n{m['from']} {issuer}")
-
-    await update.message.reply_text(f"📤 Рассылаю помеченные копии: {len(members)} чел...")
-    delivered, failed = await leak_send(context, 'leakmark', user_id, members, render, attachment,
-                                        _leak_plain(body_html))
-    log_action(user_id, 'leakmark', None, _leak_plain(body_html)[:200])
-    await update.message.reply_text(
-        "✅ ПОМЕЧЕННАЯ РАССЫЛКА\n━━━━━━━━━━━━━━━━━\n"
-        f"📨 Доставлено: {delivered}\n⛔ Не доставлено: {failed}\n"
-        "🔒 Переслать и сохранить нельзя\n━━━━━━━━━━━━━━━━━\n"
-        "🔎 Всплыл скрин — /leakfind <текст со скрина>")
-
-
 def _leak_tokens(text: str) -> set:
     # «━17» / «━ 17» в запросе — разделитель из 17 символов (чтобы не рисовать его)
     text = re.sub(r'━\s*(\d{1,2})\b', lambda m: '━' * int(m.group(1)), text or '')
@@ -18917,7 +18995,7 @@ def _leak_tokens(text: str) -> set:
 
 
 async def aleakfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/leakfind <текст со скрина> — чья это копия помеченной рассылки."""
+    """/leakfind <текст со скрина> — чья это копия ЛС /tagall."""
     user_id = update.effective_user.id
     if not (is_main_admin(user_id) or has_special_access(user_id)):
         await update.message.reply_text("❌ Доступно спецдопуску и главному админу.")
@@ -18960,14 +19038,14 @@ async def aleakfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     log_action(user_id, 'leakfind', None, query_text[:200])
     if not results:
-        await _private_reply(update, context, "🔎 Совпадений нет — текст не из помеченных рассылок "
+        await _private_reply(update, context, "🔎 Совпадений нет — текст не из рассылок /tagall "
                                               "или переписан слишком неточно.")
         return
     results.sort(key=lambda r: (r[0], r[1]), reverse=True)
     lines = ["🔎 ЧЬЯ КОПИЯ", "━━━━━━━━━━━━━━━━━"]
     for score, _extra, hits, total, uid, mid, kind, created, preview in results[:5]:
         lines.append(f"👤 {_nick(uid)} (ID {uid})\n"
-                     f"   📨 #{mid} {'/tagall' if kind == 'tagall' else '/leakmark'} · {created[:16]}\n"
+                     f"   📨 /tagall #{mid} · {created[:16]}\n"
                      f"   🎯 меток совпало: {hits} из {total}" + (f", чужих: {hits - score}" if hits != score else ""))
     if len(results) > 1 and results[0][:2] == results[1][:2]:
         lines.append("━━━━━━━━━━━━━━━━━\n⚠️ Первые места равны — перепишите больше текста "
@@ -19092,7 +19170,7 @@ def main():
         'snowball': asnowball, 'snowstats': asnowstats, 'year': ayear,
         'nypoll': anypoll, 'amnesty': aamnesty,
         'lock': alock, 'lockok': alockok, 'appeal': aappeal, 'antimat': aantimat,
-        'leakmark': aleakmark, 'leakfind': aleakfind,
+        'leakfind': aleakfind,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -19253,6 +19331,7 @@ def main():
     application.add_handler(MessageHandler(filters.Chat(PM_LOG_CHAT_ID) & filters.REPLY, clarify_reply_handler),
                             group=12)
     application.add_handler(CallbackQueryHandler(aconf_callback, pattern=r'^conf:sw:'))
+    application.add_handler(CallbackQueryHandler(global_link_callback, pattern=r'^glink:'))
     # Справка: переключение разделов кнопками
     application.add_handler(CallbackQueryHandler(ahelp_callback, pattern=r'^help:'))
     # Идеи: ответы юзеров и решения админов
