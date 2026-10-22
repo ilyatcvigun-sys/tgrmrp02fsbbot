@@ -147,6 +147,11 @@ def init_conference_registry():
             created_at TEXT DEFAULT ''
         )
     ''')
+    # Общая база связки: в какую связку данные беседы уже влиты (см. «ОБЩАЯ БАЗА СВЯЗКИ»)
+    try:
+        c.execute("ALTER TABLE public.g_conferences ADD COLUMN merged_link INTEGER")
+    except sqlite3.OperationalError:
+        pass
     # Жетоны конфы (/regfields token): выдавать ли и в каком формате.
     # Значения по умолчанию = прежний формат ФСБ «52XXXX».
     for col_sql in (
@@ -174,6 +179,11 @@ def init_conference_registry():
             created_at TEXT DEFAULT ''
         )
     ''')
+    # Старшая беседа связки — её база общая для всей связки
+    try:
+        c.execute("ALTER TABLE public.g_link_groups ADD COLUMN owner_conf_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
     # Из какой конфы отправлено сообщение с inline-кнопками в ЛС. Нужно, чтобы
     # нажатие кнопки (одобрить жалобу, заявку…) обработалось в «той» конфе,
     # даже если у пользователя сейчас активна другая.
@@ -203,12 +213,55 @@ def init_conference_registry():
 
 
 def reload_conferences():
-    global _conferences
+    global _conferences, _link_owners
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(f"SELECT {', '.join(_CONF_COLUMNS)} FROM public.g_conferences ORDER BY id")
     _conferences = {r[0]: dict(zip(_CONF_COLUMNS, r)) for r in c.fetchall()}
+    try:
+        c.execute('SELECT id, owner_conf_id FROM public.g_link_groups')
+        _link_owners = {gid: owner for gid, owner in c.fetchall() if owner}
+    except sqlite3.OperationalError:
+        _link_owners = {}
     conn.close()
+
+
+# ─── ОБЩАЯ БАЗА СВЯЗКИ ───
+# Беседы одной связки (/global) работают на ОДНОЙ базе — схеме старшей беседы
+# (g_link_groups.owner_conf_id; к ней присоединяли). Ранги, жетоны, варны,
+# награды, поинты, история — общие. Настройки чата (топики, формат жетона,
+# открыта ли регистрация) — в реестре, у каждой беседы свои.
+_link_owners: dict = {}         # id связки → id старшей беседы
+
+
+def link_owner(conf: dict):
+    """Старшая беседа связки этой конфы (или None, если конфа не в связке)."""
+    gid = conf.get('link_group')
+    if gid is None:
+        return None
+    owner = _conferences.get(_link_owners.get(gid))
+    if owner and owner.get('link_group') == gid:
+        return owner
+    members = [c for c in _conferences.values() if c.get('link_group') == gid]
+    return min(members, key=lambda c: c['id']) if members else None
+
+
+def data_schema_of(conf: dict) -> str:
+    """Схема, где лежат данные конфы: своя или старшей беседы связки."""
+    owner = link_owner(conf)
+    return owner['schema_name'] if owner else conf['schema_name']
+
+
+def shared_confs(conf: dict = None) -> list:
+    """Конфы на той же базе, что и эта (сама + беседы связки)."""
+    conf = conf or current_conf()
+    schema = data_schema_of(conf)
+    return [c for c in _conferences.values() if data_schema_of(c) == schema] or [conf]
+
+
+def shared_chats(conf: dict = None) -> list:
+    """Чаты всех бесед на этой базе — мут/кик/бан применяются во всех."""
+    return [c['chat_id'] for c in shared_confs(conf) if c.get('chat_id')]
 
 
 def all_conferences() -> list:
@@ -263,14 +316,14 @@ def is_main_conf(conf: dict = None) -> bool:
 def activate_conf(conf: dict):
     """Сделать конфу текущей до конца апдейта (без отката)."""
     _conf_var.set(conf)
-    sqlite3.set_schema(conf['schema_name'])
+    sqlite3.set_schema(data_schema_of(conf))
 
 
 @contextmanager
 def using_conf(conf: dict, global_run: bool = None):
     """with using_conf(conf): … — временно работать в другой конфе."""
     t1 = _conf_var.set(conf)
-    t2 = sqlite3.set_schema(conf['schema_name'])
+    t2 = sqlite3.set_schema(data_schema_of(conf))
     t3 = _global_run.set(global_run) if global_run is not None else None
     try:
         yield conf
@@ -297,6 +350,11 @@ def is_registered_in(conf: dict, user_id: int) -> bool:
         ok = c.fetchone() is not None
         conn.close()
     return ok
+
+
+def linked_chat_titles(conf: dict) -> list:
+    """Названия остальных бесед связки — у них общая база (см. «ОБЩАЯ БАЗА СВЯЗКИ»)."""
+    return [conf_title(c) for c in linked_confs(conf) if c['id'] != conf['id']]
 
 
 def confs_of_user(user_id: int) -> list:
@@ -396,10 +454,20 @@ async def conf_router(update: object, context: ContextTypes.DEFAULT_TYPE):
             activate_conf(main_conf())
 
 
-def per_conf_job(func):
-    """Обёртка для периодических задач JobQueue: выполнить задачу в каждой конфе."""
+
+def per_conf_job(func, once_per_base: bool = False):
+    """Обёртка для периодических задач JobQueue: выполнить задачу в каждой конфе.
+    once_per_base=True — один раз на базу (беседы связки делят базу): для задач,
+    которые меняют данные (сгорание варнов, авто-разбан…), иначе — дубли."""
     async def wrapper(context: ContextTypes.DEFAULT_TYPE):
+        done = set()
         for conf in all_conferences():
+            if once_per_base:
+                schema = data_schema_of(conf)
+                if schema in done:
+                    continue
+                done.add(schema)
+                conf = link_owner(conf) or conf
             with using_conf(conf):
                 try:
                     await func(context)
@@ -1048,38 +1116,65 @@ def find_users_by_nickname(nickname: str) -> list:
     conn.close()
     return results
 
+async def _restrict_everywhere(context, user_id: int, permissions, until_date=None):
+    """Мут/размут во всех чатах базы (беседы связки). Ошибка — только если не
+    получилось ни в одном."""
+    last_error, ok = None, False
+    for chat_id in shared_chats():
+        try:
+            await context.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id,
+                                                   permissions=permissions, until_date=until_date)
+            ok = True
+        except Exception as e:
+            last_error = e
+            logger.debug(f"restrict [{chat_id}] {user_id}: {e}")
+    if not ok and last_error:
+        raise last_error
+
+
+def _action_chats(update: Update) -> list:
+    """Чаты для кика/бана: если команда относится к конфе — все чаты её базы
+    (беседы связки), иначе — только чат, где её написали."""
+    chat_id = _action_chat_id(update)
+    chats = shared_chats()
+    return chats if chat_id in chats else [chat_id]
+
+
 async def kick_user_from_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
-    try:
-        chat_id = _action_chat_id(update)
-        await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
-        await asyncio.sleep(1)
-        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
-        if chat_id == conf_chat():
-            _close_service_period(target_id)
-        return True
-    except Exception as e:
-        logger.error(f"Kick error: {e}")
-        return False
+    ok = False
+    for chat_id in _action_chats(update):
+        try:
+            await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
+            await asyncio.sleep(1)
+            await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
+            ok = True
+        except Exception as e:
+            logger.error(f"Kick error [{chat_id}]: {e}")
+    if ok and conf_chat() in _action_chats(update):
+        _close_service_period(target_id)
+    return ok
 
 async def ban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
-    try:
-        chat_id = _action_chat_id(update)
-        await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
-        if chat_id == conf_chat():
-            _close_service_period(target_id)
-        return True
-    except Exception as e:
-        logger.error(f"Ban error: {e}")
-        return False
+    ok = False
+    for chat_id in _action_chats(update):
+        try:
+            await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
+            ok = True
+        except Exception as e:
+            logger.error(f"Ban error [{chat_id}]: {e}")
+    if ok and conf_chat() in _action_chats(update):
+        _close_service_period(target_id)
+    return ok
 
 async def unban_user_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
-    try:
-        chat_id = _action_chat_id(update)
-        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
-        return True
-    except Exception as e:
-        logger.error(f"Unban error: {e}")
-        return False
+    ok = False
+    for chat_id in _action_chats(update):
+        try:
+            await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
+            ok = True
+        except Exception as e:
+            logger.error(f"Unban error [{chat_id}]: {e}")
+    return ok
 
 async def notify_user(context: ContextTypes.DEFAULT_TYPE, target_id: int, text: str):
     """Отправка уведомления с проверкой блокировки"""
@@ -1838,20 +1933,25 @@ def generate_unique_token() -> str:
             return token
         attempts += 1
 
+# С каким рангом человек попадает в конфу (регистрация, /register, связка).
+# 0 — гость — остаётся для тех, кого понизили вручную.
+NEW_USER_RANK = 1
+
+
 def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_username: str = "") -> str:
     """Добавление пользователя. Возвращает жетон ('—', если в конфе жетоны не
-    выдаются) или None при ошибке."""
+    выдаются) или None при ошибке. Ранг — NEW_USER_RANK."""
     if not token and token_settings()[0]:
         token = generate_unique_token()
     token = token or None
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, tg_username)
-                     VALUES (?, ?, ?, ?, ?, ?)''',
+        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, tg_username, rank)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
                   (user_id, game_nick, callsign, token,
                    now_msk_str("%Y-%m-%d %H:%M:%S"),
-                   tg_username or ""))
+                   tg_username or "", NEW_USER_RANK))
         conn.commit()
         conn.close()
         _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
@@ -1862,10 +1962,10 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
     except sqlite3.OperationalError:
         # Старая БД без колонки tg_username — пробуем без неё
         try:
-            c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at)
-                         VALUES (?, ?, ?, ?, ?)''',
+            c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, rank)
+                         VALUES (?, ?, ?, ?, ?, ?)''',
                       (user_id, game_nick, callsign, token,
-                       now_msk_str("%Y-%m-%d %H:%M:%S")))
+                       now_msk_str("%Y-%m-%d %H:%M:%S"), NEW_USER_RANK))
             conn.commit()
             conn.close()
             _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
@@ -2315,9 +2415,9 @@ async def auto_unban_job(context: ContextTypes.DEFAULT_TYPE):
     # Снимаем бан в Telegram + аудит + уведомление
     for uid, nick in rows:
         log_action(None, 'unban', uid, "истёк срок временного бана")
-        if conf_chat():
+        for chat_id in shared_chats():
             try:
-                await context.bot.unban_chat_member(conf_chat(), uid, only_if_banned=True)
+                await context.bot.unban_chat_member(chat_id, uid, only_if_banned=True)
             except Exception as e:
                 logger.debug(f"auto-unban in TG failed for {uid}: {e}")
         try:
@@ -7356,8 +7456,8 @@ async def amute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Применяем ограничения
     try:
-        await context.bot.restrict_chat_member(
-            chat_id=conf_chat(),
+        await _restrict_everywhere(
+            context,
             user_id=target_id,
             permissions=ChatPermissions(
                 can_send_messages=False,
@@ -7431,8 +7531,8 @@ async def aunmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Восстанавливаем стандартные права участника чата
     try:
-        await context.bot.restrict_chat_member(
-            chat_id=conf_chat(),
+        await _restrict_everywhere(
+            context,
             user_id=target_id,
             permissions=ChatPermissions(
                 can_send_messages=True,
@@ -7819,8 +7919,8 @@ async def word_trigger_callback(update: Update, context: ContextTypes.DEFAULT_TY
         duration = timedelta(minutes=max(1, minutes))
         until_utc = datetime.now(timezone.utc) + duration
         try:
-            await context.bot.restrict_chat_member(
-                chat_id=conf_chat(),
+            await _restrict_everywhere(
+                context,
                 user_id=target_id,
                 permissions=ChatPermissions(
                     can_send_messages=False, can_send_audios=False, can_send_documents=False,
@@ -10571,7 +10671,10 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     lines += [f"📋 {f['title']}: {v}" for f, v in custom if v]
     if token != '—':
         lines.append(f"🎫 {token}")
-    lines.append(f"⭐ {RANKS[0]['name']}")
+    lines.append(f"⭐ {RANKS[NEW_USER_RANK]['name']}")
+    shared = linked_chat_titles(conf) if conf else []
+    if shared:
+        lines.append(f"🔗 Регистрация действует и в: {', '.join(shared)}")
     await reply("✅ Готово!\n\n" + "\n".join(lines))
 
     # Уведомление в лог-группу и генералам (6+)
@@ -10856,7 +10959,11 @@ def vote_in_poll(poll_id: int, user_id: int, vote: str, reason: str = "") -> tup
     row = c.fetchone()
     if not row or row[0] != 'active': conn.close(); return False, "Голосование неактивно."
     voter_data = get_user_data(user_id)
-    voter_nick = voter_data['nick'] if voter_data else f"id {user_id}"
+    if not voter_data:
+        conn.close(); return False, "Вы не зарегистрированы."
+    if voter_data['rank'] < 1 and not (is_main_admin(user_id) or has_special_access(user_id)):
+        conn.close(); return False, "Гости (ранг 0) не голосуют."
+    voter_nick = voter_data['nick']
     c.execute('''INSERT INTO poll_votes (poll_id, user_id, vote, reason, voted_at, voter_nick)
                  VALUES (?, ?, ?, ?, ?, ?)''',
               (poll_id, user_id, vote, reason, now_msk_str("%Y-%m-%d %H:%M:%S"), voter_nick))
@@ -11661,8 +11768,8 @@ async def _handle_topic_violation(update: Update, context: ContextTypes.DEFAULT_
     if mute_min > 0:
         try:
             until = datetime.now(timezone.utc) + timedelta(minutes=mute_min)
-            await context.bot.restrict_chat_member(
-                chat_id=conf_chat(),
+            await _restrict_everywhere(
+                context,
                 user_id=user_id,
                 permissions=ChatPermissions(
                     can_send_messages=False,
@@ -16255,12 +16362,112 @@ def _link_group_title(group_id) -> str:
 
 
 def _set_conf_link(conf_id: int, group_id):
+    """Сменить связку беседы. При вступлении её данные вливаются в общую базу
+    связки (база старшей беседы), при выходе беседа возвращается на свою базу."""
+    conf = get_conf(conf_id)
+    was_own_base = conf is not None and data_schema_of(conf) == conf['schema_name']
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('UPDATE public.g_conferences SET link_group = ? WHERE id = ?', (group_id, conf_id))
     conn.commit()
     conn.close()
     reload_conferences()
+    if group_id is None or conf is None:
+        return
+    conf = get_conf(conf_id)
+    owner = link_owner(conf)
+    if owner and owner['id'] != conf_id and was_own_base:
+        moved = _merge_base(conf['schema_name'], owner['schema_name'])
+        logger.info(f"Связка {group_id}: база «{conf_title(conf)}» влита в «{conf_title(owner)}», новых людей: {moved}")
+    _mark_merged(conf_id, group_id)
+
+
+def _set_link_owner(group_id: int, conf_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE public.g_link_groups SET owner_conf_id = ? WHERE id = ?', (conf_id, group_id))
+    conn.commit()
+    conn.close()
+    reload_conferences()
+
+
+def _mark_merged(conf_id: int, group_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('UPDATE public.g_conferences SET merged_link = ? WHERE id = ?', (group_id, conf_id))
+    conn.commit()
+    conn.close()
+
+
+# Таблицы, где кроме user_id есть ссылки на id других таблиц этой же базы —
+# при переносе они указали бы не туда, поэтому не переносятся.
+_MERGE_SKIP_TABLES = {'poll_votes', 'leak_copies', 'user_fields', 'ideas'}
+
+
+def _merge_base(src: str, dst: str) -> int:
+    """Влить людей из базы src в базу dst. Переносятся только те, кого в dst нет
+    (у остальных главнее данные старшей беседы), вместе с их строками во всех
+    таблицах с user_id. Жетон, уже занятый в dst, обнуляется. Возвращает число людей."""
+    if src == dst:
+        return 0
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    def columns(schema, table):
+        c.execute('SELECT column_name FROM information_schema.columns WHERE table_schema = ? AND table_name = ? '
+                  'ORDER BY ordinal_position', (schema, table))
+        return [r[0] for r in c.fetchall()]
+
+    c.execute(f'SELECT user_id FROM {src}.users WHERE user_id NOT IN (SELECT user_id FROM {dst}.users)')
+    new_ids = [r[0] for r in c.fetchall()]
+    if not new_ids:
+        conn.close()
+        return 0
+    c.execute("SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = ? "
+              "AND column_name = 'user_id'", (src,))
+    tables = sorted(r[0] for r in c.fetchall() if r[0] != 'users' and r[0] not in _MERGE_SKIP_TABLES)
+    for table in ['users'] + tables:
+        dst_cols = set(columns(dst, table))
+        common = [col for col in columns(src, table) if col in dst_cols and col != 'id']
+        if 'user_id' not in common:
+            continue
+        exprs = [(f"CASE WHEN token IN (SELECT token FROM {dst}.users WHERE token IS NOT NULL) "
+                  "THEN NULL ELSE token END") if (table == 'users' and col == 'token') else col
+                 for col in common]
+        for i in range(0, len(new_ids), 500):
+            part = new_ids[i:i + 500]
+            try:
+                c.execute(f"INSERT INTO {dst}.{table} ({', '.join(common)}) SELECT {', '.join(exprs)} "
+                          f"FROM {src}.{table} WHERE user_id IN ({','.join('?' * len(part))}) "
+                          "ON CONFLICT DO NOTHING", part)
+            except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+                logger.warning(f"merge {src}.{table} → {dst}: {e}")
+    conn.commit()
+    conn.close()
+    return len(new_ids)
+
+
+def sync_link_bases():
+    """При старте: у каждой связки есть старшая беседа, данные остальных влиты
+    в её базу (для связок, созданных до общей базы, — один раз)."""
+    for conf in all_conferences():
+        gid = conf.get('link_group')
+        if gid is None:
+            continue
+        owner = link_owner(conf)
+        if owner and _link_owners.get(gid) != owner['id']:
+            _set_link_owner(gid, owner['id'])
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT merged_link FROM public.g_conferences WHERE id = ?', (conf['id'],))
+        row = c.fetchone()
+        conn.close()
+        if row and row[0] == gid:
+            continue
+        if owner and owner['id'] != conf['id']:
+            moved = _merge_base(conf['schema_name'], owner['schema_name'])
+            logger.info(f"Связка {gid}: база «{conf_title(conf)}» влита в «{conf_title(owner)}», новых людей: {moved}")
+        _mark_merged(conf['id'], gid)
 
 
 async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -16355,6 +16562,7 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gid = c.fetchone()[0]
         conn.commit()
         conn.close()
+        _set_link_owner(gid, conf['id'])
         _set_conf_link(conf['id'], gid)
         log_action(user_id, 'global_create', None, f"group={gid} conf=#{conf['id']}")
         await update.message.reply_text(
@@ -16418,11 +16626,19 @@ async def aglobal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"ℹ️ «{conf_title(conf)}» не в связке.{where}")
             return
         gid = conf['link_group']
+        owner = link_owner(conf)
+        others = [m for m in linked_confs(conf) if m['id'] != conf['id']]
+        if owner and owner['id'] == conf['id'] and others:
+            await update.message.reply_text(
+                f"❌ «{conf_title(conf)}» — старшая беседа связки, на её базе работают остальные: "
+                f"{', '.join(conf_title(m) for m in others)}.\nСначала уберите их (/global remove в их чатах)." + where)
+            return
         _set_conf_link(conf['id'], None)
         log_action(user_id, 'global_remove', None, f"group={gid} conf=#{conf['id']}")
         await update.message.reply_text(
             f"✅ «{conf_title(conf)}» удалена из связки «{_link_group_title(gid)}».\n"
-            "ЧС беседы сохранён как есть, новые баны связки сюда больше не приходят." + where
+            "Беседа вернулась на свою базу — в том виде, какой она была до вступления в связку "
+            "(всё, что менялось в связке, осталось в общей базе)." + where
         )
         return
 
@@ -16441,6 +16657,7 @@ def _link_confs(conf: dict, target: dict) -> int:
         gid = c.fetchone()[0]
         conn.commit()
         conn.close()
+        _set_link_owner(gid, target['id'])
         _set_conf_link(target['id'], gid)
     _set_conf_link(conf['id'], gid)
     sync_gban_group(gid)
@@ -16471,6 +16688,10 @@ async def global_link_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(f"ℹ️ «{conf_title(conf)}» и «{conf_title(target)}» уже в одной связке.")
         return
     old = conf.get('link_group')
+    owner = link_owner(conf)
+    if old and owner and owner['id'] == conf['id'] and len(linked_confs(conf)) > 1:
+        await query.edit_message_text(f"❌ «{conf_title(conf)}» — старшая беседа своей связки, сначала уберите из неё остальные.")
+        return
     gid = _link_confs(conf, target)
     log_action(query.from_user.id, 'global_add', None, f"group={gid} conf=#{conf_id} к #{target_id}")
     members = [conf_title(m) for m in all_conferences() if m.get('link_group') == gid]
@@ -16528,8 +16749,14 @@ def make_global_command(local_name: str, handler):
             return
 
         skipped = []
+        done_bases = set()
         try:
             for conf in confs:
+                # Беседы связки делят базу, а мут/кик/бан и так идут во все её чаты
+                base = data_schema_of(conf)
+                if base in done_bases:
+                    continue
+                done_bases.add(base)
                 if not is_registered_in(conf, target_id):
                     skipped.append(conf_title(conf))
                     continue
@@ -17721,7 +17948,7 @@ async def asnowball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not td:
         await update.message.reply_text("❌ Цель не зарегистрирована.")
         return
-    key = (current_conf()['schema_name'], user_id)
+    key = (sqlite3.get_schema(), user_id)
     now_ts = now_msk().timestamp()
     wait = SNOW_COOLDOWN_SEC - (now_ts - _snow_last.get(key, 0))
     if wait > 0:
@@ -17818,22 +18045,22 @@ async def ny_countdown_job(context: ContextTypes.DEFAULT_TYPE):
         return
     year = _ny_year()
     text = _countdown_text()
-    if ny_kv_get(f'countdown_text_{year}') == text:
+    if ny_kv_get(f'countdown_text_{current_conf()["id"]}_{year}') == text:
         return
-    msg_id = ny_kv_get(f'countdown_msg_{year}')
+    msg_id = ny_kv_get(f'countdown_msg_{current_conf()["id"]}_{year}')
     if msg_id:
         try:
             await context.bot.edit_message_text(chat_id=conf_chat(), message_id=int(msg_id), text=text)
-            ny_kv_set(f'countdown_text_{year}', text)
+            ny_kv_set(f'countdown_text_{current_conf()["id"]}_{year}', text)
             return
         except Exception as e:
             if 'not modified' in str(e).lower():
-                ny_kv_set(f'countdown_text_{year}', text)
+                ny_kv_set(f'countdown_text_{current_conf()["id"]}_{year}', text)
                 return
             logger.info(f"ny_countdown: старое сообщение не правится ({e}), шлю новое")
     msg = await context.bot.send_message(chat_id=conf_chat(), text=text)
-    ny_kv_set(f'countdown_msg_{year}', msg.message_id)
-    ny_kv_set(f'countdown_text_{year}', text)
+    ny_kv_set(f'countdown_msg_{current_conf()["id"]}_{year}', msg.message_id)
+    ny_kv_set(f'countdown_text_{current_conf()["id"]}_{year}', text)
     try:
         await context.bot.pin_chat_message(chat_id=conf_chat(), message_id=msg.message_id,
                                            disable_notification=True)
@@ -17846,12 +18073,12 @@ async def ny_greeting_job(context: ContextTypes.DEFAULT_TYPE):
     now = now_msk()
     if not (now.month == 1 and now.day == 1) or not ny_active('countdown'):
         return
-    key = f'greeting_sent_{now.year}'
+    key = f'greeting_sent_{current_conf()["id"]}_{now.year}'
     if ny_kv_get(key):
         return
     ny_kv_set(key, '1')
     await context.bot.send_message(chat_id=conf_chat(), text=ny_kv_get('greeting_text') or NY_DEFAULT_GREETING)
-    msg_id = ny_kv_get(f'countdown_msg_{now.year}')
+    msg_id = ny_kv_get(f'countdown_msg_{current_conf()["id"]}_{now.year}')
     if msg_id:
         try:
             await context.bot.edit_message_text(chat_id=conf_chat(), message_id=int(msg_id),
@@ -18003,7 +18230,7 @@ async def ny_year_summary_job(context: ContextTypes.DEFAULT_TYPE):
     now = now_msk()
     if not (now.month == 12 and now.day == 31) or not ny_active('year'):
         return
-    key = f'summary_sent_{now.year}'
+    key = f'summary_sent_{current_conf()["id"]}_{now.year}'
     if ny_kv_get(key):
         return
     ny_kv_set(key, '1')
@@ -18148,7 +18375,7 @@ def mod_kv_set(key: str, value):
 
 
 def _lock_state() -> dict:
-    schema = current_conf()['schema_name']
+    schema = sqlite3.get_schema()
     st = _lock_cache.get(schema)
     if st is None:
         on = mod_kv_get('lock_on') == '1'
@@ -18165,7 +18392,7 @@ def _lock_state() -> dict:
 
 
 def _lock_invalidate():
-    _lock_cache.pop(current_conf()['schema_name'], None)
+    _lock_cache.pop(sqlite3.get_schema(), None)
 
 
 def lock_active() -> bool:
@@ -18200,7 +18427,7 @@ async def _lock_mute(context, user_id: int) -> bool:
     if member.status == 'restricted' and not getattr(member, 'can_send_messages', True):
         return False
     try:
-        await context.bot.restrict_chat_member(conf_chat(), user_id, ChatPermissions(**_AMODE_CLOSED))
+        await _restrict_everywhere(context, user_id, ChatPermissions(**_AMODE_CLOSED))
     except Exception as e:
         logger.debug(f"lock: не замутил {user_id}: {e}")
         return False
@@ -18225,7 +18452,7 @@ async def _lock_unmute(context, user_id: int) -> bool:
     if not muted:
         return False
     try:
-        await context.bot.restrict_chat_member(conf_chat(), user_id, ChatPermissions(**_AMODE_OPEN))
+        await _restrict_everywhere(context, user_id, ChatPermissions(**_AMODE_OPEN))
         return True
     except Exception as e:
         logger.debug(f"lock: не снял мут {user_id}: {e}")
@@ -18321,7 +18548,7 @@ async def lock_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.debug(f"lock: не удалил сообщение: {e}")
     await _lock_mute(context, user_id)   # не был в базе или мут не встал при /lock on
-    key = (current_conf()['schema_name'], user_id)
+    key = (sqlite3.get_schema(), user_id)
     now_ts = now_msk().timestamp()
     if now_ts - _lock_reminded.get(key, 0) > LOCK_REMIND_COOLDOWN_SEC:
         _lock_reminded[key] = now_ts
@@ -18752,7 +18979,7 @@ _antimat_cache: dict = {}       # схема → (включён, regex свои
 
 
 def _antimat_state():
-    schema = current_conf()['schema_name']
+    schema = sqlite3.get_schema()
     st = _antimat_cache.get(schema)
     if st is None:
         on = mod_kv_get('antimat_on') == '1'
@@ -18821,7 +19048,7 @@ async def aantimat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action in ('on', 'вкл', 'off', 'выкл'):
         enable = action in ('on', 'вкл')
         mod_kv_set('antimat_on', '1' if enable else None)
-        _antimat_cache.pop(current_conf()['schema_name'], None)
+        _antimat_cache.pop(sqlite3.get_schema(), None)
         log_action(user_id, 'antimat_mode', None, 'вкл' if enable else 'выкл')
         text = (f"🕶 {WARN_ANNOUNCE_PREFIX} » Включён антимат: сообщения с матом и оскорблениями "
                 "будут удаляться и публиковаться от имени бота без автора."
@@ -18841,7 +19068,7 @@ async def aantimat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute('INSERT INTO antimat_words (word) VALUES (?)', (rest,))
         conn.commit()
         conn.close()
-        _antimat_cache.pop(current_conf()['schema_name'], None)
+        _antimat_cache.pop(sqlite3.get_schema(), None)
         await update.message.reply_text(f"✅ «{rest}» {'добавлено в список' if action == 'add' else 'убрано из списка'}.")
         return
     if action == 'list':
@@ -19085,9 +19312,15 @@ def main():
         if conf['schema_name'] != MAIN_SCHEMA:
             sqlite3.create_schema(conf['schema_name'])
         with using_conf(conf):
-            init_database()
+            # Миграции — на собственной схеме беседы (даже если сейчас она на базе связки)
+            with sqlite3.using_schema(conf['schema_name']):
+                init_database()
             reload_blocked_users()
     sqlite3.invalidate_table_cache()
+    try:
+        sync_link_bases()
+    except Exception as e:
+        logger.error(f"Связки: выравнивание баз не удалось: {e}")
     logger.info(f"Конференций: {len(all_conferences())}")
     # Mini App «Личное дело» — отдельный поток, использует уже поднятый пул БД.
     threading.Thread(target=run_webapp, daemon=True, name="webapp").start()
@@ -19362,11 +19595,11 @@ def main():
     application.add_handler(CallbackQueryHandler(word_trigger_callback, pattern=r'^wtrig:'))
 
     # Авто-сгорание предупреждений: проверяем раз в час, сразу при старте — через 30 секунд.
-    application.job_queue.run_repeating(per_conf_job(expire_warnings_job), interval=3600, first=30)
+    application.job_queue.run_repeating(per_conf_job(expire_warnings_job, once_per_base=True), interval=3600, first=30)
     # Закрытие голосований с истёкшим сроком — раз в минуту.
-    application.job_queue.run_repeating(per_conf_job(poll_deadline_job), interval=60, first=20)
+    application.job_queue.run_repeating(per_conf_job(poll_deadline_job, once_per_base=True), interval=60, first=20)
     # Авто-разбан временных банов: проверяем каждые 5 минут.
-    application.job_queue.run_repeating(per_conf_job(auto_unban_job), interval=300, first=45)
+    application.job_queue.run_repeating(per_conf_job(auto_unban_job, once_per_base=True), interval=300, first=45)
     # Главный преступник дня — ежедневно в 21:00 МСК
     application.job_queue.run_daily(
         per_conf_job(daily_criminal_job),
@@ -19388,7 +19621,7 @@ def main():
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
-        per_conf_job(weekly_rank_check),
+        per_conf_job(weekly_rank_check, once_per_base=True),
         time=time(hour=8, minute=0, tzinfo=MSK),
         days=(6,),
     )
