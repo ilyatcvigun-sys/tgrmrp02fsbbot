@@ -626,17 +626,17 @@ RANKS = _ConfRanks()
 
 DEPARTMENTS_INITIAL = [
     "🎯 Руководящий состав",
-    "🔍 Начальник ОСБ",
+    "🔍 Начальник УСБ",
     "⚡️ Командир Управления 'A'",
-    "🔍 Первый заместитель Начальника ОСБ ФСБ",
-    "🔍 Заместитель Начальника ОСБ ФСБ",
+    "🔍 Первый заместитель Начальника УСБ ФСБ",
+    "🔍 Заместитель Начальника УСБ ФСБ",
     "⚡️ Заместитель командира Управления 'A'",
-    "🛡 6-я служба ОСБ ФСБ - Куратор МВД",
-    "🚁 6-я служба ОСБ ФСБ - Куратор МО",
-    "💻 6-я служба ОСБ ФСБ - Куратор ФСИН",
-    "🚔 6-я служба ОСБ ФСБ - Заместитель куратора МВД",
-    "🏥 6-я служба ОСБ ФСБ - Заместитель куратора МО",
-    "🏥 6-я служба ОСБ ФСБ - Заместитель куратора ФСИН",
+    "🛡 6-я служба УСБ ФСБ - Куратор МВД",
+    "🚁 6-я служба УСБ ФСБ - Куратор МО",
+    "💻 6-я служба УСБ ФСБ - Куратор ФСИН",
+    "🚔 6-я служба УСБ ФСБ - Заместитель куратора МВД",
+    "🏥 6-я служба УСБ ФСБ - Заместитель куратора МО",
+    "🏥 6-я служба УСБ ФСБ - Заместитель куратора ФСИН",
     "🦅 Младший оперуполномоченный по государственным организациям",
     "⚡️ Оперативник Управления 'A'",
     "📡 Оперативно-розыскной отдел 2-й службы ФСБ",
@@ -1811,6 +1811,11 @@ def init_database():
     c.execute('''CREATE TABLE IF NOT EXISTS antimat_words (word TEXT PRIMARY KEY)''')
     # Кого замутил /lock — чтобы при /lock off снять мут только с них
     c.execute('''CREATE TABLE IF NOT EXISTS lock_muted (user_id INTEGER PRIMARY KEY)''')
+    # Разово: ОСБ переименовали в УСБ — в названиях отделов, групп и у людей
+    c.execute("SELECT 1 FROM mod_kv WHERE key = 'renamed_osb_usb'")
+    if not c.fetchone():
+        _rename_word_in_departments(c, 'ОСБ', 'УСБ')
+        c.execute("INSERT INTO mod_kv (key, value) VALUES ('renamed_osb_usb', '1')")
     # Метки от слива: рассылки и персональная копия каждого получателя
     c.execute('''CREATE TABLE IF NOT EXISTS leak_mailings (
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, author_id INTEGER,
@@ -1893,6 +1898,32 @@ def init_database():
     
     conn.commit()
     conn.close()
+
+def _rename_word_in_departments(c, old: str, new: str):
+    """Заменить слово в названиях отделов и групп и везде, где отдел записан
+    по имени (users.department, user_departments). Занятое имя — пропускаем."""
+    pattern = re.compile(rf'(?<![А-ЯЁA-Z]){old}(?![А-ЯЁA-Z])')
+    c.execute('SELECT id, name FROM departments')
+    for dept_id, name in c.fetchall():
+        renamed = pattern.sub(new, name or '')
+        if renamed == name:
+            continue
+        try:
+            c.execute('UPDATE departments SET name = ? WHERE id = ?', (renamed, dept_id))
+        except sqlite3.IntegrityError:
+            logger.warning(f"Переименование отдела: «{renamed}» уже есть, «{name}» оставлен")
+            continue
+        c.execute('UPDATE users SET department = ? WHERE department = ?', (renamed, name))
+        c.execute('UPDATE user_departments SET department = ? WHERE department = ?', (renamed, name))
+    c.execute('SELECT id, name FROM department_groups')
+    for group_id, name in c.fetchall():
+        renamed = pattern.sub(new, name or '')
+        if renamed != name:
+            try:
+                c.execute('UPDATE department_groups SET name = ? WHERE id = ?', (renamed, group_id))
+            except sqlite3.IntegrityError:
+                pass
+
 
 def get_departments() -> list:
     """Получение списка отделов из базы"""
@@ -3083,7 +3114,7 @@ HELP_SECTIONS = [
         ("adddept",    "<user> <номер>",       "добавить ещё один отдел", 5),
         ("deldept",    "<user> <номер>",       "убрать из отдела", 5),
         ("tag",        "<user(s)> <текст>",    "тегнуть людей", 4),
-        ("tagdept",    "<номер> <текст>",      "тегнуть отдел", 4),
+        ("tagdept",    "<номер|слово> <текст>", "тегнуть отдел; словом (УСБ, ЦСН) — всю группу или все отделы с этим словом", 4),
         ("tagall",     "<текст>",              "тегнуть всех активных; в ЛС — помеченные копии, переслать нельзя; ответом на файл — с вложением", 5),
         ("leakfind",   "<текст со скрина>",    "чья копия /tagall на слитом скриншоте", "spec"),
         ("tagskip",    "[user]",               "кому не слать уведомления от /tagall: без аргумента — список, с <user> — добавить/убрать", 5),
@@ -8792,6 +8823,37 @@ async def atag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _dept_groups() -> list:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT name FROM department_groups ORDER BY sort_order, id')
+    names = [r[0] for r in c.fetchall()]
+    conn.close()
+    return names
+
+
+def _depts_by_word(word: str):
+    """(подпись, [отделы]) по слову: сначала группа, в названии которой оно есть,
+    иначе — все отделы, где это слово встречается отдельным словом."""
+    w = word.strip().lower()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT id, name FROM department_groups ORDER BY sort_order, id')
+    groups = [(gid, name) for gid, name in c.fetchall() if w in (name or '').lower()]
+    if groups:
+        ids = [gid for gid, _ in groups]
+        c.execute(f'SELECT name FROM departments WHERE group_id IN ({",".join("?" * len(ids))}) '
+                  'ORDER BY COALESCE(sort_order, id)', ids)
+        depts = [r[0] for r in c.fetchall()]
+        conn.close()
+        return ", ".join(name for _, name in groups), depts
+    c.execute('SELECT name FROM departments ORDER BY COALESCE(sort_order, id)')
+    pattern = re.compile(rf'(?<![\wё]){re.escape(w)}(?![\wё])', re.IGNORECASE)
+    depts = [r[0] for r in c.fetchall() if pattern.search(r[0] or '')]
+    conn.close()
+    return word.upper() if depts else word, depts
+
+
 async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Тегнуть всех участников отдела и написать им.
@@ -8807,41 +8869,51 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     depts = get_departments()
     
+    groups = _dept_groups()
     if not context.args:
         deps_list = "\n".join([f"{i + 1}. {d}" for i, d in enumerate(depts)])
+        groups_list = "\n".join(f"• {g}" for g in groups)
         await update.message.reply_text(
             "📣 ТЕГ ОТДЕЛА\n"
             "━━━━━━━━━━━━━━━━━\n"
-            "Использование: /tagdept <номер> <текст>\n\n"
+            "/tagdept <номер> <текст> — один отдел\n"
+            "/tagdept <слово> <текст> — группа целиком или все отделы с этим словом "
+            "(например, /tagdept УСБ …)\n\n"
             f"📁 ОТДЕЛЫ:\n{deps_list}"
+            + (f"\n\n🗂 ГРУППЫ:\n{groups_list}" if groups else "")
         )
         return
     
-    try:
-        dept_num = int(context.args[0]) - 1
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Первый аргумент должен быть номером отдела. /tagdept без аргументов покажет список.")
-        return
-    
-    if dept_num < 0 or dept_num >= len(depts):
-        await update.message.reply_text(f"❌ Неверный номер отдела. Допустимо: 1..{len(depts)}.")
-        return
-    
-    dept_name = depts[dept_num]
+    key = context.args[0]
+    if key.isdigit():
+        dept_num = int(key) - 1
+        if dept_num < 0 or dept_num >= len(depts):
+            await update.message.reply_text(f"❌ Неверный номер отдела. Допустимо: 1..{len(depts)}.")
+            return
+        dept_name = depts[dept_num]
+        target_depts = [dept_name]
+    else:
+        dept_name, target_depts = _depts_by_word(key)
+        if not target_depts:
+            await update.message.reply_text(
+                f"❌ Не нашёл ни группы, ни отделов со словом «{key}». /tagdept без аргументов покажет список.")
+            return
     message_text = ' '.join(context.args[1:]).strip()
     
     if not message_text:
         await update.message.reply_text(f"❌ Укажите текст сообщения после номера отдела.\n📁 Выбран отдел: {dept_name}")
         return
     
-    # Собираем всех участников отдела (кроме забаненных в группе)
+    # Собираем всех участников отдела (или всех отделов группы), кроме забаненных
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute(
-        f'SELECT user_id FROM users WHERE {IN_DEPT_SQL} AND ban_status = "Нет"',
-        (dept_name, dept_name),
-    )
-    members = [r[0] for r in c.fetchall()]
+    members = []
+    for name in target_depts:
+        c.execute(
+            f'SELECT user_id FROM users WHERE {IN_DEPT_SQL} AND ban_status = "Нет"',
+            (name, name),
+        )
+        members += [r[0] for r in c.fetchall() if r[0] not in members]
     conn.close()
     
     if not members:
@@ -8897,6 +8969,7 @@ async def atagdept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ ТЕГ ОТДЕЛА ОТПРАВЛЕН\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"📁 Отдел: {dept_name}\n"
+        + (f"🗂 Отделов: {len(target_depts)}\n" if len(target_depts) > 1 else "") +
         f"👥 Участников: {len(members)}\n"
         f"📤 Сообщение → {summary_chat}\n"
         f"📨 В ЛС доставлено: {delivered}\n"

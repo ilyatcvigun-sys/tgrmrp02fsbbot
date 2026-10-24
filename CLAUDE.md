@@ -426,7 +426,11 @@ Telegram, позывной → `'—'`), свои — в `user_fields` и выв
 **Отделы:** основной — `users.department`, дополнительные — `user_departments`
 (`/adddept`, `/deldept`). Фильтр «состоит в отделе» — `IN_DEPT_SQL` (параметр
 дважды). В `get_user_data` есть `departments` и `departments_str` — для показа.
-`/find` листается по 10 человек (`findpg:<стр>`).
+`/find` листается по 10 человек (`findpg:<стр>`). `/tagdept <номер> текст` —
+один отдел, `/tagdept <слово> текст` — группа (`department_groups`), в названии
+которой есть слово, иначе все отделы с этим словом (`_depts_by_word`).
+ОСБ переименован в УСБ: в `DEPARTMENTS_INITIAL` и разовой миграцией в базе
+(`_rename_word_in_departments`, флаг `renamed_osb_usb` в `mod_kv`).
 
 **Связки (`/global create|add|remove|info`, главный админ)** — общая база (см.
 выше). `/global add` без
