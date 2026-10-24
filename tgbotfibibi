@@ -3787,29 +3787,44 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     result = check_gban(target_id)
-    if result['is_banned']:
-        if has_permission(checker_id, 'warn') or has_special_access(checker_id):
-            admin_nick = get_admin_nick(result['banned_by'])
-            await update.message.reply_text(
-                "🚫 НАЙДЕН В ЧС\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"👤 {result['nick']}\n"
-                f"📝 Причина: {result['reason']}\n"
-                f"📅 Дата: {result['date']}\n"
-                f"👮 Выдал: {admin_nick}"
-            )
-        else:
-            await update.message.reply_text(
-                "🚫 НАЙДЕН В ЧС\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"👤 {result['nick']}"
-            )
-    else:
-        await update.message.reply_text(
-            "✅ ПРОВЕРКА ЧС\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "Пользователь не в чёрном списке."
-        )
+    if not result['is_banned']:
+        await update.message.reply_text(f"{WARN_ANNOUNCE_PREFIX} » Блокировка отсутствует")
+        return
+    td = get_user_data(target_id)
+    banned_name = result['nick'] or (td['nick'] if td else f"ID {target_id}")
+    await update.message.reply_text(
+        f"{WARN_ANNOUNCE_PREFIX} » Информация о блокировке\n\n"
+        f"Пользователь: {_profile_link_html(target_id, banned_name)}\n"
+        f"Выдал: {_profile_link_html(result['banned_by'], get_admin_nick(result['banned_by']) if result['banned_by'] else '—')}\n"
+        f"Дата и время: {_gban_date_view(result['date'])}\n"
+        # Причину видит только руководство (5+ ранг, спецдопуск, главный админ)
+        + (f"Причина: {_html_escape(result['reason'] or '—')}\n"
+           if has_permission(checker_id, 'warn') or has_special_access(checker_id) else "")
+        + "\n"
+        "Для уточнения причины ОЧС пишите на форум в раздел \"Жалобы на ГА/зГА\".\n"
+        "Ссылка на раздел — vk.cc/cqkBdy",
+        parse_mode='HTML',
+        disable_web_page_preview=True,
+    )
+
+
+def _profile_link_html(user_id, name: str) -> str:
+    """«Ник (ссылка)»: t.me/username, если знаем @, иначе ссылка на профиль по ID."""
+    name = _html_escape(name or '—')
+    if not user_id:
+        return name
+    ud = get_user_data(user_id)
+    username = ud.get('tg_username') if ud else None
+    url = f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
+    return f'{name} (<a href="{url}">{_html_escape(url.replace("https://", ""))}</a>)'
+
+
+def _gban_date_view(date: str) -> str:
+    """'2025-10-23 18:25:00' → '23.10.25 18:25' (что не распознали — как есть)."""
+    try:
+        return datetime.strptime((date or '')[:16], "%Y-%m-%d %H:%M").strftime("%d.%m.%y %H:%M")
+    except ValueError:
+        return date or '—'
 
 # ============ ПРИВЕТСТВИЕ ============
 
