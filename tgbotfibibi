@@ -3802,7 +3802,7 @@ async def check_gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
            if has_permission(checker_id, 'warn') or has_special_access(checker_id) else "")
         + "\n"
         "Для уточнения причины ОЧС пишите на форум в раздел \"Жалобы на ГА/зГА\".\n"
-        "Ссылка на раздел — vk.cc/cqkBdy",
+        f"Ссылка на раздел — @{context.bot.username}",
         parse_mode='HTML',
         disable_web_page_preview=True,
     )
