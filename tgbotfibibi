@@ -19563,17 +19563,6 @@ def main():
             "Проверьте переменную DATABASE_URL (или строку подключения в начале файла).\n"
         )
     
-    # Разовый автоперенос данных из старой SQLite-базы.
-    # Нужен для хостингов без консоли: при первом запуске данные переезжают
-    # сами, при последующих — функция видит, что база уже заполнена, и молчит.
-    try:
-        from migrate_to_pg import auto_migrate_if_needed
-        auto_migrate_if_needed(DB_FILE, DATABASE_URL)
-    except ImportError:
-        logger.info("migrate_to_pg.py не найден — автоперенос пропущен")
-    except Exception as e:
-        logger.error(f"Автоперенос не выполнен: {e}")
-    
     # Реестр конференций, затем схема и миграции КАЖДОЙ конференции.
     init_conference_registry()
     for conf in all_conferences():
