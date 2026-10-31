@@ -59,19 +59,23 @@ PERMS_USER = 30
 # States для публикации постановлений Радмира (форма только в ЛС, 4+).
 RADMIR_NUMBER, RADMIR_NAME, RADMIR_SCREENSHOTS = range(60, 63)
 
-BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
+# Секреты задаются только через переменные окружения хостинга или локальной
+# оболочки. Не добавляйте реальные значения в этот файл или в Git.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_IDS = [8026911824]
 
 # ── Подключение к PostgreSQL ──────────────────────────────────────────
-# Предпочтительно задать переменную окружения DATABASE_URL в панели хостинга —
-# тогда пароль не хранится в коде. Если такой возможности нет, впишите строку
-# подключения сюда (она будет использована как запасной вариант).
-DATABASE_URL = os.environ.get("DATABASE_URL") or (
-    "postgresql://bothost_db_3259092c25db:"
-    "I1Rz74aZKGx0z_X8W9aTo1EIdjvqJ3zq-B72ocQ_xDw"
-    "@node1.pghost.ru:15631/bothost_db_3259092c25db"
-)
-os.environ["DATABASE_URL"] = DATABASE_URL   # чтобы увидели db_pg и миграция
+# Пароль базы не хранится в коде. На Bothost задайте DATABASE_URL в настройках
+# проекта, локально экспортируйте её перед запуском.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
+if not DATABASE_URL:
+    raise RuntimeError("Не задана переменная окружения DATABASE_URL")
+
+# Чтобы db_pg и модуль миграции увидели то же значение при импорте/старте.
+os.environ["DATABASE_URL"] = DATABASE_URL
 
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
