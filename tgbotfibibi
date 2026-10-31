@@ -897,6 +897,7 @@ def has_permission(user_id: int, action: str, command_name: str = None) -> bool:
     permissions = {
         "search": rank >= 4,
         "points": rank >= 4,
+        "acts": rank >= 4,
         "award": rank >= 3,
         "warn": rank >= 5,
         "manage_ranks": rank >= 5,
@@ -2922,7 +2923,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Кнопка выдачи выговора — модераторам с 4 ранга (или со спецдоступом).
         if rank >= 4 or has_special_access(user_id):
             keyboard.append([KeyboardButton("🚓 Выдать выговор")])
-        if rank >= 4:
+        if has_permission(user_id, 'acts', 'acts'):
             keyboard.append([KeyboardButton("Документооборот акты")])
         # Кнопка настройки доступов — только главному админу.
         if is_main_admin(user_id):
@@ -14723,8 +14724,8 @@ async def aradmir_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_data:
         await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return ConversationHandler.END
-    if user_data.get('rank', 0) < 4:
-        await update.message.reply_text("❌ Публикация постановлений доступна с 4 ранга.")
+    if not has_permission(user_id, 'acts', 'acts'):
+        await update.message.reply_text("❌ У вас нет доступа к кнопке документооборота актов.")
         return ConversationHandler.END
 
     for key in ('radmir_number', 'radmir_name', 'radmir_media'):
@@ -14816,8 +14817,8 @@ async def radmir_screenshot_done(update: Update, context: ContextTypes.DEFAULT_T
 
     user_id = update.effective_user.id
     user_data = get_user_data(user_id)
-    if not user_data or user_data.get('rank', 0) < 4:
-        await update.message.reply_text("❌ Публикация доступна только пользователям 4+ ранга.")
+    if not user_data or not has_permission(user_id, 'acts', 'acts'):
+        await update.message.reply_text("❌ У вас больше нет доступа к документообороту актов.")
         return ConversationHandler.END
 
     card = (
@@ -19686,6 +19687,10 @@ def main():
     ALL_COMMAND_NAMES.clear()
     ALL_COMMAND_NAMES.update(commands.keys())
     ALL_COMMAND_NAMES.update(no_prefix.keys())
+    # Виртуальная команда доступа для кнопки «Документооборот акты».
+    # Форма обслуживается ConversationHandler ниже, но доступ к кнопке
+    # должен быть виден /grant, /permsmenu и /cmdrank.
+    ALL_COMMAND_NAMES.add('acts')
 
     # Обратная совместимость по старому префиксу "a" (см. секцию выше)
     for legacy_cmd in _LEGACY_A_PREFIX_COMMANDS:
@@ -19724,6 +19729,7 @@ def main():
     # Форма постановлений с документооборота Радмира (только ЛС, 4+).
     radmir_handler = ConversationHandler(
         entry_points=[
+            CommandHandler('acts', aradmir_start),
             MessageHandler(
                 filters.Regex('^Документооборот акты$') & filters.ChatType.PRIVATE,
                 aradmir_start,
