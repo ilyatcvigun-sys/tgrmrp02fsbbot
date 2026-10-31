@@ -56,6 +56,8 @@ REPORT_VIOLATOR, REPORT_FACTION, REPORT_VIOLATION, REPORT_EVIDENCE, REPORT_COMMA
 PUNISH_VIOLATOR, PUNISH_VIOLATION, PUNISH_EVIDENCE, PUNISH_FACTION, PUNISH_WARNS, PUNISH_CONFIRM = range(20, 26)
 # State для интерактивного меню настройки доступов /permsmenu (главный админ).
 PERMS_USER = 30
+# States для публикации постановлений Радмира (форма только в ЛС, 4+).
+RADMIR_NUMBER, RADMIR_NAME, RADMIR_SCREENSHOTS = range(60, 63)
 
 BOT_TOKEN = "8496760689:AAFOWsPHp1WniL47OOv10PIwb8SCJ0fQH_w"
 ADMIN_IDS = [8026911824]
@@ -87,6 +89,8 @@ PM_LOG_CHAT_ID = -1003712184120
 GAMES_ALLOWED_TOPIC_ID = 52562
 # Топик голосований основной конфы.
 POLL_TOPIC_ID = 10677
+# Топик для постановлений с документооборота Радмира.
+RADMIR_DOCUMENTS_TOPIC_ID = 140008
 # ВНИМАНИЕ: CONFERENCE_CHAT_ID и *_TOPIC_ID выше — настройки ОСНОВНОЙ конфы,
 # они только засеивают реестр (init_conference_registry). В коде используй
 # conf_chat() / conf_topic('verdict'|'games'|'poll') — они берут значения
@@ -2918,6 +2922,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Кнопка выдачи выговора — модераторам с 4 ранга (или со спецдоступом).
         if rank >= 4 or has_special_access(user_id):
             keyboard.append([KeyboardButton("🚓 Выдать выговор")])
+        if rank >= 4:
+            keyboard.append([KeyboardButton("Документооборот акты")])
         # Кнопка настройки доступов — только главному админу.
         if is_main_admin(user_id):
             keyboard.append([KeyboardButton("🎫 Доступы")])
@@ -14704,6 +14710,152 @@ async def startup_notify_job(context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"startup notify to {admin_id}: {e}")
 
 
+# ============ ПОСТАНОВЛЕНИЯ РАДМИРА ============
+
+async def aradmir_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запускает форму публикации постановления с документооборота Радмира."""
+    if not is_private_chat(update):
+        await update.message.reply_text("❌ Эта форма работает только в личке с ботом.")
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
+        return ConversationHandler.END
+    if user_data.get('rank', 0) < 4:
+        await update.message.reply_text("❌ Публикация постановлений доступна с 4 ранга.")
+        return ConversationHandler.END
+
+    for key in ('radmir_number', 'radmir_name', 'radmir_media'):
+        context.user_data.pop(key, None)
+    await update.message.reply_text(
+        "📜 ПОСТАНОВЛЕНИЕ РАДМИРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "Номер:\n"
+        "Введите номер постановления.\n\n"
+        "✖️ Для отмены — /cancel"
+    )
+    return RADMIR_NUMBER
+
+
+async def radmir_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or '').strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        await update.message.reply_text("✖️ Публикация отменена.")
+        return ConversationHandler.END
+    if not text or len(text) > 100:
+        await update.message.reply_text("❌ Укажите номер (до 100 символов) или /cancel.")
+        return RADMIR_NUMBER
+    context.user_data['radmir_number'] = text
+    await update.message.reply_text(
+        "📜 ПОСТАНОВЛЕНИЕ РАДМИРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Номер: {text}\n\n"
+        "Наименование:\n"
+        "Введите наименование постановления."
+    )
+    return RADMIR_NAME
+
+
+async def radmir_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or '').strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        await update.message.reply_text("✖️ Публикация отменена.")
+        return ConversationHandler.END
+    if len(text) < 2 or len(text) > 500:
+        await update.message.reply_text("❌ Наименование должно быть от 2 до 500 символов или /cancel.")
+        return RADMIR_NAME
+    context.user_data['radmir_name'] = text
+    await update.message.reply_text(
+        "📜 ПОСТАНОВЛЕНИЕ РАДМИРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Номер: {context.user_data['radmir_number']}\n"
+        f"Наименование: {text}\n\n"
+        "Скрины:\n"
+        "Отправьте один или несколько скринов (фото/файлов).\n"
+        "Когда закончите — напишите «Готово»."
+    )
+    return RADMIR_SCREENSHOTS
+
+
+async def radmir_screenshot_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Копит скрины до команды «Готово», после чего публикует карточку."""
+    msg = update.message
+    kind = None
+    file_id = None
+    if msg.photo:
+        kind, file_id = 'photo', msg.photo[-1].file_id
+    elif msg.document:
+        kind, file_id = 'document', msg.document.file_id
+    if not kind:
+        return RADMIR_SCREENSHOTS
+
+    media = context.user_data.setdefault('radmir_media', [])
+    media.append({'type': kind, 'file_id': file_id, 'caption': msg.caption or ''})
+    await msg.reply_text(
+        f"✅ Скрин прикреплён. Всего: {len(media)}.\n"
+        "Можно отправить ещё или написать «Готово»."
+    )
+    return RADMIR_SCREENSHOTS
+
+
+async def radmir_screenshot_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or '').strip()
+    if text.lower() in ('/cancel', 'cancel', 'отмена'):
+        await update.message.reply_text("✖️ Публикация отменена.")
+        return ConversationHandler.END
+    if text.lower() not in ('готово', 'готов', 'далее', 'отправить'):
+        await update.message.reply_text("❌ Пришлите скрин или напишите «Готово».")
+        return RADMIR_SCREENSHOTS
+
+    media = context.user_data.get('radmir_media') or []
+    if not media:
+        await update.message.reply_text("❌ Нужно прикрепить хотя бы один скрин.")
+        return RADMIR_SCREENSHOTS
+
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    if not user_data or user_data.get('rank', 0) < 4:
+        await update.message.reply_text("❌ Публикация доступна только пользователям 4+ ранга.")
+        return ConversationHandler.END
+
+    card = (
+        "📜 ПОСТАНОВЛЕНИЕ РАДМИРА\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"Номер: {context.user_data['radmir_number']}\n"
+        f"Наименование: {context.user_data['radmir_name']}\n"
+        f"Скрины: {len(media)}\n"
+        f"Подал: {user_data.get('nick') or update.effective_user.full_name}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=CONFERENCE_CHAT_ID,
+            message_thread_id=RADMIR_DOCUMENTS_TOPIC_ID,
+            text=card,
+        )
+        await forward_report_media(
+            context, CONFERENCE_CHAT_ID, media,
+            message_thread_id=RADMIR_DOCUMENTS_TOPIC_ID,
+        )
+    except Exception as e:
+        logger.error(f"radmir publication failed: {e}")
+        await update.message.reply_text("❌ Не удалось отправить постановление в топик. Попробуйте ещё раз.")
+        return ConversationHandler.END
+
+    for key in ('radmir_number', 'radmir_name', 'radmir_media'):
+        context.user_data.pop(key, None)
+    await update.message.reply_text("✅ Постановление отправлено в топик документооборота Радмира.")
+    return ConversationHandler.END
+
+
+async def radmir_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for key in ('radmir_number', 'radmir_name', 'radmir_media'):
+        context.user_data.pop(key, None)
+    await update.message.reply_text("✖️ Публикация отменена.")
+    return ConversationHandler.END
+
+
 # ============ ВЫДАЧА НАКАЗАНИЯ (/punish) ============
 # Форма в личке: ник нарушителя → нарушение → доказательство (текст/медиа) → превью →
 # публикация в VERDICT_TOPIC_ID. Реального варна НЕ выдаёт — только публикация-объявление.
@@ -19545,6 +19697,27 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel)],
     )
     application.add_handler(report_handler)
+
+    # Форма постановлений с документооборота Радмира (только ЛС, 4+).
+    radmir_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.Regex('^Документооборот акты$') & filters.ChatType.PRIVATE,
+                aradmir_start,
+            ),
+        ],
+        states={
+            RADMIR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, radmir_number)],
+            RADMIR_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, radmir_name)],
+            RADMIR_SCREENSHOTS: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, radmir_screenshot_media),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, radmir_screenshot_done),
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', radmir_cancel)],
+        per_chat=True,
+    )
+    application.add_handler(radmir_handler)
     
     # Форма выдачи выговора (только в ЛС). Срабатывает по команде /punish или
     # по кнопке reply-keyboard «🚓 Выдать выговор» (видна модераторам с 4 ранга).
