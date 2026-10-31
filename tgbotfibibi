@@ -6,7 +6,7 @@ import contextvars
 from contextlib import contextmanager
 from collections.abc import Mapping
 from datetime import datetime, timedelta, time, timezone
-from telegram import Update, Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo, ForceReply
+from telegram import Update, Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, WebAppInfo, ForceReply, InputMediaPhoto, InputMediaDocument
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatMemberHandler, CallbackQueryHandler, ApplicationHandlerStop, TypeHandler, ExtBot
 # ВАЖНО: бот работает на PostgreSQL. Модуль db_pg — слой совместимости,
 # который повторяет API sqlite3 (connect / Row / OperationalError /
@@ -14821,23 +14821,46 @@ async def radmir_screenshot_done(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     card = (
-        "📜 ПОСТАНОВЛЕНИЕ РАДМИРА\n"
-        "━━━━━━━━━━━━━━━━━\n"
         f"Номер: {context.user_data['radmir_number']}\n"
         f"Наименование: {context.user_data['radmir_name']}\n"
-        f"Скрины: {len(media)}\n"
-        f"Подал: {user_data.get('nick') or update.effective_user.full_name}"
+        f"Составил: {user_data.get('nick') or update.effective_user.full_name}"
     )
     try:
-        await context.bot.send_message(
-            chat_id=CONFERENCE_CHAT_ID,
-            message_thread_id=RADMIR_DOCUMENTS_TOPIC_ID,
-            text=card,
-        )
-        await forward_report_media(
-            context, CONFERENCE_CHAT_ID, media,
-            message_thread_id=RADMIR_DOCUMENTS_TOPIC_ID,
-        )
+        # Telegram объединяет 2–10 фото/документов в один альбом. Текст
+        # карточки становится подписью первого скрина, поэтому публикация
+        # выглядит одним сообщением со всеми приложенными материалами.
+        for offset in range(0, len(media), 10):
+            batch = media[offset:offset + 10]
+            album = []
+            for index, item in enumerate(batch):
+                caption = card if offset == 0 and index == 0 else None
+                if item['type'] == 'photo':
+                    album.append(InputMediaPhoto(media=item['file_id'], caption=caption))
+                else:
+                    album.append(InputMediaDocument(media=item['file_id'], caption=caption))
+
+            if len(album) == 1:
+                item = album[0]
+                if isinstance(item, InputMediaPhoto):
+                    await context.bot.send_photo(
+                        chat_id=CONFERENCE_CHAT_ID,
+                        photo=item.media,
+                        caption=item.caption,
+                        message_thread_id=RADMIR_DOCUMENTS_TOPIC_ID,
+                    )
+                else:
+                    await context.bot.send_document(
+                        chat_id=CONFERENCE_CHAT_ID,
+                        document=item.media,
+                        caption=item.caption,
+                        message_thread_id=RADMIR_DOCUMENTS_TOPIC_ID,
+                    )
+            else:
+                await context.bot.send_media_group(
+                    chat_id=CONFERENCE_CHAT_ID,
+                    media=album,
+                    message_thread_id=RADMIR_DOCUMENTS_TOPIC_ID,
+                )
     except Exception as e:
         logger.error(f"radmir publication failed: {e}")
         await update.message.reply_text("❌ Не удалось отправить постановление в топик. Попробуйте ещё раз.")
