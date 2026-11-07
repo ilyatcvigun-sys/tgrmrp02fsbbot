@@ -694,11 +694,16 @@ NON_GRANTABLE_COMMANDS = {
     'setallrank',
     'tgadmin', 'tgunadmin',
     'addcomment', 'comments', 'delcomment',
+    'execute',
 }
 
 # Полный список зарегистрированных имён команд — заполняется в main() сразу
 # после сборки commands/no_prefix, до этого пуст.
 ALL_COMMAND_NAMES: set = set()
+
+# Обработчики команд, доступные пакетному /execute. Заполняется в main() после
+# сборки основного словаря команд. Это именно команды бота, а не shell-команды.
+_COMMAND_HANDLERS: dict = {}
 
 
 def grantable_commands() -> set:
@@ -19550,6 +19555,78 @@ async def aleakfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ ЗАПУСК ============
 
+async def aexecute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Последовательно выполняет несколько зарегистрированных команд бота.
+
+    Формат:
+        /execute {
+        /warn @user причина
+        /warn @another_user 2 выговор
+        }
+
+    Команды вызываются с теми же правами и в том же чате, что и обычная
+    команда. Произвольные команды ОС здесь намеренно не поддерживаются.
+    """
+    user_id = update.effective_user.id
+    if not (is_main_admin(user_id) or has_special_access(user_id)):
+        await update.message.reply_text("❌ Доступно спецдопуску и главному админу.")
+        return
+
+    text = (update.message.text or '').strip()
+    match = re.match(r'^/execute(?:@\w+)?(?:\s+)?(.*)$', text, flags=re.DOTALL | re.IGNORECASE)
+    body = match.group(1).strip() if match else ''
+
+    # Поддерживаем как многострочный блок в {}, так и короткую форму
+    # /execute /warn @user причина.
+    if body.startswith('{'):
+        if not body.endswith('}'):
+            await update.message.reply_text("❌ Закройте блок фигурной скобкой: }")
+            return
+        body = body[1:-1].strip()
+
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if not lines:
+        await update.message.reply_text(
+            "ℹ️ Формат:\n/execute {\n/команда аргументы\n/команда аргументы\n}"
+        )
+        return
+    if len(lines) > 50:
+        await update.message.reply_text("❌ За один запуск можно выполнить не более 50 команд.")
+        return
+
+    executed = 0
+    for line in lines:
+        command_match = re.match(
+            r'^/([a-zA-Z0-9_]+)(?:@\w+)?(?:\s+(.*))?$', line, flags=re.DOTALL
+        )
+        if not command_match:
+            await update.message.reply_text(f"❌ Некорректная строка: {line}")
+            continue
+
+        command_name = command_match.group(1).lower()
+        if command_name in ('execute', 'cancel'):
+            await update.message.reply_text(f"❌ Команду /{command_name} нельзя запускать внутри /execute.")
+            continue
+
+        handler = _COMMAND_HANDLERS.get(command_name)
+        if handler is None:
+            await update.message.reply_text(f"❌ Неизвестная команда: /{command_name}")
+            continue
+
+        # PTB уже делает примерно такое же разбиение для обычного
+        # CommandHandler. Передаём аргументы напрямую, не меняя исходное
+        # Telegram-сообщение и сохраняя единый чат/топик для ответов.
+        args = (command_match.group(2) or '').split()
+        context.args = args
+        try:
+            await handler(update, context)
+            executed += 1
+        except Exception:
+            logger.exception("/execute: ошибка в команде /%s", command_name)
+            await update.message.reply_text(f"❌ Ошибка при выполнении /{command_name}.")
+
+    await update.message.reply_text(f"✅ Выполнено команд: {executed} из {len(lines)}.")
+
 def main():
     # Пул соединений к PostgreSQL поднимаем до любых обращений к БД.
     # Если DATABASE_URL не задан или база недоступна — падаем сразу с внятной
@@ -19661,6 +19738,7 @@ def main():
         'nypoll': anypoll, 'amnesty': aamnesty,
         'lock': alock, 'lockok': alockok, 'appeal': aappeal, 'antimat': aantimat,
         'leakfind': aleakfind,
+        'execute': aexecute,
     }
     for cmd, func in commands.items():
         application.add_handler(CommandHandler(cmd, func))
@@ -19673,6 +19751,10 @@ def main():
     }
     for cmd, func in no_prefix.items():
         application.add_handler(CommandHandler(cmd, func))
+
+    _COMMAND_HANDLERS.clear()
+    _COMMAND_HANDLERS.update(commands)
+    _COMMAND_HANDLERS.update(no_prefix)
 
     # Единый источник правды для грантов (/grant, /grantcmds, /permsmenu) — те же
     # имена, которыми только что реально зарегистрированы хендлеры выше, без
