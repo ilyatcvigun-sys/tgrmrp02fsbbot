@@ -35,16 +35,26 @@ document.getElementById('wallet').onclick=()=>TelegramWidget.request('wallet',{{
 
 
 def tower_widget() -> str:
-    """Offline one-player tower mini-game for private chats."""
+    """Offline Stack-style game: tap to drop and trim the moving block."""
     return '''<style>
-body{font-family:sans-serif;margin:0;padding:10px;background:var(--tg-theme-bg-color);color:var(--tg-theme-text-color);text-align:center}
-#tower{height:210px;display:flex;flex-direction:column-reverse;align-items:center;justify-content:flex-start;padding-bottom:8px}
-.block{width:70%;height:18px;margin:2px;border-radius:4px;background:var(--tg-theme-button-color)}
-button{border:0;border-radius:8px;padding:10px 18px;background:var(--tg-theme-button-color);color:var(--tg-theme-button-text-color);font-weight:700}
-.muted{opacity:.7;font-size:12px}
-</style><b>🏗 Башня</b><div id="tower"></div><button id="build">Поставить блок</button><div class="muted" id="score">Высота: 0</div>
+body{font-family:sans-serif;margin:0;padding:8px;background:#171638;color:#fff;text-align:center;overflow:hidden}
+.head{font-size:34px;font-weight:800;line-height:38px}.hint{font-size:12px;opacity:.72;margin:3px 0 7px}
+#scene{height:232px;position:relative;margin:auto;max-width:280px;overflow:hidden;perspective:500px}
+#tower{position:absolute;inset:0}.block{position:absolute;height:16px;border-radius:2px;background:linear-gradient(90deg,#dd3e77,#f36c91);box-shadow:0 4px 0 #9b2759,0 9px 14px #090825;transition:left .08s linear}
+.block:before{content:'';position:absolute;left:7px;right:-7px;top:-7px;height:7px;background:#f17198;transform:skewX(45deg);transform-origin:left bottom}
+.block:after{content:'';position:absolute;right:-7px;top:0;width:7px;height:16px;background:#8d235f;transform:skewY(45deg);transform-origin:left top}
+#tap{position:absolute;inset:0;border:0;background:transparent;color:#fff;font-size:18px;font-weight:700;text-shadow:0 2px 3px #090825}
+#over{position:absolute;inset:65px 18px auto;padding:14px;border-radius:10px;background:#211e51dd;font-size:16px;display:none}
+</style><div class="head" id="score">0</div><div class="hint">Tap to drop · Best <span id="best">0</span></div>
+<div id="scene"><div id="tower"></div><button id="tap">TAP TO DROP</button><div id="over">Башня готова.<br><small>Нажмите, чтобы начать заново</small></div></div>
 <script>
-let n=0;const t=document.getElementById('tower'),s=document.getElementById('score');
-document.getElementById('build').onclick=()=>{n++;const b=document.createElement('div');b.className='block';b.style.width=(55+Math.random()*25)+'%';t.appendChild(b);s.textContent='Высота: '+n;if(n>=10){document.getElementById('build').disabled=true;s.textContent='🏆 Башня построена: '+n;}};
+const scene=document.getElementById('scene'),tower=document.getElementById('tower'),tap=document.getElementById('tap'),score=document.getElementById('score'),bestEl=document.getElementById('best'),over=document.getElementById('over');
+let blocks=[],moving=null,level=0,dir=1,step=2.1,best=0,timer=null,dead=false;
+function block(x,w,i){const e=document.createElement('div');e.className='block';e.style.left=x+'px';e.style.width=w+'px';e.style.bottom=(10+i*18)+'px';tower.appendChild(e);return e}
+function start(){tower.innerHTML='';blocks=[];level=0;dead=false;over.style.display='none';tap.textContent='TAP TO DROP';score.textContent=0;const base={x:78,w:124,el:block(78,124,0)};blocks.push(base);spawn()}
+function spawn(){const p=blocks[blocks.length-1];moving={x:dir>0?8:scene.clientWidth-p.w-8,w:p.w,el:block(8,p.w,level+1)};moving.el.style.bottom=(10+(level+1)*18)+'px';timer=setInterval(tick,28)}
+function tick(){if(!moving)return;moving.x+=dir*step;if(moving.x<4||moving.x+moving.w>scene.clientWidth-4){dir*=-1;moving.x+=dir*step}moving.el.style.left=moving.x+'px'}
+function drop(){if(dead){start();return}clearInterval(timer);const p=blocks[blocks.length-1],left=Math.max(p.x,moving.x),right=Math.min(p.x+p.w,moving.x+moving.w),w=right-left;if(w<7){dead=true;moving.el.style.opacity='.35';over.style.display='block';tap.textContent='RESTART';return}moving.x=left;moving.w=w;moving.el.style.left=left+'px';moving.el.style.width=w+'px';blocks.push(moving);level++;score.textContent=level;best=Math.max(best,level);bestEl.textContent=best;dir*=-1;step=Math.min(4.4,step+.12);spawn()}
+tap.onclick=drop;start();
 </script>'''
 
