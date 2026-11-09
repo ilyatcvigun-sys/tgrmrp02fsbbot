@@ -19,6 +19,22 @@ from pathlib import Path
 import json
 import re
 import webapp as _webapp_module
+from bot_api_10_4 import send_ephemeral_message, send_widget, answer_widget_query
+from widgets_10_4 import dossier_widget, tower_widget
+
+
+async def _callback_ephemeral(query, text: str) -> bool:
+    """Show a callback result as a Bot API 10.4 ephemeral message.
+
+    Returns False on older Bot API servers so callers can keep their existing
+    edit/popup fallback.
+    """
+    try:
+        await send_ephemeral_message(callback_query_id=query.id, text=text)
+        return True
+    except Exception as exc:
+        logger.debug("ephemeral callback response unavailable: %s", exc)
+        return False
 
 # === Часовой пояс ===
 # os.environ['TZ'] без time.tzset() не действует, и в Docker системное время — UTC.
@@ -5382,13 +5398,21 @@ async def weekly_check_callback(update: Update, context: ContextTypes.DEFAULT_TY
     user_data = get_user_data(user_id)
     if not user_data:
         try:
-            await query.edit_message_text("❌ Вы не зарегистрированы в боте.")
+            await send_ephemeral_message(
+                callback_query_id=query.id,
+                text="❌ Вы не зарегистрированы в боте.",
+            )
         except Exception:
-            pass
+            # Совместимость с тестовыми/старыми Bot API-серверами.
+            try:
+                await query.edit_message_text("❌ Вы не зарегистрированы в боте.")
+            except Exception:
+                pass
         return
 
     # === Главные действия ===
     if data == "wkc:ok":
+        await _callback_ephemeral(query, "✅ Данные подтверждены.")
         await query.edit_message_text(
             "✅ Подтверждено\n"
             "━━━━━━━━━━━━━━━━━\n"
@@ -5450,6 +5474,7 @@ async def weekly_check_callback(update: Update, context: ContextTypes.DEFAULT_TY
             "━━━━━━━━━━━━━━━━━\n"
             "Ожидайте решения 5+."
         )
+        await _callback_ephemeral(query, f"✅ Заявка #{req_id} отправлена администрации.")
         await _broadcast_request_to_mods(context, req_id)
         return
 
@@ -5480,6 +5505,7 @@ async def weekly_check_callback(update: Update, context: ContextTypes.DEFAULT_TY
             "━━━━━━━━━━━━━━━━━\n"
             "Ожидайте решения 5+."
         )
+        await _callback_ephemeral(query, f"✅ Заявка #{req_id} отправлена администрации.")
         await _broadcast_request_to_mods(context, req_id)
         return
 
@@ -5654,10 +5680,11 @@ async def request_decision_callback(update: Update, context: ContextTypes.DEFAUL
     reviewer_id = query.from_user.id
 
     if not has_permission(reviewer_id, 'warn'):
-        try:
-            await query.edit_message_text("❌ Решения по заявкам — только с 5 ранга.")
-        except Exception:
-            pass
+        if not await _callback_ephemeral(query, "❌ Решения по заявкам — только с 5 ранга."):
+            try:
+                await query.edit_message_text("❌ Решения по заявкам — только с 5 ранга.")
+            except Exception:
+                pass
         return
 
     parts = (query.data or "").split(":")
@@ -5671,26 +5698,29 @@ async def request_decision_callback(update: Update, context: ContextTypes.DEFAUL
 
     req = get_change_request(req_id)
     if not req:
-        await query.edit_message_text("❌ Заявка не найдена.")
+        if not await _callback_ephemeral(query, "❌ Заявка не найдена."):
+            await query.edit_message_text("❌ Заявка не найдена.")
         return
 
     if req['user_id'] == reviewer_id:
-        await query.answer("Нельзя обрабатывать свою же заявку.", show_alert=True)
+        await _callback_ephemeral(query, "❌ Нельзя обрабатывать свою же заявку.")
         return
 
     if req['status'] != 'pending':
         existing_reviewer = get_admin_nick(req['reviewer_id']) if req['reviewer_id'] else "—"
         status_label = "✅ ОДОБРЕНО" if req['status'] == 'approved' else "❌ ОТКАЗАНО"
-        try:
-            await query.edit_message_text(
-                f"{query.message.text}\n\n"
-                "━━━━━━━━━━━━━━━━━\n"
-                f"⚠️ Уже обработано: {status_label}\n"
-                f"👮 {existing_reviewer}\n"
-                f"📅 {req['decided_at']}"
-            )
-        except Exception:
-            pass
+        notice = f"⚠️ Заявка уже обработана: {status_label} · {existing_reviewer}"
+        if not await _callback_ephemeral(query, notice):
+            try:
+                await query.edit_message_text(
+                    f"{query.message.text}\n\n"
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ Уже обработано: {status_label}\n"
+                    f"👮 {existing_reviewer}\n"
+                    f"📅 {req['decided_at']}"
+                )
+            except Exception:
+                pass
         return
 
     new_status = 'approved' if action == 'appr' else 'rejected'
@@ -15093,6 +15123,7 @@ async def punish_faction_callback(update: Update, context: ContextTypes.DEFAULT_
     faction = parts[2]
     context.user_data['punish_faction'] = faction
     await query.answer(f"Фракция: {faction}")
+    await _callback_ephemeral(query, f"🏛 Фракция выбрана: {faction}")
     
     try:
         await query.edit_message_text(
@@ -15118,6 +15149,7 @@ async def punish_warns_callback(update: Update, context: ContextTypes.DEFAULT_TY
     warns_after = parts[2]
     context.user_data['punish_warns'] = warns_after
     await query.answer(f"Стало: {warns_after}")
+    await _callback_ephemeral(query, f"📊 Новый счётчик выговоров: {warns_after}")
     
     # Превью
     user_id = query.from_user.id
@@ -15171,6 +15203,7 @@ async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
                   'punish_media', 'punish_faction', 'punish_warns'):
             context.user_data.pop(k, None)
         await query.answer("Отменено.")
+        await _callback_ephemeral(query, "✖️ Публикация отменена.")
         try:
             await query.edit_message_text("✖️ Публикация отменена.")
         except Exception:
@@ -15183,7 +15216,7 @@ async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     
     ud_check = get_user_data(user_id)
     if not ud_check or (ud_check.get('rank', 0) < 4 and not has_special_access(user_id)):
-        await query.answer("❌ Нет прав.", show_alert=True)
+        await _callback_ephemeral(query, "❌ Нет прав для публикации наказания.")
         return ConversationHandler.END
     
     violator = context.user_data.get('punish_violator')
@@ -15194,7 +15227,7 @@ async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     media = context.user_data.get('punish_media') or []
     
     if not (violator and violation and evidence and faction and warns_after):
-        await query.answer("❌ Данные потерялись, начните заново.", show_alert=True)
+        await _callback_ephemeral(query, "❌ Данные потерялись, начните заново.")
         return ConversationHandler.END
     
     ud = get_user_data(user_id)
@@ -15246,7 +15279,7 @@ async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
             )
     except Exception as e:
         logger.error(f"apunish publish failed: {e}")
-        await query.answer("Ошибка публикации, см. логи.", show_alert=True)
+        await _callback_ephemeral(query, "❌ Ошибка публикации, запись сохранена в журнале.")
         try:
             await query.edit_message_text(
                 "❌ Не удалось опубликовать в топик вердиктов.\n"
@@ -15271,6 +15304,7 @@ async def punish_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop(k, None)
     
     await query.answer("Опубликовано.")
+    await _callback_ephemeral(query, f"✅ Выговор #{pid} опубликован.")
     try:
         await query.edit_message_text(
             f"✅ ВЫГОВОР #{pid} ОПУБЛИКОВАН\n"
@@ -16356,6 +16390,78 @@ async def _legacy_prefix_notice(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ============ MINI APP «ЛИЧНОЕ ДЕЛО» ============
+
+# ============ BOT API 10.4 WIDGETS (PRIVATE CHAT) ============
+
+async def awidget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send the user's protected personal card as an offline HTML Widget.
+
+    The command intentionally does not restrict the chat type. Telegram decides
+    whether the target is currently eligible for Widgets (production currently
+    accepts them only in private chats; the test server also accepts groups).
+    """
+    user_id = update.effective_user.id
+    data = get_user_data(user_id)
+    if not data:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
+        return
+    profile = {
+        "nick": data.get("nick") or data.get("game_nick") or "—",
+        "callsign": data.get("callsign") or "—",
+        "rank_name": RANKS.get(data.get("rank") or 0, RANKS[0]).get("name", "—"),
+        "department": data.get("department") or "Не назначен",
+        "token": data.get("token") or "—",
+        "warns": data.get("warns") or "0/0",
+    }
+    try:
+        await send_widget(
+            chat_id=update.effective_chat.id,
+            html=dossier_widget(profile),
+            caption="🔒 Личное дело · защищённый виджет",
+            chat_data=json.dumps({"kind": "dossier", "user_id": user_id}),
+            allow_queries=True,
+            height=300,
+        )
+    except Exception as exc:
+        logger.exception("10.4 dossier widget failed")
+        await update.message.reply_text(f"❌ Не удалось открыть виджет: {exc}")
+
+
+async def atower(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send an offline mini-game widget without a local chat-type restriction."""
+    try:
+        await send_widget(
+            chat_id=update.effective_chat.id,
+            html=tower_widget(),
+            caption="🏗 Мини-игра «Башня»",
+            chat_data=json.dumps({"kind": "tower", "user_id": update.effective_user.id}),
+            height=300,
+        )
+    except Exception as exc:
+        logger.exception("10.4 tower widget failed")
+        await update.message.reply_text(f"❌ Не удалось открыть игру: {exc}")
+
+
+async def widget_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Answer 10.4 widget requests when the installed PTB exposes them."""
+    query = getattr(update, "widget_query", None)
+    if query is None:
+        return
+    payload = query.to_dict() if hasattr(query, "to_dict") else {}
+    request_type = payload.get("type") or {}
+    wallet = request_type.get("wallet_card") if isinstance(request_type, dict) else None
+    if wallet:
+        address = wallet.get("address", "—")
+        balance = wallet.get("balance", "—")
+        answer = f"TON-кошелёк\nАдрес: {address}\nБаланс: {balance}"
+    else:
+        answer = "Запрос получен ботом"
+    try:
+        await answer_widget_query(widget_query_id=query.id, data=answer[:1024])
+    except Exception:
+        logger.exception("10.4 widget query answer failed")
+
+
 # Веб-часть живёт в отдельном модуле webapp.py и поднимается в фоновом потоке
 # того же процесса — использует тот же пул соединений к PostgreSQL (db_pg),
 # что и сам бот. Наружу доступна через домен, который bothost выдаёт по
@@ -16394,6 +16500,7 @@ def run_webapp():
         admin_ids=ADMIN_IDS,
         get_departments=get_departments,
         add_warning=add_warning,
+        add_user=add_user,
         conference_chat_id=CONFERENCE_CHAT_ID,
     )
     try:
@@ -19033,15 +19140,16 @@ async def appeal_compose_callback(update: Update, context: ContextTypes.DEFAULT_
     action = (query.data or '').split(':', 1)[-1]
     draft = _appeal_drafts.get(user_id)
     if draft is None:
-        await query.answer("Черновика нет — начните заново: /appeal", show_alert=True)
+        await _callback_ephemeral(query, "❌ Черновика нет — начните заново: /appeal")
         return
     if action == 'cancel':
         _appeal_drafts.pop(user_id, None)
         await query.answer()
+        await _callback_ephemeral(query, "✖️ Обращение отменено.")
         await query.edit_message_text("✖️ Обращение отменено.")
         return
     if not draft['msgs']:
-        await query.answer("Сначала приложите объяснение или доказательства.", show_alert=True)
+        await _callback_ephemeral(query, "❌ Сначала приложите объяснение или доказательства.")
         return
     conf = get_conf(draft['conf_id']) or main_conf()
     _appeal_drafts.pop(user_id, None)
@@ -19077,8 +19185,10 @@ async def appeal_compose_callback(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=decide_kb)
         except Exception as e:
             logger.error(f"appeal: в лог-группу не ушло: {e}")
+            await _callback_ephemeral(query, "❌ Не удалось отправить обращение. Попробуйте ещё раз.")
             await query.edit_message_text("❌ Не удалось отправить обращение. Попробуйте позже: /appeal")
             return
+    await _callback_ephemeral(query, f"✅ Обращение #{appeal_id} передано руководству.")
     await query.edit_message_text(f"📤 Обращение #{appeal_id} отправлено руководству. О решении бот напишет сюда.")
 
 
@@ -19662,6 +19772,8 @@ def main():
     application = Application.builder().bot(ConfTrackingBot(token=BOT_TOKEN)).build()
     # Самым первым для каждого апдейта — выбор текущей конференции
     application.add_handler(TypeHandler(Update, conf_router), group=-100)
+    # Bot API 10.4 widget_query is optional: older PTB versions simply omit it.
+    application.add_handler(TypeHandler(Update, widget_query_handler), group=1)
     
     # Регистрация
     reg_handler = ConversationHandler(
@@ -19680,6 +19792,7 @@ def main():
     # Все команды (без префикса)
     commands = {
         'start': start, 'info': ainfo, 'help': ahelp, 'profile': aprofile,
+        'widget': awidget, 'tower': atower,
         'stats': astats, 'awards': aawards, 'nick': anick, 'search': asearch,
         'kick': akick, 'ban': aban, 'unban': aunban, 'mute': amute, 'unmute': aunmute, 'warn': awarn,
         'warns': awarns, 'warnlist': awarnlist, 'mywarns': amywarns, 'unwarn': aunwarn, 'unwarnall': aunwarnall,
