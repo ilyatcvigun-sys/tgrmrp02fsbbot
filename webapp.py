@@ -61,7 +61,7 @@ def validate_init_data(init_data: str, bot_token: str):
 
 
 def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_departments,
-                add_warning, conference_chat_id):
+                add_warning, add_user=None, conference_chat_id=None):
     """
     Собирает Flask-приложение. Все зависимости от bot.py — параметрами, чтобы
     этот модуль оставался самостоятельным.
@@ -229,6 +229,34 @@ def create_app(*, bot_token, db_file, sqlite3_module, ranks, admin_ids, get_depa
             payload["rank_choices"] = [{"id": rid, "name": r.get('name', str(rid))} for rid, r in sorted(ranks.items())]
             payload["dept_choices"] = get_departments() or []
         return jsonify(payload)
+
+    @app.post('/api/register')
+    def api_register():
+        """Register a Telegram user from the Mini App registration form."""
+        user_id = _authed_user_id()
+        if not user_id:
+            return jsonify({"error": "unauthorized"}), 401
+        if _get_user_row(user_id):
+            return jsonify({"error": "already_registered"}), 409
+        if add_user is None:
+            return jsonify({"error": "registration_unavailable"}), 503
+        data = request.get_json(silent=True) or {}
+        nick = (data.get('nick') or '').strip()
+        callsign = (data.get('callsign') or '').strip()
+        if len(nick) < 2 or len(nick) > 64:
+            return jsonify({"error": "invalid_nick", "message": "Ник: от 2 до 64 символов."}), 400
+        if len(callsign) < 2 or len(callsign) > 32:
+            return jsonify({"error": "invalid_callsign", "message": "Позывной: от 2 до 32 символов."}), 400
+        try:
+            token = add_user(user_id, nick, callsign)
+        except Exception:
+            logger.exception("webapp registration failed")
+            return jsonify({"error": "registration_failed"}), 500
+        payload = _dossier_payload(user_id, include_notes=False)
+        payload["is_staff"] = False
+        payload["is_self"] = True
+        payload["registration_token"] = token
+        return jsonify(payload), 201
 
     @app.get('/api/dossier/<int:target_id>')
     def api_dossier(target_id):
@@ -667,10 +695,30 @@ function renderError(msg, withBack) {
     not_registered: 'Пользователь не зарегистрирован в боте.',
     forbidden: 'Недостаточно прав для просмотра этого личного дела.',
   };
+  if (msg === 'not_registered') { renderRegistration(); return; }
   root.innerHTML = '<div class="folder"><div class="error">' + (map[msg] || 'Ошибка загрузки: ' + msg) + '</div></div>' +
     (withBack ? '<button class="secondary" id="err-back-btn">← В меню</button>' : '');
   const b = document.getElementById('err-back-btn');
   if (b) b.onclick = renderMenu;
+}
+
+function renderRegistration() {
+  root.innerHTML = '<div class="menu-header"><div class="crest">📝</div><div class="title">Регистрация</div></div>' +
+    '<div class="folder"><div class="muted" style="margin-bottom:10px;">Заполните данные для регистрации в конференции.</div>' +
+    '<input id="reg-nick" maxlength="64" placeholder="Игровой ник (2–64 символа)">' +
+    '<input id="reg-callsign" maxlength="32" placeholder="Позывной (2–32 символа)">' +
+    '<button id="reg-submit">Зарегистрироваться</button><div id="reg-error" class="error hidden"></div></div>';
+  document.getElementById('reg-submit').onclick = submitRegistration;
+}
+
+function submitRegistration() {
+  const nick = document.getElementById('reg-nick').value.trim();
+  const callsign = document.getElementById('reg-callsign').value.trim();
+  const error = document.getElementById('reg-error');
+  error.classList.add('hidden');
+  api('/api/register', {method:'POST', body:JSON.stringify({nick, callsign})})
+    .then(d => { me = d; window.__RANKS__ = []; window.__DEPTS__ = []; renderMenu(); })
+    .catch(e => { error.textContent = e.message || 'Не удалось зарегистрироваться.'; error.classList.remove('hidden'); });
 }
 
 function topbarHtml(title) {
