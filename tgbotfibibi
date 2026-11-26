@@ -2024,9 +2024,31 @@ def mark_token_migrated(user_id: int, token: str) -> bool:
     return changed
 
 
+def confirm_token_migration(user_id: int) -> bool:
+    """Подтверждает текущий жетон без его замены."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE users SET token_format_version = 1,
+           token_migration_pending = 0 WHERE user_id = ?''',
+        (user_id,),
+    )
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def token_migration_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Всё верно", callback_data=f"tokenmig:ok:{user_id}"),
+        InlineKeyboardButton("🔄 Изменить", callback_data=f"tokenmig:change:{user_id}"),
+    ]])
+
+
 async def token_format_migration(context: ContextTypes.DEFAULT_TYPE):
     """Однократно просит пользователей заменить старые автоматически выданные жетоны."""
-    if mod_kv_get('token_format_migration_v1') == '1':
+    if mod_kv_get('token_format_migration_v2') == '1':
         return
 
     conn = sqlite3.connect(DB_FILE)
@@ -2044,12 +2066,13 @@ async def token_format_migration(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    "🎫 ОБНОВЛЕНИЕ ЖЕТОНА\n"
+                    "🎫 ПРОВЕРКА ЖЕТОНА\n"
                     "━━━━━━━━━━━━━━━━━\n"
                     f"Текущий жетон: {token}\n\n"
-                    "Введите свой ID маски.\n"
-                    "Он будет сохранён за вами и не должен повторяться у другого участника."
+                    "Если всё верно — подтвердите.\n"
+                    "Если нужно заменить жетон — нажмите «Изменить» и введите свой ID маски.",
                 ),
+                reply_markup=token_migration_keyboard(user_id),
             )
             conn = sqlite3.connect(DB_FILE)
             conn.execute(
@@ -2063,7 +2086,45 @@ async def token_format_migration(context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"token_format_migration send to {user_id} failed: {e}")
 
     # Маркер не даёт повторять массовую рассылку после перезапуска бота.
-    mod_kv_set('token_format_migration_v1', '1')
+    mod_kv_set('token_format_migration_v2', '1')
+
+
+async def token_migration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает подтверждение или запуск замены старого жетона."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    parts = query.data.split(':')
+    if len(parts) != 3 or parts[2] != str(user_id):
+        await query.answer("Эта кнопка предназначена для другого пользователя.", show_alert=True)
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT token, token_migration_pending FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row or row[1] not in (1, 2):
+        await query.answer("Проверка жетона уже завершена.", show_alert=True)
+        return
+
+    await query.answer()
+    if parts[1] == 'ok':
+        confirm_token_migration(user_id)
+        await query.edit_message_text("✅ Жетон подтверждён, изменений нет.")
+        return
+
+    if parts[1] == 'change':
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute(
+            'UPDATE users SET token_migration_pending = 2 WHERE user_id = ?',
+            (user_id,),
+        )
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(
+            "🎫 Жетон: Введите свой ID маски.\n"
+            "Значение должно быть уникальным, без пробелов и не длиннее 64 символов."
+        )
 
 
 async def token_migration_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2076,7 +2137,8 @@ async def token_migration_answer(update: Update, context: ContextTypes.DEFAULT_T
     c.execute('SELECT token_migration_pending FROM users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
     conn.close()
-    if not row or not row[0]:
+    # 1 — ожидается кнопка, 2 — пользователь нажал «Изменить».
+    if not row or row[0] != 2:
         return
 
     value = (update.message.text or '').strip()
@@ -20219,6 +20281,8 @@ def main():
     application.add_handler(CallbackQueryHandler(report_extra_callback, pattern=r'^rep:'))
     # Еженедельная проверка ранга/отдела
     application.add_handler(CallbackQueryHandler(weekly_check_callback, pattern=r'^wkc:'))
+    # Одноразовая проверка жетона — подтверждение или замена по кнопке.
+    application.add_handler(CallbackQueryHandler(token_migration_callback, pattern=r'^tokenmig:'))
     # Решения по заявкам (одобрить/отказать)
     application.add_handler(CallbackQueryHandler(request_decision_callback, pattern=r'^rqst:'))
     # Игра за снятие предупреждения (камень-ножницы-бумага)
@@ -20244,9 +20308,8 @@ def main():
     application.add_handler(CallbackQueryHandler(idea_callback, pattern=r'^idea:'))
     # Голосования: анонимные кнопки Да/Нет/Воздержусь под сообщением в ЛС
     application.add_handler(CallbackQueryHandler(poll_vote_callback, pattern=r'^poll:vote:'))
-    # Одноразовая миграция старых автоматически выданных жетонов.
-    # Ставится перед обычной обработкой текста, чтобы новый ID маски не ушёл
-    # в общий обработчик личных сообщений.
+    # Текст принимается только после нажатия «Изменить» в проверке жетона.
+    # Обычные сообщения в ЛС здесь не перехватываются.
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
                        token_migration_answer)
