@@ -1892,6 +1892,13 @@ def init_database():
     else:
         # Позывной — отдельное поле регистрации, не жетон/ID маски.
         pass
+    # Игровые инициалы нужны для автоматического тега участника в Telegram.
+    c.execute("SELECT 1 FROM reg_fields WHERE title = 'Игровые инициалы' LIMIT 1")
+    if not c.fetchone():
+        c.execute('''INSERT INTO reg_fields (title, prompt, enabled, required, sort_order)
+                     VALUES ('Игровые инициалы',
+                             'Введите свои игровые инициалы (Фамилия Имя Отчество)',
+                             1, 1, 3)''')
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_fields (
             user_id INTEGER NOT NULL,
@@ -1983,6 +1990,52 @@ def get_departments() -> list:
     depts = [row[0] for row in c.fetchall()]
     conn.close()
     return depts
+
+
+def default_new_user_department() -> str:
+    """Отдел для нового участника — позиция 17 в списке /setdept."""
+    departments = get_departments()
+    if len(departments) >= 17:
+        return departments[16]
+    # В старых базах список может быть короче. Сохраняем именно выбранный
+    # номер, чтобы настройка не потерялась до появления полного списка.
+    logger.warning("Отдел №17 отсутствует в списке, назначен временный отдел '17'")
+    return '17'
+
+
+def member_tag_for_registration(nick: str, initials: str) -> str:
+    """Формирует Telegram-тег длиной до 16 символов без emoji."""
+    def clean(value: str) -> str:
+        return re.sub(r'[^\w .#-]', '', value or '', flags=re.UNICODE).strip()
+
+    nick = clean(nick)
+    initials_parts = clean(initials).split()
+    if len(nick) <= 16 and nick:
+        return nick
+
+    surname = initials_parts[0] if initials_parts else (nick.split()[0] if nick else 'Участник')
+    name = initials_parts[1] if len(initials_parts) > 1 else (nick[:1] or 'У')
+    tag = f"#{name[0]}. {surname}"
+    return tag[:16].rstrip() or '#У. Участник'[:16]
+
+
+async def set_registered_member_tag(context: ContextTypes.DEFAULT_TYPE,
+                                    chat_id: int, user_id: int, tag: str):
+    """Ставит тег участника, включая совместимость с PTB до 22.7."""
+    method = getattr(context.bot, 'set_chat_member_tag', None)
+    try:
+        if method:
+            await method(chat_id=chat_id, user_id=user_id, tag=tag)
+            return True
+        # setChatMemberTag появился в PTB 22.7, но уже есть в Bot API.
+        await context.bot._post(
+            'setChatMemberTag',
+            data={'chat_id': chat_id, 'user_id': user_id, 'tag': tag},
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Не удалось установить тег участника {user_id}: {e}")
+        return False
 
 def token_settings() -> tuple:
     """(выдавать ли, префикс, число случайных цифр) — для текущей конфы."""
@@ -2130,7 +2183,7 @@ async def token_migration_callback(update: Update, context: ContextTypes.DEFAULT
 async def token_migration_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Принимает новый ID маски после одноразового уведомления."""
     if not update.message or update.effective_chat.type != 'private':
-        return
+        return False
     user_id = update.effective_user.id
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -2139,22 +2192,23 @@ async def token_migration_answer(update: Update, context: ContextTypes.DEFAULT_T
     conn.close()
     # 1 — ожидается кнопка, 2 — пользователь нажал «Изменить».
     if not row or row[0] != 2:
-        return
+        return False
 
     value = (update.message.text or '').strip()
     if not value or value in ('-', '—'):
         await update.message.reply_text("❌ ID маски обязателен. Введите его ещё раз:")
-        return
+        return True
     if len(value) > 64 or any(ch.isspace() for ch in value):
         await update.message.reply_text(
             "❌ ID маски должен быть непустым, без пробелов и не длиннее 64 символов."
         )
-        return
+        return True
     if not user_token_available(value, user_id):
         await update.message.reply_text("❌ Такой ID маски уже занят. Введите другой:")
-        return
+        return True
     if mark_token_migrated(user_id, value):
         await update.message.reply_text(f"✅ Жетон обновлён. Ваш ID маски: {value}")
+    return True
 
 
 def user_token_available(token: str, user_id: int = None) -> bool:
@@ -2209,21 +2263,22 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
             c.execute('''UPDATE users
                          SET game_nick = ?, callsign = ?, token = ?,
                              tg_username = ?, rank = ?, token_format_version = 1,
-                             token_migration_pending = 0, department = 'Не назначен',
+                             token_migration_pending = 0, department = ?,
                              bot_blocked = 'Нет', blocked_at = '', last_kick_reason = ''
                          WHERE user_id = ?''',
-                      (game_nick, callsign, token, tg_username or '', NEW_USER_RANK, user_id))
+                      (game_nick, callsign, token, tg_username or '', NEW_USER_RANK,
+                       default_new_user_department(), user_id))
             conn.commit()
             conn.close()
             blocked_users.discard(user_id)
             _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
             return token or '—'
         c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at,
-                     tg_username, rank, token_format_version)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 1)''',
+                     tg_username, rank, department, token_format_version)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)''',
                   (user_id, game_nick, callsign, token,
-                   now_msk_str("%Y-%m-%d %H:%M:%S"),
-                   tg_username or "", NEW_USER_RANK))
+                   now_msk_str("%Y-%m-%d %H:%M:%S"), tg_username or "", NEW_USER_RANK,
+                   default_new_user_department()))
         conn.commit()
         conn.close()
         _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
@@ -2235,10 +2290,11 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
         # Старая БД без колонки tg_username — пробуем без неё
         try:
             c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at,
-                         rank, token_format_version)
-                         VALUES (?, ?, ?, ?, ?, ?, 1)''',
+                         rank, department, token_format_version)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 1)''',
                       (user_id, game_nick, callsign, token,
-                       now_msk_str("%Y-%m-%d %H:%M:%S"), NEW_USER_RANK))
+                       now_msk_str("%Y-%m-%d %H:%M:%S"), NEW_USER_RANK,
+                       default_new_user_department()))
             conn.commit()
             conn.close()
             _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
@@ -4158,6 +4214,12 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.close()
         
         user_data = get_user_data(user_id)
+        if user_data:
+            # При возвращении после кика участник снова получает стартовые
+            # права, как если бы администратор выполнил /setrank 1 и /setdept 17.
+            update_user_rank(user_id, NEW_USER_RANK)
+            update_user_department(user_id, default_new_user_department())
+            user_data = get_user_data(user_id)
         
         # Формируем приветствие
         if user_data:
@@ -6464,6 +6526,9 @@ async def aregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = add_user(target_id, game_nick, callsign, tg_username=tg_uname)
     
     if token:
+        await set_registered_member_tag(
+            context, conf_chat(), target_id, member_tag_for_registration(game_nick, '')
+        )
         await update.message.reply_text(f"✅ Зарегистрирован!\n🎮 {game_nick}\n{cs_line(callsign, '📻 ')}{tk_line(token, '🎫 ')}")
         await notify_user(context, target_id,
                          f"✅ Вас зарегистрировал {get_admin_nick(user_id)}!\n🎮 {game_nick}\n{cs_line(callsign, '📻 ')}{tk_line(token, '🎫 ')}")
@@ -6533,6 +6598,9 @@ async def aforcereg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     new_token = add_user(target_id, game_nick, callsign, token, tg_username=tg_uname)
     if new_token:
+        await set_registered_member_tag(
+            context, conf_chat(), target_id, member_tag_for_registration(game_nick, '')
+        )
         await update.message.reply_text(f"✅ Перерегистрирован!\n🎮 {game_nick}\n{cs_line(callsign, '📻 ')}{tk_line(new_token, '🎫 ')}")
         # Уведомление в лог-группу и генералам (6+)
         uname_view = f"@{tg_uname}" if tg_uname else "—"
@@ -11055,6 +11123,10 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     custom = [(f, answers.get(f['id'], '')) for f in fields if not f['field_key']]
     save_user_fields(user_id, {f['id']: v for f, v in custom})
+    initials = next((value for field, value in custom
+                     if field['title'] == 'Игровые инициалы'), '')
+    member_tag = member_tag_for_registration(game_nick, initials)
+    await set_registered_member_tag(context, conf_chat(), user_id, member_tag)
 
     lines = [f"🏛 {conf_title()}", f"🎮 {game_nick}"]
     if by_key.get('callsign'):
@@ -11723,6 +11795,11 @@ async def apolls(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
+
+    # Обрабатываем ввод нового ID только после кнопки «Изменить».
+    # Вынесенный MessageHandler перехватывал все обычные сообщения в ЛС.
+    if await token_migration_answer(update, context):
+        return
     
     if check_gban(user_id)['is_banned']:
         await update.message.reply_text("🚫 Вы в ЧС!")
@@ -20308,12 +20385,6 @@ def main():
     application.add_handler(CallbackQueryHandler(idea_callback, pattern=r'^idea:'))
     # Голосования: анонимные кнопки Да/Нет/Воздержусь под сообщением в ЛС
     application.add_handler(CallbackQueryHandler(poll_vote_callback, pattern=r'^poll:vote:'))
-    # Текст принимается только после нажатия «Изменить» в проверке жетона.
-    # Обычные сообщения в ЛС здесь не перехватываются.
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-                       token_migration_answer)
-    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     # Идеи в личке: текст идеи (после клика «Есть идеи») и комментарий админа к решению.
