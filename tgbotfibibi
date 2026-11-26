@@ -370,10 +370,24 @@ def is_registered_in(conf: dict, user_id: int) -> bool:
     with using_conf(conf):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
-        ok = c.fetchone() is not None
+        # Кик не удаляет личное дело: такая запись доступна для повторного
+        # подключения и должна снова попасть в список регистрации. Ручная
+        # блокировка (/block) остаётся настоящей блокировкой.
+        c.execute('SELECT bot_blocked, last_kick_at FROM users WHERE user_id = ?', (user_id,))
+        row = c.fetchone()
+        ok = bool(row) and not (row[0] == 'Да' and not row[1])
         conn.close()
     return ok
+
+
+def is_kicked_user(user_id: int) -> bool:
+    """Есть ли у пользователя сохранённое личное дело после кика."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT bot_blocked, last_kick_at FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row and row[0] == 'Да' and row[1])
 
 
 def linked_chat_titles(conf: dict) -> list:
@@ -1781,6 +1795,9 @@ def init_database():
     for col_sql in (
         "ALTER TABLE users ADD COLUMN msg_count INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN last_msg_at TEXT DEFAULT ''",
+        # 0 — старый автоматически выданный жетон, 1 — новый ID маски.
+        "ALTER TABLE users ADD COLUMN token_format_version INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN token_migration_pending INTEGER DEFAULT 0",
         "ALTER TABLE service_periods ADD COLUMN started_at TEXT DEFAULT ''",
         # /tagskip: кому не слать ЛС-уведомления от /tagall
         "ALTER TABLE users ADD COLUMN tagall_skip INTEGER DEFAULT 0",
@@ -1872,6 +1889,9 @@ def init_database():
                      VALUES ('nick', 'Игровой ник', 'Игровой ник:', 1)''')
         c.execute('''INSERT INTO reg_fields (field_key, title, prompt, sort_order)
                      VALUES ('callsign', 'Позывной', 'Позывной:', 2)''')
+    else:
+        # Позывной — отдельное поле регистрации, не жетон/ID маски.
+        pass
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_fields (
             user_id INTEGER NOT NULL,
@@ -1978,6 +1998,116 @@ def token_format_example() -> str:
     return f"{prefix}{'X' * digits}"
 
 
+def is_legacy_token(token: str) -> bool:
+    """Проверяет старый автоматически выданный формат жетона."""
+    if not token or token in ('—', '-'):
+        return False
+    _enabled, prefix, digits = token_settings()
+    token = str(token)
+    prefix = str(prefix)
+    tail = token[len(prefix):] if token.startswith(prefix) else ''
+    return bool(tail) and len(tail) == int(digits) and tail.isdigit()
+
+
+def mark_token_migrated(user_id: int, token: str) -> bool:
+    """Сохраняет новый ID маски и завершает миграцию пользователя."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''UPDATE users SET token = ?, token_format_version = 1,
+           token_migration_pending = 0 WHERE user_id = ?''',
+        (token, user_id),
+    )
+    changed = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+async def token_format_migration(context: ContextTypes.DEFAULT_TYPE):
+    """Однократно просит пользователей заменить старые автоматически выданные жетоны."""
+    if mod_kv_get('token_format_migration_v1') == '1':
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        '''SELECT user_id, token FROM users
+           WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'
+             AND COALESCE(token_format_version, 0) = 0'''
+    )
+    users = [(uid, token) for uid, token in c.fetchall() if is_legacy_token(token)]
+    conn.close()
+
+    for user_id, token in users:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🎫 ОБНОВЛЕНИЕ ЖЕТОНА\n"
+                    "━━━━━━━━━━━━━━━━━\n"
+                    f"Текущий жетон: {token}\n\n"
+                    "Введите свой ID маски.\n"
+                    "Он будет сохранён за вами и не должен повторяться у другого участника."
+                ),
+            )
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute(
+                'UPDATE users SET token_migration_pending = 1 WHERE user_id = ?',
+                (user_id,),
+            )
+            conn.commit()
+            conn.close()
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.debug(f"token_format_migration send to {user_id} failed: {e}")
+
+    # Маркер не даёт повторять массовую рассылку после перезапуска бота.
+    mod_kv_set('token_format_migration_v1', '1')
+
+
+async def token_migration_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает новый ID маски после одноразового уведомления."""
+    if not update.message or update.effective_chat.type != 'private':
+        return
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT token_migration_pending FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return
+
+    value = (update.message.text or '').strip()
+    if not value or value in ('-', '—'):
+        await update.message.reply_text("❌ ID маски обязателен. Введите его ещё раз:")
+        return
+    if len(value) > 64 or any(ch.isspace() for ch in value):
+        await update.message.reply_text(
+            "❌ ID маски должен быть непустым, без пробелов и не длиннее 64 символов."
+        )
+        return
+    if not user_token_available(value, user_id):
+        await update.message.reply_text("❌ Такой ID маски уже занят. Введите другой:")
+        return
+    if mark_token_migrated(user_id, value):
+        await update.message.reply_text(f"✅ Жетон обновлён. Ваш ID маски: {value}")
+
+
+def user_token_available(token: str, user_id: int = None) -> bool:
+    """Проверка, что введённый пользователем ID маски ещё не занят."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if user_id is None:
+        c.execute('SELECT 1 FROM users WHERE token = ?', (token,))
+    else:
+        c.execute('SELECT 1 FROM users WHERE token = ? AND user_id <> ?', (token, user_id))
+    result = c.fetchone() is None
+    conn.close()
+    return result
+
+
 def generate_unique_token() -> str:
     """Генерация уникального жетона в формате текущей конфы (префикс + N цифр)."""
     _enabled, prefix, digits = token_settings()
@@ -2008,8 +2138,27 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, tg_username, rank)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
+        # Повторный вход после /kick: обновляем только регистрационные данные
+        # и статус доступа. msg_count, предупреждения, награды, поинты и даты
+        # остаются в том же личном деле.
+        c.execute("SELECT bot_blocked, last_kick_at FROM users WHERE user_id = ?", (user_id,))
+        old = c.fetchone()
+        if old and old[0] == 'Да' and old[1]:
+            c.execute('''UPDATE users
+                         SET game_nick = ?, callsign = ?, token = ?,
+                             tg_username = ?, rank = ?, token_format_version = 1,
+                             token_migration_pending = 0, department = 'Не назначен',
+                             bot_blocked = 'Нет', blocked_at = '', last_kick_reason = ''
+                         WHERE user_id = ?''',
+                      (game_nick, callsign, token, tg_username or '', NEW_USER_RANK, user_id))
+            conn.commit()
+            conn.close()
+            blocked_users.discard(user_id)
+            _open_service_period(user_id, hired_at=now_msk().strftime("%d.%m.%Y"))
+            return token or '—'
+        c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at,
+                     tg_username, rank, token_format_version)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 1)''',
                   (user_id, game_nick, callsign, token,
                    now_msk_str("%Y-%m-%d %H:%M:%S"),
                    tg_username or "", NEW_USER_RANK))
@@ -2023,8 +2172,9 @@ def add_user(user_id: int, game_nick: str, callsign: str, token: str = None, tg_
     except sqlite3.OperationalError:
         # Старая БД без колонки tg_username — пробуем без неё
         try:
-            c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at, rank)
-                         VALUES (?, ?, ?, ?, ?, ?)''',
+            c.execute('''INSERT INTO users (user_id, game_nick, callsign, token, created_at,
+                         rank, token_format_version)
+                         VALUES (?, ?, ?, ?, ?, ?, 1)''',
                       (user_id, game_nick, callsign, token,
                        now_msk_str("%Y-%m-%d %H:%M:%S"), NEW_USER_RANK))
             conn.commit()
@@ -2043,7 +2193,9 @@ def set_user_token(user_id: int, new_token: str) -> tuple:
     if c.fetchone():
         conn.close()
         return False, "Жетон уже занят"
-    c.execute('UPDATE users SET token = ? WHERE user_id = ?', (new_token, user_id))
+    c.execute('''UPDATE users SET token = ?, token_format_version = 1,
+                 token_migration_pending = 0 WHERE user_id = ?''',
+              (new_token, user_id))
     conn.commit()
     ok = c.rowcount > 0
     conn.close()
@@ -3311,7 +3463,11 @@ def _help_header(user_id: int, user_data: dict, sections, special: bool) -> str:
         f"👤 {who}\n"
         f"{rank_name}{extra} · {counter}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "Выберите раздел:"
+        "Быстрый старт:\n"
+        "• /info — краткий профиль\n"
+        "• /get + — полная статистика и стаж\n"
+        "• /help <слово> — найти команду\n"
+        "\nВыберите раздел:"
     )
 
 
@@ -3324,6 +3480,7 @@ def _help_section_text(emoji: str, title: str, cmds: list) -> str:
         lines.append(f"   {desc}")
     lines.append("━━━━━━━━━━━━━━━━━")
     lines.append("💡 <user> — @username, ID, ник, позывной или ответ на сообщение")
+    lines.append("💡 Команды с пометкой «с 5/6 ранга» скрыты у пользователей без доступа")
     return "\n".join(lines)
 
 
@@ -3882,6 +4039,13 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if actor:
                 actor_data = get_user_data(actor.id)
                 actor_name = actor_data['nick'] if actor_data else (actor.full_name or f"id {actor.id}")
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute(
+                'UPDATE users SET last_kick_at = ?, last_kick_reason = ? WHERE user_id = ?',
+                (now_msk_str(), 'исключён из конференции', user.id),
+            )
+            conn.commit()
+            conn.close()
             disconnect_user_from_bot(user.id)
             log_action(actor.id if actor else None, 'auto_disconnect_kick', user.id, 'кикнут из конференции')
             if user_data:
@@ -4915,6 +5079,12 @@ async def ablock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prev_dept = target_data['department']
 
     disconnect_user_from_bot(target_id)
+    # Ручной /block не должен превращаться в разрешение на повторную
+    # регистрацию, даже если у пользователя когда-то был старый кик.
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("UPDATE users SET last_kick_at = '' WHERE user_id = ?", (target_id,))
+    conn.commit()
+    conn.close()
     log_action(user_id, 'block', target_id, f"снят {RANKS.get(prev_rank, RANKS[0])['name']}, отдел: {prev_dept}")
 
     issuer_name = get_admin_nick(user_id)
@@ -5341,15 +5511,17 @@ def _weekly_main_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def _weekly_main_text(nick: str, rank: int, dept: str) -> str:
+def _weekly_main_text(nick: str, rank: int, dept: str, callsign: str = '') -> str:
     return (
         "📋 ЕЖЕНЕДЕЛЬНАЯ ПРОВЕРКА\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"👤 {nick}\n"
+        f"📻 Позывной: {callsign or '—'}\n"
         f"⭐ Ранг: {RANKS.get(rank, RANKS[0])['name']}\n"
         f"📁 Отдел: {dept}\n"
         "━━━━━━━━━━━━━━━━━\n"
         "Подтвердите данные или запросите изменение.\n"
+        "Позывной можно изменить командой /callsign НовыйПозывной.\n"
         "Заявка уйдёт на одобрение администрации (5+)."
     )
 
@@ -5359,7 +5531,7 @@ async def weekly_rank_check(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "SELECT user_id, game_nick, rank, department "
+        "SELECT user_id, game_nick, rank, department, callsign "
         "FROM users WHERE ban_status = 'Нет' AND bot_blocked = 'Нет'"
     )
     users = c.fetchall()
@@ -5367,8 +5539,8 @@ async def weekly_rank_check(context: ContextTypes.DEFAULT_TYPE):
 
     sent = 0
     for u in users:
-        user_id, nick, rank, dept = u
-        text = _weekly_main_text(nick, rank or 0, dept or "Не назначен")
+        user_id, nick, rank, dept, callsign = u
+        text = _weekly_main_text(nick, rank or 0, dept or "Не назначен", callsign or '')
         kb = _weekly_main_keyboard()
         try:
             await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
@@ -5423,7 +5595,8 @@ async def weekly_check_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "wkc:back":
         await query.edit_message_text(
-            _weekly_main_text(user_data['nick'], user_data['rank'] or 0, user_data['department']),
+            _weekly_main_text(user_data['nick'], user_data['rank'] or 0,
+                              user_data['department'], user_data.get('callsign', '')),
             reply_markup=_weekly_main_keyboard(),
         )
         return
@@ -10476,7 +10649,7 @@ def _regfields_text() -> str:
     enabled, _prefix, _digits = token_settings()
     lines += [
         "━━━━━━━━━━━━━━━━━",
-        f"🎫 Жетон: {'выдаётся автоматически, формат ' + token_format_example() if enabled else 'не выдаётся'}",
+        f"🎫 Жетон: {'Введите свой ID маски' if enabled else 'не используется'}",
         "━━━━━━━━━━━━━━━━━",
         "/regfields add <название> | <вопрос>",
         "/regfields on|off <номер> — включить/выключить",
@@ -10522,8 +10695,8 @@ async def _regfields_token(update: Update, args: list):
     log_action(update.effective_user.id, 'reg_token', None, ' '.join(args)[:100])
     enabled = token_settings()[0]
     await update.message.reply_text(
-        f"✅ Жетон: {'выдаётся, формат ' + token_format_example() if enabled else 'не выдаётся'}.\n"
-        "Уже выданные жетоны не меняются."
+        f"✅ Жетон: {'Введите свой ID маски' if enabled else 'не используется'}.\n"
+        "Для зарегистрированных пользователей будет одноразовый запрос нового ID маски."
     )
 
 
@@ -10715,6 +10888,12 @@ async def _reg_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answers = context.user_data.get('reg_answers') or {}
     idx = len(answers)
     if idx >= len(fields):
+        if token_shown() and not context.user_data.get('reg_token'):
+            await update.effective_message.reply_text(
+                "🎫 Жетон: Введите свой ID маски.\n"
+                "Это значение будет сохранено за вами и не должно повторяться у другого участника."
+            )
+            return REG_FIELD
         return await complete_registration(update, context)
     field = fields[idx]
     text = f"📝 Шаг {idx + 1}/{len(fields)} — {field['prompt']}"
@@ -10729,6 +10908,21 @@ async def reg_field_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fields = context.user_data.get('reg_fields') or []
     answers = context.user_data.setdefault('reg_answers', {})
     if len(answers) >= len(fields):
+        # Жетон теперь не генерируется автоматически: пользователь вводит
+        # собственный ID маски последним шагом регистрации.
+        value = (update.message.text or '').strip()
+        if not value or value in ('-', '—'):
+            await update.message.reply_text("❌ ID маски обязателен. Введите его ещё раз:")
+            return REG_FIELD
+        if len(value) > 64 or any(ch.isspace() for ch in value):
+            await update.message.reply_text(
+                "❌ ID маски должен быть непустым, без пробелов и не длиннее 64 символов."
+            )
+            return REG_FIELD
+        if not user_token_available(value):
+            await update.message.reply_text("❌ Такой ID маски уже занят. Введите другой:")
+            return REG_FIELD
+        context.user_data['reg_token'] = value
         return await complete_registration(update, context)
     field = fields[len(answers)]
     value = (update.message.text or '').strip()
@@ -10781,7 +10975,7 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     if conf:
         activate_conf(conf)
     reply = update.effective_message.reply_text
-    if get_user_data(user_id):
+    if get_user_data(user_id) and not is_kicked_user(user_id):
         await reply("❌ Вы уже зарегистрированы в этой конференции.")
         return ConversationHandler.END
 
@@ -10792,7 +10986,8 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     game_nick = by_key.get('nick') or update.effective_user.full_name or f"User {user_id}"
     callsign = by_key.get('callsign') or '—'
 
-    token = add_user(user_id, game_nick, callsign, tg_username=tg_username)
+    token = context.user_data.get('reg_token') if token_shown() else None
+    token = add_user(user_id, game_nick, callsign, token=token, tg_username=tg_username)
     if not token:
         await reply("❌ Ошибка регистрации. Попробуйте позже.")
         return ConversationHandler.END
@@ -10825,7 +11020,7 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
         f"🔗 {uname} · 🆔 {user_id}\n"
         f"📅 {now_msk_str('%d.%m.%Y %H:%M')}"
     ))
-    for key in ('reg_fields', 'reg_answers', 'reg_conf_id'):
+    for key in ('reg_fields', 'reg_answers', 'reg_conf_id', 'reg_token'):
         context.user_data.pop(key, None)
 
     if update.message:
@@ -20049,6 +20244,13 @@ def main():
     application.add_handler(CallbackQueryHandler(idea_callback, pattern=r'^idea:'))
     # Голосования: анонимные кнопки Да/Нет/Воздержусь под сообщением в ЛС
     application.add_handler(CallbackQueryHandler(poll_vote_callback, pattern=r'^poll:vote:'))
+    # Одноразовая миграция старых автоматически выданных жетонов.
+    # Ставится перед обычной обработкой текста, чтобы новый ID маски не ушёл
+    # в общий обработчик личных сообщений.
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                       token_migration_answer)
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_moderator_comment), group=1)
     # Идеи в личке: текст идеи (после клика «Есть идеи») и комментарий админа к решению.
@@ -20096,6 +20298,11 @@ def main():
     application.job_queue.run_daily(per_conf_job(ny_year_summary_job), time=time(hour=20, minute=0, tzinfo=MSK))
     # Уведомление о старте бота — через 5 секунд после запуска.
     application.job_queue.run_once(startup_notify_job, when=5)
+    # Однократно запросить у старых пользователей новый формат жетона.
+    application.job_queue.run_once(
+        per_conf_job(token_format_migration, once_per_base=True),
+        when=10,
+    )
     # time(...) без tzinfo планировщик PTB интерпретирует как UTC.
     # Привязываем явно к МСК, чтобы рассылка приходила в 8:00 по Москве.
     application.job_queue.run_daily(
